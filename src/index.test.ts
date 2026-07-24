@@ -3,25 +3,49 @@ import crypto from "node:crypto"
 import { test } from "node:test"
 import {
   type ApprovalReceipt,
-  canonicalAuthorizationPayload,
+  canonicalIntentPayload,
+  type RequesterIdentity,
   verificationCode,
   verifyApprovalReceipt,
 } from "./index.ts"
+
+/** Shared DIV fixtures. `target` and `requester` are bound into every signed payload. */
+const TARGET = "prod-db-cluster-01"
+const REQUESTER: RequesterIdentity = { did: "did:sakra:agent-1", attestation: null }
+/** Far-future expiry so the fail-closed expiry check (DIV §5.8) passes without being time-dependent. */
+const FAR_FUTURE = "2999-01-01T00:00:00.000Z"
+
+function divPayload(input: {
+  actionType: string
+  actionDescription: string
+  params: Record<string, unknown>
+  nonce: string
+  expiresAt?: string
+}): string {
+  return canonicalIntentPayload({
+    target: TARGET,
+    actionType: input.actionType,
+    display: input.actionDescription,
+    params: input.params,
+    requester: REQUESTER,
+    nonce: input.nonce,
+    expiresAt: input.expiresAt ?? FAR_FUTURE,
+  })
+}
 
 // Build a genuinely-signed ES256 receipt the way the gateway would.
 function es256Receipt(input: {
   actionType: string
   actionDescription: string
   params: Record<string, unknown>
+  nonce?: string
+  expiresAt?: string
 }): { receipt: ApprovalReceipt; pubB64: string } {
   const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", {
     namedCurve: "prime256v1",
   })
   const pubB64 = publicKey.export({ format: "der", type: "spki" }).toString("base64")
-  const canonical = canonicalAuthorizationPayload({
-    nonce: "nonce-1",
-    ...input,
-  })
+  const canonical = divPayload({ nonce: input.nonce ?? "nonce-1", ...input })
   const signature = crypto
     .sign("sha256", Buffer.from(canonical, "utf8"), {
       key: privateKey,
@@ -32,9 +56,11 @@ function es256Receipt(input: {
     pubB64,
     receipt: {
       canonicalPayload: canonical,
+      target: TARGET,
       actionType: input.actionType,
       actionDescription: input.actionDescription,
       params: input.params,
+      requester: REQUESTER,
       signerPublicKey: pubB64,
       signature,
       sigAlg: "ES256",
@@ -45,8 +71,9 @@ function es256Receipt(input: {
 
 /** The action half of an expectation — spread into the receipt builders, which add the nonce. */
 const ACTION = {
+  target: TARGET,
   actionType: "wipe_production",
-  params: { target: "prod-db-1", region: "eu-north-1" },
+  params: { host: "prod-db-1", region: "eu-north-1" },
 }
 /** Full expectation for receipts built with nonce "nonce-1" (es256Receipt / webauthnReceipt). */
 const EXPECTED = { ...ACTION, nonce: "nonce-1" }
@@ -72,8 +99,9 @@ test("rejects when params differ from what was approved", () => {
     ...ACTION,
   })
   const r = verifyApprovalReceipt(receipt, {
+    target: TARGET,
     actionType: "wipe_production",
-    params: { target: "prod-db-2", region: "eu-north-1" },
+    params: { host: "prod-db-2", region: "eu-north-1" },
     nonce: "nonce-1",
   })
   assert.equal(r.ok, false)
@@ -86,6 +114,7 @@ test("rejects when actionType differs", () => {
     ...ACTION,
   })
   const r = verifyApprovalReceipt(receipt, {
+    target: TARGET,
     actionType: "read_only_report",
     params: ACTION.params,
     nonce: "nonce-1",
@@ -113,15 +142,13 @@ test("rejects a signature from a different key", () => {
 })
 
 test("AUTO_APPROVED is REFUSED by default (no human signature to verify), accepted only on opt-in", () => {
-  const canonical = canonicalAuthorizationPayload({
-    nonce: "n",
-    actionDescription: "deploy",
-    ...ACTION,
-  })
+  const canonical = divPayload({ nonce: "n", actionDescription: "deploy", ...ACTION })
   const receipt: ApprovalReceipt = {
     canonicalPayload: canonical,
+    target: TARGET,
     actionDescription: "deploy",
     params: ACTION.params,
+    requester: REQUESTER,
     sigAlg: "AUTO_APPROVED",
     verificationCode: verificationCode(canonical),
   }
@@ -136,15 +163,13 @@ test("AUTO_APPROVED is REFUSED by default (no human signature to verify), accept
 })
 
 test("rejects a receipt missing signature material", () => {
-  const canonical = canonicalAuthorizationPayload({
-    nonce: "n",
-    actionDescription: "deploy",
-    ...ACTION,
-  })
+  const canonical = divPayload({ nonce: "n", actionDescription: "deploy", ...ACTION })
   const receipt: ApprovalReceipt = {
     canonicalPayload: canonical,
+    target: TARGET,
     actionDescription: "deploy",
     params: ACTION.params,
+    requester: REQUESTER,
     sigAlg: "ES256",
     verificationCode: verificationCode(canonical),
   }
@@ -211,7 +236,7 @@ function webauthnReceipt(
   const x = Buffer.from(jwk.x, "base64url")
   const y = Buffer.from(jwk.y, "base64url")
 
-  const canonical = canonicalAuthorizationPayload({ nonce: "nonce-1", ...input })
+  const canonical = divPayload({ nonce: "nonce-1", ...input })
   // The authenticator signs authenticatorData || SHA-256(clientDataJSON); the challenge is the payload.
   const clientDataJSON = Buffer.from(
     JSON.stringify({
@@ -230,9 +255,11 @@ function webauthnReceipt(
 
   return {
     canonicalPayload: canonical,
+    target: TARGET,
     actionType: input.actionType,
     actionDescription: input.actionDescription,
     params: input.params,
+    requester: REQUESTER,
     signerPublicKey: (mutateCose ? mutateCose(x, y) : coseKey(x, y)).toString("base64"),
     signature: signature.toString("base64"),
     sigAlg: "WEBAUTHN",
@@ -326,15 +353,13 @@ test("WebAuthn rejects a clientDataJSON challenge that is not the canonical payl
 })
 
 test("WebAuthn receipt missing assertion components is rejected", () => {
-  const canonical = canonicalAuthorizationPayload({
-    nonce: "n",
-    actionDescription: "deploy",
-    ...ACTION,
-  })
+  const canonical = divPayload({ nonce: "n", actionDescription: "deploy", ...ACTION })
   const receipt: ApprovalReceipt = {
     canonicalPayload: canonical,
+    target: TARGET,
     actionDescription: "deploy",
     params: ACTION.params,
+    requester: REQUESTER,
     signerPublicKey: "AAAA",
     signature: "BBBB",
     sigAlg: "WEBAUTHN",
@@ -424,11 +449,13 @@ test("ES256 verification rejects a non-EC key even when the signature is valid f
   // An RSA keypair signs the canonical payload correctly. createPublicKey accepts the SPKI and
   // crypto.verify would happily verify under RSA — but the receipt claims ES256, so it must fail.
   const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 })
-  const canonical = canonicalAuthorizationPayload({ nonce: "n", actionDescription: "deploy", ...ACTION })
+  const canonical = divPayload({ nonce: "n", actionDescription: "deploy", ...ACTION })
   const receipt: ApprovalReceipt = {
     canonicalPayload: canonical,
+    target: TARGET,
     actionDescription: "deploy",
     params: ACTION.params,
+    requester: REQUESTER,
     signerPublicKey: publicKey.export({ format: "der", type: "spki" }).toString("base64"),
     signature: crypto.sign("sha256", Buffer.from(canonical, "utf8"), privateKey).toString("base64"),
     sigAlg: "ES256",
@@ -441,11 +468,13 @@ test("ES256 verification rejects a non-EC key even when the signature is valid f
 
 test("ES256 verification rejects an EC key on a curve other than P-256", () => {
   const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "secp384r1" })
-  const canonical = canonicalAuthorizationPayload({ nonce: "n", actionDescription: "deploy", ...ACTION })
+  const canonical = divPayload({ nonce: "n", actionDescription: "deploy", ...ACTION })
   const receipt: ApprovalReceipt = {
     canonicalPayload: canonical,
+    target: TARGET,
     actionDescription: "deploy",
     params: ACTION.params,
+    requester: REQUESTER,
     signerPublicKey: publicKey.export({ format: "der", type: "spki" }).toString("base64"),
     signature: crypto
       .sign("sha256", Buffer.from(canonical, "utf8"), { key: privateKey, dsaEncoding: "der" })
@@ -466,12 +495,14 @@ test("ES256 accepts both DER and raw IEEE-P1363 signatures over the same payload
   // reachable in a test; trying both encodings is what makes the distinction moot.)
   const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
   const pubB64 = publicKey.export({ format: "der", type: "spki" }).toString("base64")
-  const canonical = canonicalAuthorizationPayload({ nonce: "n", actionDescription: "deploy", ...ACTION })
+  const canonical = divPayload({ nonce: "n", actionDescription: "deploy", ...ACTION })
 
   const receiptWith = (signature: Buffer): ApprovalReceipt => ({
     canonicalPayload: canonical,
+    target: TARGET,
     actionDescription: "deploy",
     params: ACTION.params,
+    requester: REQUESTER,
     signerPublicKey: pubB64,
     signature: signature.toString("base64"),
     sigAlg: "ES256",
@@ -484,4 +515,48 @@ test("ES256 accepts both DER and raw IEEE-P1363 signatures over the same payload
 
   assert.equal(verifyApprovalReceipt(receiptWith(der), EXPECTED_N).ok, true)
   assert.equal(verifyApprovalReceipt(receiptWith(p1363), EXPECTED_N).ok, true)
+})
+
+// ─── Expiration (DIV §5.8/§6.2) ──────────────────────────────────────────────
+
+test("rejects an expired proof by default (fail-closed), even with a valid signature", () => {
+  const { receipt } = es256Receipt({
+    actionDescription: "Wipe production database",
+    ...ACTION,
+    expiresAt: "2020-01-01T00:00:00.000Z",
+  })
+  const r = verifyApprovalReceipt(receipt, EXPECTED)
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /expired/)
+})
+
+test("allowExpired accepts an otherwise-valid expired proof (audit re-verification)", () => {
+  const { receipt } = es256Receipt({
+    actionDescription: "Wipe production database",
+    ...ACTION,
+    expiresAt: "2020-01-01T00:00:00.000Z",
+  })
+  assert.deepEqual(verifyApprovalReceipt(receipt, EXPECTED, { allowExpired: true }), { ok: true })
+})
+
+test("asOf evaluates expiry at a chosen instant; skew tolerance is applied", () => {
+  const expiresAt = "2026-07-24T12:00:00.000Z"
+  const { receipt } = es256Receipt({ actionDescription: "Wipe production database", ...ACTION, expiresAt })
+  // 20s past expiry is within the default ±30s skew → still valid.
+  assert.equal(
+    verifyApprovalReceipt(receipt, EXPECTED, { asOf: new Date("2026-07-24T12:00:20.000Z") }).ok,
+    true,
+  )
+  // 40s past expiry is beyond the skew → rejected.
+  assert.equal(
+    verifyApprovalReceipt(receipt, EXPECTED, { asOf: new Date("2026-07-24T12:00:40.000Z") }).ok,
+    false,
+  )
+})
+
+test("rejects a proof whose target differs from the relying party's own (Target Isolation)", () => {
+  const { receipt } = es256Receipt({ actionDescription: "Wipe production database", ...ACTION })
+  const r = verifyApprovalReceipt(receipt, { ...EXPECTED, target: "some-other-service" })
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /do not match/)
 })

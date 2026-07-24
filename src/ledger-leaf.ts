@@ -1,5 +1,19 @@
 import { hashLeaf } from "./ledger-merkle.js"
 
+/**
+ * JCS (RFC 8785) serialization of the `metadata` value — every object key sorted recursively by
+ * UTF-16 code unit. DEWP §4.2 requires the metadata element to be a *canonical* string, so an equal
+ * metadata object hashes identically regardless of the producer's key insertion order or language
+ * (JS/Go/Rust/Python). Do NOT replace with plain JSON.stringify — that reintroduces order dependence.
+ */
+function jcsStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null"
+  if (Array.isArray(value)) return `[${value.map(jcsStringify).join(",")}]`
+  const obj = value as Record<string, unknown>
+  const keys = Object.keys(obj).sort()
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${jcsStringify(obj[k])}`).join(",")}}`
+}
+
 // Canonical leaf encoding — the exact preimage the producer commits to for one audit event. To bind a
 // proof to a human-readable event ("this leaf IS this record"), a bundle must carry every field below
 // in this order; the verifier recomputes leafHash and checks it equals proof.leaf. Drop or reorder a
@@ -36,7 +50,7 @@ export function canonicalPreimage(row: AuditLeaf): string {
     row.event,
     row.outcome,
     row.detail,
-    JSON.stringify(row.metadata ?? null),
+    jcsStringify(row.metadata ?? null),
     row.signerDid,
     row.signerPublicKey,
     row.signedPayload,

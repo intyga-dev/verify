@@ -9,11 +9,20 @@
 
 import crypto from "node:crypto"
 
-/** A verifiable proof of what the human approved — returned once a challenge is APPROVED. */
+/**
+ * A DIV Proof Envelope — a verifiable proof of what the human approved, returned once a challenge is
+ * APPROVED. `canonicalPayload` is the exact signed bytes (the DIV Intent Payload); the remaining
+ * fields are the signature metadata needed to verify it, extended beyond DIV §4.4's raw-ES256 shape
+ * with the WebAuthn assertion components so a passkey approval — the primary approver path — is
+ * representable.
+ */
 export interface ApprovalReceipt {
-  canonicalPayload: string // the exact bytes the human's key signed
+  canonicalPayload: string // the exact bytes the human's key signed (the DIV Intent Payload)
+  // The intended execution TARGET (DIV Target Isolation). Carried for display/telemetry only; the
+  // Relying Party asserts its OWN target via expected.target and never trusts this copy.
+  target?: string | null
   actionType?: string | null
-  actionDescription: string
+  actionDescription: string // the DIV `display` field
   params: Record<string, unknown>
   signerDid?: string | null
   signerPublicKey?: string | null // base64 SPKI or base64 COSE public key
@@ -21,8 +30,8 @@ export interface ApprovalReceipt {
   sigAlg?: string | null // "ES256" | "WEBAUTHN" | "AUTO_APPROVED"
   authenticatorData?: string | null // base64url (WEBAUTHN only)
   clientDataJSON?: string | null // base64url (WEBAUTHN only)
-  // Who REQUESTED the action (v3 receipts only; absent on v2). Present here so a relying party can
-  // recompute the signed bytes and, optionally, assert the requester via expected.requesterDid.
+  // Who REQUESTED the action. Present here so a relying party can recompute the signed bytes and,
+  // optionally, assert the requester via expected.requesterDid.
   requester?: RequesterIdentity | null
   verificationCode: string
 }
@@ -154,47 +163,45 @@ function stableStringify(value: unknown): string {
   return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`
 }
 
-/** v2 agent-authorization canonical payload — identical to mcp-schemas.canonicalAuthorizationPayload. */
-export function canonicalAuthorizationPayload(input: {
-  nonce: string
-  actionType: string
-  actionDescription: string
-  params: Record<string, unknown>
-}): string {
-  return (
-    `{"v":2,"type":"agent-authorization","nonce":${JSON.stringify(input.nonce)},` +
-    `"actionType":${JSON.stringify(input.actionType)},"action":${JSON.stringify(input.actionDescription)},` +
-    `"params":${stableStringify(input.params)}}`
-  )
-}
-
-/** The requesting workload's identity, as bound into a v3 payload. Mirrors mcp-schemas. */
+/** The requesting workload's identity, as bound into a DIV Intent Payload. Mirrors mcp-schemas. */
 export interface RequesterIdentity {
   did: string
   attestation: { method: string; issuer: string; subject: string } | null
 }
 
-/** v3 agent-authorization canonical payload — identical to mcp-schemas.canonicalAuthorizationPayloadV3. */
-export function canonicalAuthorizationPayloadV3(input: {
-  nonce: string
+/** DIV protocol version and type discriminator — identical to mcp-schemas. */
+export const DIV_VERSION = 1
+export const DIV_INTENT_TYPE = "div-intent-verification"
+
+/**
+ * Canonical DIV Intent Payload (docs/DIV.md v1) — byte-identical to
+ * mcp-schemas.canonicalIntentPayload. Strict RFC 8785 JCS: the whole object is serialized with every
+ * key sorted recursively by UTF-16 code unit via `stableStringify`. Do NOT hand-order keys.
+ */
+export function canonicalIntentPayload(input: {
+  target: string
   actionType: string
-  actionDescription: string
+  display: string
   params: Record<string, unknown>
   requester: RequesterIdentity
-  expiresAt?: string | null
+  nonce: string
+  expiresAt: string
 }): string {
   const a = input.requester.attestation
-  const attestation = a
-    ? `{"method":${JSON.stringify(a.method)},"issuer":${JSON.stringify(a.issuer)},"subject":${JSON.stringify(a.subject)}}`
-    : "null"
-  const expiresAtSuffix = input.expiresAt ? `,"expiresAt":${JSON.stringify(input.expiresAt)}` : ""
-  return (
-    `{"v":3,"type":"agent-authorization","nonce":${JSON.stringify(input.nonce)},` +
-    `"actionType":${JSON.stringify(input.actionType)},"action":${JSON.stringify(input.actionDescription)},` +
-    `"params":${stableStringify(input.params)},` +
-    `"requester":{"did":${JSON.stringify(input.requester.did)},"attestation":${attestation}}` +
-    `${expiresAtSuffix}}`
-  )
+  return stableStringify({
+    v: DIV_VERSION,
+    type: DIV_INTENT_TYPE,
+    target: input.target,
+    actionType: input.actionType,
+    display: input.display,
+    params: input.params,
+    requester: {
+      did: input.requester.did,
+      attestation: a ? { method: a.method, issuer: a.issuer, subject: a.subject } : null,
+    },
+    nonce: input.nonce,
+    expiresAt: input.expiresAt,
+  })
 }
 
 /** Short verification code (first 8 hex of SHA-256 of the canonical payload), grouped XXXX-XXXX. */
@@ -242,26 +249,35 @@ export function verifyEcdsaP256(publicKeyB64: string, payload: string, signature
   }
 }
 
+function parseField<T = string>(canonical: string, key: string): T | undefined {
+  try {
+    return (JSON.parse(canonical) as Record<string, unknown>)[key] as T
+  } catch {
+    return undefined
+  }
+}
+
 function parseNonce(canonical: string): string {
-  try {
-    return (JSON.parse(canonical) as { nonce: string }).nonce
-  } catch {
-    return ""
-  }
+  return parseField<string>(canonical, "nonce") ?? ""
 }
 
-/** Which canonical-payload version a receipt was signed under. Unparseable/absent ⇒ 0 (rejected). */
+/** Which DIV version a receipt was signed under. Unparseable/absent ⇒ 0 (rejected). */
 function parseVersion(canonical: string): number {
-  try {
-    const v = (JSON.parse(canonical) as { v?: unknown }).v
-    return typeof v === "number" ? v : 0
-  } catch {
-    return 0
-  }
+  const v = parseField<unknown>(canonical, "v")
+  return typeof v === "number" ? v : 0
 }
 
-/** What you assert the receipt must say. `nonce` is required — see the note on replay below. */
+/** Default clock-skew tolerance for expiry validation (DIV §6.2 RECOMMENDED ±30s). */
+export const DEFAULT_CLOCK_SKEW_SECONDS = 30
+
+/** What you assert the receipt must say. `target` and `nonce` are required — see the notes below. */
 export interface ReceiptExpectation {
+  /**
+   * YOUR target identifier — the Relying Party / execution environment this approval must be bound to
+   * (DIV Target Isolation). Required and asserted from your own identity, never read from the
+   * receipt: this is what rejects an approval minted for a different service (cross-service replay).
+   */
+  target: string
   actionType: string
   params: Record<string, unknown>
   /**
@@ -269,7 +285,7 @@ export interface ReceiptExpectation {
    * specific request you are tracking. See the replay note on verifyApprovalReceipt.
    */
   nonce: string
-  /** Optionally assert WHICH workload the approval was granted to (v3 receipts only). */
+  /** Optionally assert WHICH workload the approval was granted to. */
   requesterDid?: string
 }
 
@@ -282,6 +298,18 @@ export interface VerifyReceiptOptions {
   expectedRpId?: string
   /** Demand the User-Verified flag (biometric/PIN, not mere possession). Defaults to true. */
   requireUserVerification?: boolean
+  /**
+   * Expiry handling (DIV §5.8/§6.2). By DEFAULT this verifier is fail-closed on `expiresAt`: a proof
+   * whose expiry is in the past (beyond the skew tolerance) is rejected — the correct behaviour for a
+   * pre-execution check. Set `allowExpired: true` ONLY for post-hoc audit/forensic re-verification,
+   * where you deliberately want to confirm a signature that was valid at the time even though it has
+   * since expired. `asOf` overrides "now" for deterministic/replayed checks.
+   */
+  allowExpired?: boolean
+  /** Wall-clock instant to evaluate expiry against. Defaults to `new Date()`. */
+  asOf?: Date
+  /** Clock-skew tolerance in seconds for expiry validation. Defaults to DEFAULT_CLOCK_SKEW_SECONDS. */
+  clockSkewSeconds?: number
 }
 
 // WebAuthn authenticatorData flag bits (WebAuthn L3 §6.1).
@@ -294,11 +322,15 @@ const AUTH_DATA_FLAG_UV = 0x04 // User Verified
  * human's P-256 or WebAuthn signature — with no SÄKRA secret.
  *
  * WHAT THIS PROVES: that a specific human key signed exactly this action, with exactly these params,
- * for exactly the nonce you pass in `expected.nonce`.
+ * for exactly the target and nonce you pass in `expected`, and that the proof has not expired.
  *
- * WHAT THIS DOES NOT PROVE: that the approval has not ALREADY BEEN USED. Nothing in a receipt is
- * time-bound, so a valid receipt verifies forever. Single-use enforcement lives in the gateway's
- * /authorize/verify (which atomically marks the challenge CONSUMED) — this function is a
+ * EXPIRY: the signed `expiresAt` is enforced fail-closed by default (±30s skew) — a lapsed proof is
+ * rejected. Pass `{ allowExpired: true }` ONLY for post-hoc audit/forensic re-verification, where
+ * confirming a signature that was valid AT THE TIME is the point.
+ *
+ * WHAT THIS DOES NOT PROVE: that the approval has not ALREADY BEEN USED within its validity window.
+ * Expiry bounds how long a proof is valid, but single-use enforcement is separate and lives in the
+ * gateway's /authorize/verify (which atomically marks the challenge CONSUMED) — this function is a
  * defense-in-depth companion to that call, not a replacement for it. If you verify offline and skip
  * the consume step, YOU must record redeemed nonces yourself; requiring `expected.nonce` here is what
  * makes that possible, since you cannot call this without having tracked the nonce you issued.
@@ -311,45 +343,53 @@ export function verifyApprovalReceipt(
   opts: VerifyReceiptOptions = {},
 ): { ok: boolean; reason?: string; autoApproved?: boolean } {
   const version = parseVersion(receipt.canonicalPayload)
-  if (version !== 2 && version !== 3)
-    return { ok: false, reason: `unsupported canonical payload version (${version || "unparseable"})` }
+  if (version !== DIV_VERSION)
+    return { ok: false, reason: `unsupported DIV payload version (${version || "unparseable"})` }
+  if (parseField(receipt.canonicalPayload, "type") !== DIV_INTENT_TYPE)
+    return { ok: false, reason: "payload is not a div-intent-verification" }
 
   // Bind the receipt to the challenge the caller is redeeming, before anything else.
   if (parseNonce(receipt.canonicalPayload) !== expected.nonce)
     return { ok: false, reason: "receipt is for a different challenge" }
 
-  // v3 additionally binds the requester, so it must be rebuilt from the receipt's own requester block.
-  // That is not circular: the rebuilt string has to byte-match the signed bytes below, so a forged
-  // requester changes the payload and fails the comparison.
-  let recomputed: string
-  if (version === 3) {
-    if (!receipt.requester) return { ok: false, reason: "v3 receipt missing requester" }
-    recomputed = canonicalAuthorizationPayloadV3({
-      nonce: parseNonce(receipt.canonicalPayload),
-      actionType: expected.actionType,
-      actionDescription: receipt.actionDescription,
-      params: expected.params,
-      requester: receipt.requester,
-    })
-  } else {
-    recomputed = canonicalAuthorizationPayload({
-      nonce: parseNonce(receipt.canonicalPayload),
-      actionType: expected.actionType,
-      actionDescription: receipt.actionDescription,
-      params: expected.params,
-    })
-  }
+  // Rebuild the expected payload (DIV Local Payload Reconstruction). `target`, `actionType` and
+  // `params` come from what YOU are about to execute; `display`, `requester`, `nonce` and `expiresAt`
+  // are taken from the receipt and MUST byte-match the signed bytes below — a forged value changes the
+  // string and fails the comparison, so trusting the receipt for them is not circular.
+  if (!receipt.requester) return { ok: false, reason: "receipt missing requester" }
+  const expiresAt = parseField<string>(receipt.canonicalPayload, "expiresAt")
+  if (typeof expiresAt !== "string" || expiresAt.length === 0)
+    return { ok: false, reason: "receipt missing expiresAt" }
+  const recomputed = canonicalIntentPayload({
+    target: expected.target ?? "global",
+    actionType: expected.actionType,
+    display: receipt.actionDescription,
+    params: expected.params,
+    requester: receipt.requester,
+    nonce: parseNonce(receipt.canonicalPayload),
+    expiresAt,
+  })
   if (recomputed !== receipt.canonicalPayload)
     return {
       ok: false,
-      reason: "params/actionType do not match what was approved",
+      reason: "target/params/actionType do not match what was approved",
     }
 
-  // Optional: assert WHICH workload the approval was granted to. Only v3 carries this, so asking for
-  // it against a v2 receipt fails rather than silently passing — a v2 receipt genuinely cannot answer.
+  // Expiration (DIV §5.8/§6.2). Fail-closed by default; opt out only for audit re-verification.
+  if (!opts.allowExpired) {
+    const expiryMs = Date.parse(expiresAt)
+    if (Number.isNaN(expiryMs)) return { ok: false, reason: "expiresAt is not a valid RFC3339 timestamp" }
+    const nowMs = (opts.asOf ?? new Date()).getTime()
+    const skewMs = (opts.clockSkewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS) * 1000
+    if (nowMs > expiryMs + skewMs)
+      return {
+        ok: false,
+        reason: "proof has expired (pass { allowExpired: true } for audit re-verification)",
+      }
+  }
+
+  // Optional: assert WHICH workload the approval was granted to.
   if (expected.requesterDid !== undefined) {
-    if (version !== 3)
-      return { ok: false, reason: "requesterDid asserted but receipt is v2 (no requester bound)" }
     if (receipt.requester?.did !== expected.requesterDid)
       return { ok: false, reason: "approval was requested by a different principal" }
   }
@@ -477,20 +517,38 @@ export function verifyApprovalReceipt(
 
 export {
   BUNDLE_KIND,
+  BUNDLE_KIND_ALIASES,
   type BundleVerification,
   type CheckResult,
+  deriveVerificationLevel,
   type ProofBundle,
-  type VerifyOptions,
+  type VerificationLevel,
+  type VerificationProperties,
   verifyBundle,
+  verifyEmbeddedSignature,
+  type VerifyOptions,
 } from "./ledger-bundle.js"
 export {
   EVIDENCE_BUNDLE_KIND,
+  EVIDENCE_BUNDLE_KIND_ALIASES,
   type EvidenceBundle,
   type EvidenceEntry,
   type EvidenceVerification,
   type EvidenceVerifyOptions,
   verifyEvidenceBundle,
 } from "./ledger-evidence.js"
+export {
+  type AnchorKeyResolver,
+  type AnchorPolicy,
+  type AnchorQuorumResult,
+  anchorDigest,
+  anchorDigestHex,
+  anchorPreimage,
+  signAnchor,
+  type SignedAnchor,
+  verifyAnchorQuorum,
+  verifyAnchorSignature,
+} from "./ledger-anchor.js"
 export { type AuditLeaf, canonicalPreimage, leafHash } from "./ledger-leaf.js"
 export {
   hashLeaf,

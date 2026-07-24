@@ -7,7 +7,10 @@ import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
 // existed at this position under this anchored root" — while unredacted entries additionally bind
 // the displayed content to the leaf (CONTENT-VERIFIED).
 
-export const EVIDENCE_BUNDLE_KIND = "sakra.audit.evidence-bundle"
+// DEWP canonical kind (docs/DEWP.md §6.3). The legacy `sakra.audit.*` form is accepted as an alias
+// on read (§6.5) so previously-exported bundles still verify.
+export const EVIDENCE_BUNDLE_KIND = "dewp.audit.evidence-bundle"
+export const EVIDENCE_BUNDLE_KIND_ALIASES = ["sakra.audit.evidence-bundle"] as const
 
 export interface EvidenceEntry {
   event: {
@@ -25,7 +28,7 @@ export interface EvidenceEntry {
 }
 
 export interface EvidenceBundle {
-  kind: typeof EVIDENCE_BUNDLE_KIND
+  kind: typeof EVIDENCE_BUNDLE_KIND | (typeof EVIDENCE_BUNDLE_KIND_ALIASES)[number]
   version: number
   exportedAt: string
   tenant: { id: string; name: string | null }
@@ -67,7 +70,7 @@ export function verifyEvidenceBundle(
   let contentVerified = 0
   let commitmentOnly = 0
 
-  if (bundle.kind !== EVIDENCE_BUNDLE_KIND) {
+  if (bundle.kind !== EVIDENCE_BUNDLE_KIND && !EVIDENCE_BUNDLE_KIND_ALIASES.includes(bundle.kind as never)) {
     notes.push(`Unexpected bundle kind "${bundle.kind}" (expected "${EVIDENCE_BUNDLE_KIND}").`)
   }
 

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import crypto from "node:crypto"
 import { test } from "node:test"
 import { type ProofBundle, verifyBundle } from "./ledger-bundle.js"
 import { type AuditLeaf, leafHash } from "./ledger-leaf.js"
@@ -109,12 +110,99 @@ test("verifyBundle: independent root + canonical leaf => ok", () => {
   const good = verifyBundle(bundle, { trustedRoot: dailyRoot })
   assert.equal(good.ok, true)
   assert.equal(good.checks.leafBinding.pass, true)
+  // DEWP §7.1 property model: an UNSIGNED, content-verified, independently-anchored event is
+  // FULLY_VERIFIED (there is no signature to require).
+  assert.deepEqual(good.properties, {
+    commitmentVerified: true,
+    contentVerified: true,
+    signatureVerified: false,
+    anchorVerified: true,
+  })
+  assert.equal(good.verificationLevel, "FULLY_VERIFIED")
 
   // Same bundle without an independent root: internally consistent but NOT a trustworthy verdict.
   const weak = verifyBundle(bundle)
   assert.equal(weak.ok, false)
   assert.equal(weak.rootSource, "self-asserted")
   assert.equal(weak.checks.inclusion.pass, true)
+  // Without an independent anchor, anchorVerified is false → at most CONTENT_VERIFIED.
+  assert.equal(weak.properties.anchorVerified, false)
+  assert.equal(weak.verificationLevel, "CONTENT_VERIFIED")
+})
+
+test("verifyBundle: a signed event verifies its embedded ES256 signature => SIGNATURE/FULLY_VERIFIED", () => {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  const spki = publicKey.export({ format: "der", type: "spki" }).toString("base64")
+  const signedPayload = '{"actionType":"db:dropTable","type":"div-intent-verification","v":1}'
+  const signature = crypto
+    .sign("sha256", Buffer.from(signedPayload, "utf8"), { key: privateKey, dsaEncoding: "ieee-p1363" })
+    .toString("base64")
+  const leafRow: AuditLeaf = {
+    ...makeLeaf(1),
+    signerDid: "did:sakra:alice",
+    signerPublicKey: spki,
+    signedPayload,
+    signature,
+    sigAlg: "ES256",
+  }
+  // Single-leaf block folded into a single-block day: roots collapse to the leaf/hashLeaf(root).
+  const leaf = leafHash(leafRow)
+  const blockRoot = merkleRoot([leaf])
+  const dailyRoot = merkleRoot([hashLeaf(blockRoot)])
+  const proof: InclusionProof = {
+    seq: "1",
+    leaf,
+    blockIndex: "0",
+    blockRoot,
+    blockProof: merkleProof([leaf], 0),
+    checkpointId: "cp-1",
+    checkpointRoot: dailyRoot,
+    checkpointProof: merkleProof([hashLeaf(blockRoot)], 0),
+    anchorRef: "anchor://test/signed",
+    anchored: true,
+  }
+  const bundle: ProofBundle = {
+    kind: "dewp.audit.inclusion-proof",
+    version: 2,
+    exportedAt: "2026-07-15T00:00:00.000Z",
+    event: {
+      seq: "1",
+      createdAt: leafRow.createdAt,
+      type: leafRow.event,
+      outcome: leafRow.outcome,
+      detail: leafRow.detail,
+      actorDid: null,
+      subjectDid: null,
+      signerDid: leafRow.signerDid,
+      signature: leafRow.signature,
+      sigAlg: leafRow.sigAlg,
+      canonical: leafRow,
+    },
+    proof,
+    anchor: { dailyRoot, anchorRef: proof.anchorRef, anchored: true },
+  }
+
+  const res = verifyBundle(bundle, { trustedRoot: dailyRoot })
+  assert.deepEqual(res.properties, {
+    commitmentVerified: true,
+    contentVerified: true,
+    signatureVerified: true,
+    anchorVerified: true,
+  })
+  assert.equal(res.verificationLevel, "FULLY_VERIFIED")
+
+  // Tampering with the signed payload (but keeping a valid tree position) drops signatureVerified.
+  const tampered: ProofBundle = {
+    ...bundle,
+    event: {
+      ...bundle.event,
+      canonical: { ...leafRow, signedPayload: '{"actionType":"db:dropTable","evil":true}' },
+    },
+  }
+  const t = verifyBundle(tampered, { trustedRoot: dailyRoot })
+  // The altered canonical no longer hashes to the committed leaf, so content fails first.
+  assert.equal(t.properties.contentVerified, false)
+  assert.equal(t.properties.signatureVerified, false)
 })
 
 test("verifyBundle: canonical that doesn't match the leaf fails leaf binding", () => {

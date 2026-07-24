@@ -26,16 +26,19 @@ Why re-pass the params? So the approval can't be swapped: if what you're about t
 single byte from what the human saw and signed, `verifyApprovalReceipt` returns `{ ok: false }`. This is
 your defense-in-depth even against a compromised SÄKRA gateway.
 
-## Replay: what this does and does not prove
+## Expiry and replay: what this does and does not prove
 
 `ok: true` proves a human key signed **exactly this action, with exactly these params, for exactly the
-nonce you passed**. It does **not** prove the approval hasn't already been used — nothing in a receipt is
-time-bound, so a valid receipt verifies forever.
+target and nonce you passed**, and that the proof **has not expired**. The signed `expiresAt` is enforced
+fail-closed by default (±30s clock-skew tolerance); pass `{ allowExpired: true }` only for post-hoc
+audit/forensic re-verification, where confirming a signature that was valid *at the time* is the point.
 
-Single-use enforcement lives in the gateway's `/authorize/verify`, which atomically marks the challenge
-`CONSUMED`. This library is a companion to that call, not a replacement for it. If you verify offline and
-skip the consume step, **you** must record redeemed nonces yourself — which is why `nonce` is a required
-part of the expectation rather than something read out of the receipt.
+Expiry bounds how long a proof is valid, but it does **not** prove the approval hasn't already been used
+*within* that window. Single-use enforcement is separate: it lives in the gateway's `/authorize/verify`,
+which atomically marks the challenge `CONSUMED`. This library is a companion to that call, not a
+replacement for it. If you verify offline and skip the consume step, **you** must record redeemed nonces
+yourself — which is why `nonce` is a required part of the expectation rather than something read out of
+the receipt.
 
 ## WebAuthn receipts need an origin and an RP ID
 

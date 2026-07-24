@@ -10,15 +10,22 @@ export function sha256Hex(s: string): string {
   return crypto.createHash("sha256").update(s).digest("hex")
 }
 
-// RFC 6962-style domain separation: leaves and interior nodes are hashed under DISTINCT prefixes so an
-// interior-node hash can never be reinterpreted as a leaf (blocks second-preimage / proof malleability
-// where a subtree root is passed off as a leaf). 0x00 = leaf, 0x01 = node. Must match the producer.
-const LEAF_TAG = "\x00"
-const NODE_TAG = "\x01"
+// DEWP domain separation (docs/DEWP.md §4.4): leaves, interior nodes, and the empty root are hashed
+// under DISTINCT one-byte prefixes so an interior-node hash can never be reinterpreted as a leaf
+// (blocks second-preimage / proof malleability where a subtree root is passed off as a leaf).
+// 0x00 = leaf, 0x01 = node, 0x02 = empty root. Node children are HEX-DECODED to their raw 32 bytes
+// before hashing (NOT concatenated as hex text). Must stay byte-identical to the @sakra-trust/db producer.
+const LEAF_TAG = 0x00
+const NODE_TAG = 0x01
+const EMPTY_TAG = 0x02
 
-/** Hash a raw leaf value into a domain-separated leaf digest. */
+/** Domain-separated leaf digest: sha256(0x00 || UTF8(preimage)). */
 export function hashLeaf(data: string): string {
-  return sha256Hex(LEAF_TAG + data)
+  return crypto
+    .createHash("sha256")
+    .update(Buffer.from([LEAF_TAG]))
+    .update(Buffer.from(data, "utf8"))
+    .digest("hex")
 }
 
 // Checked indexed read. The loops below keep indices in range by construction; if that invariant
@@ -29,14 +36,27 @@ function at(level: string[], i: number): string {
   return v
 }
 
-/** Combine two child hashes into a parent (domain-separated). Order encodes position — never sort. */
+/** Domain-separated node: sha256(0x01 || rawBytes(left) || rawBytes(right)). Order encodes position — never sort. */
 export function hashPair(left: string, right: string): string {
-  return sha256Hex(NODE_TAG + left + right)
+  return crypto
+    .createHash("sha256")
+    .update(Buffer.from([NODE_TAG]))
+    .update(Buffer.from(left, "hex"))
+    .update(Buffer.from(right, "hex"))
+    .digest("hex")
 }
 
-/** Merkle root over ordered leaves (duplicate-last on odd levels). "" for empty. */
+/** Empty-tree root (DEWP §5.1.1): sha256(0x02). */
+export function emptyRoot(): string {
+  return crypto
+    .createHash("sha256")
+    .update(Buffer.from([EMPTY_TAG]))
+    .digest("hex")
+}
+
+/** Merkle root over ordered leaves (duplicate-last on odd levels). Empty tree ⇒ sha256(0x02). */
 export function merkleRoot(leaves: string[]): string {
-  if (leaves.length === 0) return ""
+  if (leaves.length === 0) return emptyRoot()
   let level = leaves
   while (level.length > 1) {
     const next: string[] = []
@@ -49,10 +69,13 @@ export function merkleRoot(leaves: string[]): string {
   return at(level, 0)
 }
 
-/** One step on the path from a leaf to the root: the sibling hash and which side it sits on. */
+/**
+ * One step on the path from a leaf to the root (DEWP §5.1.6): the SIBLING's hash and the side the
+ * sibling sits on relative to the running node. Ordered leaf → root.
+ */
 export interface ProofStep {
-  sibling: string
-  side: "left" | "right"
+  siblingHash: string
+  siblingPosition: "LEFT" | "RIGHT"
 }
 
 /**
@@ -70,7 +93,8 @@ export function merkleProof(leaves: string[], index: number): ProofStep[] {
     const siblingIdx = isRightChild ? idx - 1 : idx + 1
     // duplicate-last: an unpaired right node is hashed against itself.
     const sibling = level[siblingIdx] ?? at(level, idx)
-    proof.push({ sibling, side: isRightChild ? "left" : "right" })
+    // If the running node is the RIGHT child, its sibling sits on the LEFT, and vice versa.
+    proof.push({ siblingHash: sibling, siblingPosition: isRightChild ? "LEFT" : "RIGHT" })
     const next: string[] = []
     for (let i = 0; i < level.length; i += 2) {
       const left = at(level, i)
@@ -86,7 +110,7 @@ export function merkleProof(leaves: string[], index: number): ProofStep[] {
 export function verifyMerkleProof(leaf: string, proof: ProofStep[], root: string): boolean {
   let h = leaf
   for (const step of proof) {
-    h = step.side === "left" ? hashPair(step.sibling, h) : hashPair(h, step.sibling)
+    h = step.siblingPosition === "LEFT" ? hashPair(step.siblingHash, h) : hashPair(h, step.siblingHash)
   }
   return h === root
 }

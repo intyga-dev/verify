@@ -1,0 +1,170 @@
+import crypto from "node:crypto"
+
+// DEWP signed anchor objects (docs/DEWP.md §5.2/§5.3). A Daily Checkpoint Root becomes trustworthy
+// only when independent external parties SIGN it. This module computes the domain-separated anchor
+// digest (0x03 tag), verifies an anchor's signature, and evaluates a multi-anchor QUORUM so a single
+// compromised anchor provider cannot forge non-repudiation. Zero deps beyond node:crypto.
+
+const ANCHOR_TAG = 0x03
+
+/** A signed commitment to a daily checkpoint root, published to an independent public anchor. */
+export interface SignedAnchor {
+  dailyRoot: string // 64-char lowercase hex
+  timestamp: string // ISO 8601 UTC
+  issuer: string // HTTPS URI or DID of the anchor provider
+  algorithm: "ES256" | "Ed25519" | "RSA-PSS"
+  keyId: string
+  signature: string // base64, over the raw 32-byte anchorDigest
+}
+
+/**
+ * The canonical anchor preimage: RFC 8785 JCS of the 4-element array [dailyRoot, timestamp, issuer,
+ * algorithm]. For an array of strings, JCS is exactly `JSON.stringify` with no insignificant space.
+ */
+export function anchorPreimage(
+  a: Pick<SignedAnchor, "dailyRoot" | "timestamp" | "issuer" | "algorithm">,
+): string {
+  return JSON.stringify([a.dailyRoot, a.timestamp, a.issuer, a.algorithm])
+}
+
+/** The raw 32-byte anchor digest: SHA-256(0x03 || UTF8(anchorPreimage)). This is what gets signed. */
+export function anchorDigest(
+  a: Pick<SignedAnchor, "dailyRoot" | "timestamp" | "issuer" | "algorithm">,
+): Buffer {
+  return crypto
+    .createHash("sha256")
+    .update(Buffer.from([ANCHOR_TAG]))
+    .update(Buffer.from(anchorPreimage(a), "utf8"))
+    .digest()
+}
+
+/** Hex form of the anchor digest (for display / vectors). */
+export function anchorDigestHex(
+  a: Pick<SignedAnchor, "dailyRoot" | "timestamp" | "issuer" | "algorithm">,
+): string {
+  return anchorDigest(a).toString("hex")
+}
+
+/**
+ * Sign an anchor digest with a producer key. Helper for anchor providers and tests — a relying party
+ * only needs `verifyAnchorSignature`. The message is the RAW 32-byte digest (never its hex string):
+ * ES256/RSA-PSS then apply their own SHA-256, Ed25519 signs the bytes directly.
+ */
+export function signAnchor(
+  a: Pick<SignedAnchor, "dailyRoot" | "timestamp" | "issuer" | "algorithm">,
+  privateKey: crypto.KeyObject,
+): string {
+  const digest = anchorDigest(a)
+  if (a.algorithm === "Ed25519") return crypto.sign(null, digest, privateKey).toString("base64")
+  if (a.algorithm === "RSA-PSS") {
+    return crypto
+      .sign("sha256", digest, { key: privateKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING })
+      .toString("base64")
+  }
+  // ES256 (P-256 + SHA-256), DER encoding.
+  return crypto.sign("sha256", digest, { key: privateKey, dsaEncoding: "der" }).toString("base64")
+}
+
+/**
+ * Verify an anchor's signature over its digest against a resolved public key. Pins the key type to the
+ * declared algorithm so an anchor labelled ES256 can't be verified under some other scheme.
+ */
+export function verifyAnchorSignature(anchor: SignedAnchor, publicKey: crypto.KeyObject): boolean {
+  try {
+    const digest = anchorDigest(anchor)
+    const sig = Buffer.from(anchor.signature, "base64")
+    if (anchor.algorithm === "Ed25519") {
+      if (publicKey.asymmetricKeyType !== "ed25519") return false
+      return crypto.verify(null, digest, publicKey, sig)
+    }
+    if (anchor.algorithm === "RSA-PSS") {
+      if (publicKey.asymmetricKeyType !== "rsa" && publicKey.asymmetricKeyType !== "rsa-pss") return false
+      return crypto.verify(
+        "sha256",
+        digest,
+        { key: publicKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING },
+        sig,
+      )
+    }
+    // ES256
+    if (publicKey.asymmetricKeyType !== "ec") return false
+    if (publicKey.asymmetricKeyDetails?.namedCurve !== "prime256v1") return false
+    const tryEnc = (dsaEncoding: "der" | "ieee-p1363") => {
+      try {
+        return crypto.verify("sha256", digest, { key: publicKey, dsaEncoding }, sig)
+      } catch {
+        return false
+      }
+    }
+    if (sig.length === 64 && tryEnc("ieee-p1363")) return true
+    return tryEnc("der")
+  } catch {
+    return false
+  }
+}
+
+/** The verifier's anchor-trust policy (DEWP §5.3). */
+export interface AnchorPolicy {
+  /** Minimum count of distinct trusted issuers that must sign the SAME root. SHOULD be ≥ 2. */
+  requiredAnchors: number
+  /** Allowed issuer identifiers; anchors from other issuers do not count toward quorum. */
+  trustedIssuers: string[]
+  /** ALL_MUST_AGREE = every present trusted anchor must sign the same root; N_OF_M = at least N. */
+  quorum: "ALL_MUST_AGREE" | "N_OF_M"
+}
+
+/** Resolve the verifying public key for an anchor (by issuer/keyId). Returns null when unknown. */
+export type AnchorKeyResolver = (anchor: SignedAnchor) => crypto.KeyObject | null
+
+export interface AnchorQuorumResult {
+  ok: boolean
+  /** Distinct trusted issuers whose signature over `dailyRoot` verified. */
+  verifiedIssuers: string[]
+  /** True if two trusted issuers signed DIFFERENT roots for this checkpoint (fatal → not ok). */
+  divergence: boolean
+  reason?: string
+}
+
+/**
+ * Evaluate an anchor quorum for one `dailyRoot`. `anchorVerified` in a bundle is true iff this returns
+ * ok. Divergence (a trusted issuer signing a different root) is fatal, never a silent pick.
+ */
+export function verifyAnchorQuorum(
+  anchors: SignedAnchor[],
+  dailyRoot: string,
+  policy: AnchorPolicy,
+  resolveKey: AnchorKeyResolver,
+): AnchorQuorumResult {
+  const trusted = anchors.filter((a) => policy.trustedIssuers.includes(a.issuer))
+  // Divergence: a trusted issuer that validly signed a DIFFERENT root for this checkpoint.
+  for (const a of trusted) {
+    if (a.dailyRoot === dailyRoot) continue
+    const key = resolveKey(a)
+    if (key && verifyAnchorSignature(a, key)) {
+      return {
+        ok: false,
+        verifiedIssuers: [],
+        divergence: true,
+        reason: `anchor divergence: issuer ${a.issuer} signed a different root`,
+      }
+    }
+  }
+  const verifiedIssuers = new Set<string>()
+  for (const a of trusted) {
+    if (a.dailyRoot !== dailyRoot) continue
+    const key = resolveKey(a)
+    if (key && verifyAnchorSignature(a, key)) verifiedIssuers.add(a.issuer)
+  }
+  const count = verifiedIssuers.size
+  const trustedPresent = new Set(trusted.filter((a) => a.dailyRoot === dailyRoot).map((a) => a.issuer)).size
+  const need =
+    policy.quorum === "ALL_MUST_AGREE"
+      ? Math.max(policy.requiredAnchors, trustedPresent)
+      : policy.requiredAnchors
+  return {
+    ok: count >= need && count >= 1,
+    verifiedIssuers: [...verifiedIssuers],
+    divergence: false,
+    reason: count >= need ? undefined : `anchor quorum not met (${count}/${need})`,
+  }
+}
