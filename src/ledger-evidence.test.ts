@@ -33,16 +33,18 @@ function makeLeaf(seq: number, tenantSeq: number = seq): AuditLeaf {
   }
 }
 
-function buildBundle(opts: {
-  kind?: string
-  redacted?: boolean
-  missingCanonical?: boolean
-  tamperedCanonical?: boolean
-  missingCheckpointRoot?: boolean
-  unknownCheckpointRoot?: boolean
-  invalidInclusionProof?: boolean
-  tenantSeqGap?: boolean
-} = {}): { bundle: EvidenceBundle; dailyRoot: string } {
+function buildBundle(
+  opts: {
+    kind?: string
+    redacted?: boolean
+    missingCanonical?: boolean
+    tamperedCanonical?: boolean
+    missingCheckpointRoot?: boolean
+    unknownCheckpointRoot?: boolean
+    invalidInclusionProof?: boolean
+    tenantSeqGap?: boolean
+  } = {},
+): { bundle: EvidenceBundle; dailyRoot: string } {
   const leaf0 = makeLeaf(1, 1)
   const leaf1 = makeLeaf(2, opts.tenantSeqGap ? 4 : 2)
 
@@ -83,8 +85,8 @@ function buildBundle(opts: {
   const entry0Canonical = opts.missingCanonical
     ? undefined
     : opts.tamperedCanonical
-    ? { ...leaf0, detail: "tampered" }
-    : leaf0
+      ? { ...leaf0, detail: "tampered" }
+      : leaf0
 
   const bundle: EvidenceBundle = {
     kind: (opts.kind ?? EVIDENCE_BUNDLE_KIND) as typeof EVIDENCE_BUNDLE_KIND,
