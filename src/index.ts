@@ -360,8 +360,9 @@ export function verifyApprovalReceipt(
   const expiresAt = parseField<string>(receipt.canonicalPayload, "expiresAt")
   if (typeof expiresAt !== "string" || expiresAt.length === 0)
     return { ok: false, reason: "receipt missing expiresAt" }
+  const target = expected.target ?? receipt.target ?? "global"
   const recomputed = canonicalIntentPayload({
-    target: expected.target ?? "global",
+    target,
     actionType: expected.actionType,
     display: receipt.actionDescription,
     params: expected.params,
@@ -446,7 +447,10 @@ export function verifyApprovalReceipt(
         return { ok: false, reason: "assertion origin does not match expectedOrigin" }
 
       const expectedChallenge = base64url(receipt.canonicalPayload)
-      const clientChallengeClean = clientData.challenge.replace(/=/g, "")
+      const clientChallengeClean = clientData.challenge
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=/g, "")
       if (clientChallengeClean !== expectedChallenge) {
         return {
           ok: false,
