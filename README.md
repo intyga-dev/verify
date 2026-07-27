@@ -13,6 +13,7 @@ import { verifyApprovalReceipt } from "@sakra-trust/verify";
 
 // `receipt` came back from SÄKRA when the human approved.
 const check = verifyApprovalReceipt(receipt, {
+  target: "prod-payments-eu",                           // YOUR service identifier — see below
   actionType: "wipe_production",
   params: { target: "prod-db-1", region: "eu-north-1" }, // what you're ACTUALLY about to do
   nonce, // the challenge YOU issued — see "Replay" below
@@ -25,6 +26,11 @@ if (!check.ok) throw new Error(`Refusing to proceed: ${check.reason}`);
 Why re-pass the params? So the approval can't be swapped: if what you're about to execute differs by a
 single byte from what the human saw and signed, `verifyApprovalReceipt` returns `{ ok: false }`. This is
 your defense-in-depth even against a compromised SÄKRA gateway.
+
+`target` is **required and must come from your own configuration, never from the receipt**. It is what
+rejects an approval that was minted for a *different* service (DIV Target Isolation): if the verifier
+read the target out of the receipt, the receipt would be defining the scope it is checked against, and
+a proof harvested from another relying party would verify. Omitting it is refused rather than defaulted.
 
 ## Expiry and replay: what this does and does not prove
 
@@ -71,7 +77,7 @@ verifyApprovalReceipt(receipt, expected, { allowAutoApproved: true }); // → { 
 `ok: true` without `allowAutoApproved` therefore always means **a real human signature verified**.
 
 ## API
-- `verifyApprovalReceipt(receipt, { actionType, params, nonce, requesterDid? }, { allowAutoApproved?, expectedOrigin?, expectedRpId?, requireUserVerification? })` → `{ ok, reason?, autoApproved? }`
+- `verifyApprovalReceipt(receipt, { target, actionType, params, nonce, requesterDid? }, { allowAutoApproved?, expectedOrigin?, expectedRpId?, requireUserVerification?, allowExpired?, asOf?, clockSkewSeconds? })` → `{ ok, reason?, autoApproved? }` — `target` and `nonce` are required and asserted from your own state
 - `canonicalAuthorizationPayload({ nonce, actionType, actionDescription, params })` → the exact signed string
 - `verificationCode(canonical)` → the short `XXXX-XXXX` code shown on the approval screen
 - `verifyEcdsaP256(publicKeyB64, payload, signatureB64)` → `boolean`

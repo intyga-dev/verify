@@ -82,11 +82,15 @@ function buildBundle(
     anchored: true,
   }
 
-  const entry0Canonical = opts.missingCanonical
-    ? undefined
-    : opts.tamperedCanonical
-      ? { ...leaf0, detail: "tampered" }
-      : leaf0
+  // A redacted entry has NO canonical preimage — its content is gone by design. The producer
+  // (packages/db/src/evidence.ts) omits it, so the fixture must too, or the tests silently verify a
+  // bundle shape that is never actually exported.
+  const entry0Canonical =
+    opts.missingCanonical || opts.redacted
+      ? undefined
+      : opts.tamperedCanonical
+        ? { ...leaf0, detail: "tampered" }
+        : leaf0
 
   const bundle: EvidenceBundle = {
     kind: (opts.kind ?? EVIDENCE_BUNDLE_KIND) as typeof EVIDENCE_BUNDLE_KIND,
@@ -112,6 +116,7 @@ function buildBundle(
           type: leaf0.event,
           outcome: leaf0.outcome,
           redacted: !!opts.redacted,
+          tenantSeq: leaf0.tenantSeq,
           signerDid: null,
           sigAlg: null,
           canonical: entry0Canonical,
@@ -125,6 +130,7 @@ function buildBundle(
           type: leaf1.event,
           outcome: leaf1.outcome,
           redacted: false,
+          tenantSeq: leaf1.tenantSeq,
           signerDid: null,
           sigAlg: null,
           canonical: leaf1,
@@ -135,6 +141,72 @@ function buildBundle(
   }
 
   return { bundle, dailyRoot }
+}
+
+/**
+ * Three contiguous entries (tenantSeq 1,2,3) in one block, mirroring how the producer exports them —
+ * a redacted entry keeps its tenantSeq and inclusion proof but loses its canonical preimage.
+ */
+function buildThreeEntryBundle(
+  opts: { redactMiddle?: boolean; dropMiddleTenantSeq?: boolean; duplicateTenantSeq?: boolean } = {},
+): { bundle: EvidenceBundle; dailyRoot: string } {
+  const leaves = [makeLeaf(1, 1), makeLeaf(2, opts.duplicateTenantSeq ? 1 : 2), makeLeaf(3, 3)]
+  const leafHashes = leaves.map(leafHash)
+  const blockRoot = merkleRoot(leafHashes)
+  const dailyLeaves = [hashLeaf(blockRoot)]
+  const dailyRoot = merkleRoot(dailyLeaves)
+
+  const entries = leaves.map((leaf, i) => {
+    const redacted = i === 1 && !!opts.redactMiddle
+    return {
+      event: {
+        seq: leaf.seq,
+        createdAt: leaf.createdAt,
+        type: leaf.event,
+        outcome: leaf.outcome,
+        redacted,
+        tenantSeq: redacted && opts.dropMiddleTenantSeq ? null : leaf.tenantSeq,
+        signerDid: null,
+        sigAlg: null,
+        // Redacted ⇒ no preimage, exactly as packages/db/src/evidence.ts exports it.
+        ...(redacted ? {} : { canonical: leaf }),
+      },
+      proof: {
+        seq: leaf.seq,
+        leaf: leafHashes[i] as string,
+        blockIndex: "0",
+        blockRoot,
+        blockProof: merkleProof(leafHashes, i),
+        checkpointId: "cp-1",
+        checkpointRoot: dailyRoot,
+        checkpointProof: merkleProof(dailyLeaves, 0),
+        anchorRef: "anchor://test/1",
+        anchored: true,
+      },
+    }
+  })
+
+  return {
+    bundle: {
+      kind: EVIDENCE_BUNDLE_KIND,
+      version: 1,
+      exportedAt: "2026-07-15T00:00:00.000Z",
+      tenant: { id: "tenant-1", name: "Test Tenant" },
+      range: { from: "2026-07-15T00:00:00.000Z", to: "2026-07-15T23:59:59.000Z" },
+      checkpoints: [
+        {
+          id: "cp-1",
+          root: dailyRoot,
+          anchorRef: "anchor://test/1",
+          anchoredAt: "2026-07-15T12:00:00.000Z",
+          seqStart: "1",
+          seqEnd: "3",
+        },
+      ],
+      entries,
+    },
+    dailyRoot,
+  }
 }
 
 test("verifyEvidenceBundle: valid unredacted bundle with trusted roots", () => {
@@ -219,6 +291,34 @@ test("verifyEvidenceBundle: unredacted entry missing canonical preimage", () => 
   const res = verifyEvidenceBundle(bundle, { trustedRoots: [dailyRoot] })
   assert.equal(res.ok, false)
   assert.ok(res.failed.some((f) => f.reason.includes("missing its canonical preimage")))
+})
+
+// A redacted entry carries no canonical preimage, so keying the gapless check off the preimage made
+// it invisible: the entry after it compared tenantSeq N+2 against N and the whole bundle failed with
+// "per-tenant omission detected". Lawful retention redaction must not read as tampering.
+test("verifyEvidenceBundle: a redacted entry BETWEEN two intact ones does not report a phantom gap", () => {
+  const { bundle, dailyRoot } = buildThreeEntryBundle({ redactMiddle: true })
+  const res = verifyEvidenceBundle(bundle, { trustedRoots: [dailyRoot] })
+  assert.deepEqual(res.failed, [])
+  assert.equal(res.ok, true)
+  assert.equal(res.commitmentOnly, 1)
+  assert.equal(res.contentVerified, 2)
+})
+
+// The redacted entry must not become a blind spot either: a genuinely missing event around it still
+// has to surface.
+test("verifyEvidenceBundle: a real omission next to a redacted entry is still detected", () => {
+  const { bundle, dailyRoot } = buildThreeEntryBundle({ redactMiddle: true, dropMiddleTenantSeq: true })
+  const res = verifyEvidenceBundle(bundle, { trustedRoots: [dailyRoot] })
+  assert.equal(res.ok, false)
+  assert.ok(res.notes.some((n) => n.includes("no tenantSeq")))
+})
+
+test("verifyEvidenceBundle: a repeated tenantSeq is rejected as not strictly increasing", () => {
+  const { bundle, dailyRoot } = buildThreeEntryBundle({ duplicateTenantSeq: true })
+  const res = verifyEvidenceBundle(bundle, { trustedRoots: [dailyRoot] })
+  assert.equal(res.ok, false)
+  assert.ok(res.failed.some((f) => f.reason.includes("not strictly increasing")))
 })
 
 test("verifyEvidenceBundle: sequence gap between tenantSeq detects omission", () => {

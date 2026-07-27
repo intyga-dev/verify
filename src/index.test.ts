@@ -560,3 +560,18 @@ test("rejects a proof whose target differs from the relying party's own (Target 
   assert.equal(r.ok, false)
   assert.match(r.reason!, /do not match/)
 })
+
+// A plain-JS caller can omit `target` despite the TS signature. Falling back to the receipt's own
+// target would let the receipt define the scope it is checked against, so a proof minted for another
+// service would sail through — the exact replay Target Isolation exists to prevent.
+test("fails closed when the relying party supplies no target at all", () => {
+  const { receipt } = es256Receipt({ actionDescription: "Wipe production database", ...ACTION })
+  for (const missing of [undefined, ""]) {
+    const r = verifyApprovalReceipt(receipt, {
+      ...EXPECTED,
+      target: missing as unknown as string,
+    })
+    assert.equal(r.ok, false)
+    assert.match(r.reason!, /expected\.target is required/)
+  }
+})

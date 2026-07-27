@@ -299,7 +299,7 @@ export interface VerifyReceiptOptions {
   /** Demand the User-Verified flag (biometric/PIN, not mere possession). Defaults to true. */
   requireUserVerification?: boolean
   /**
-   * Expiry handling (DIV §5.8/§6.2). By DEFAULT this verifier is fail-closed on `expiresAt`: a proof
+   * Expiry handling (DIV §5 step 8 / §6.2). By DEFAULT this verifier is fail-closed on `expiresAt`: a proof
    * whose expiry is in the past (beyond the skew tolerance) is rejected — the correct behaviour for a
    * pre-execution check. Set `allowExpired: true` ONLY for post-hoc audit/forensic re-verification,
    * where you deliberately want to confirm a signature that was valid at the time even though it has
@@ -360,9 +360,18 @@ export function verifyApprovalReceipt(
   const expiresAt = parseField<string>(receipt.canonicalPayload, "expiresAt")
   if (typeof expiresAt !== "string" || expiresAt.length === 0)
     return { ok: false, reason: "receipt missing expiresAt" }
-  const target = expected.target ?? receipt.target ?? "global"
+  // FAIL CLOSED on a missing target, like the nonce check above and the WebAuthn pinning below.
+  // TypeScript makes `target` required, but this package is shipped to relying parties and is called
+  // from plain JS too. Defaulting to the receipt's OWN target would have the receipt vouch for its own
+  // scope — exactly the cross-service replay DIV Invariant 5 (Target Isolation) exists to stop.
+  if (typeof expected.target !== "string" || expected.target.length === 0)
+    return {
+      ok: false,
+      reason:
+        "expected.target is required — it must be YOUR target identifier, asserted independently of the receipt (DIV Target Isolation)",
+    }
   const recomputed = canonicalIntentPayload({
-    target,
+    target: expected.target,
     actionType: expected.actionType,
     display: receipt.actionDescription,
     params: expected.params,
@@ -376,7 +385,7 @@ export function verifyApprovalReceipt(
       reason: "target/params/actionType do not match what was approved",
     }
 
-  // Expiration (DIV §5.8/§6.2). Fail-closed by default; opt out only for audit re-verification.
+  // Expiration (DIV §5 step 8 / §6.2). Fail-closed by default; opt out only for audit re-verification.
   if (!opts.allowExpired) {
     const expiryMs = Date.parse(expiresAt)
     if (Number.isNaN(expiryMs)) return { ok: false, reason: "expiresAt is not a valid RFC3339 timestamp" }
@@ -516,14 +525,19 @@ export function verifyApprovalReceipt(
 // ─── Audit ledger inclusion proofs ───────────────────────────────────────────
 // The other half of "inspect-it-yourself": confirm an audit event is committed to SÄKRA's append-only
 // Merkle log against an independently anchored daily root. Same zero-dependency, no-secret contract as
-// the approval-receipt verifier above. See @sakra-trust/ledger (SPEC.md) for the format and the
+// the approval-receipt verifier above. See docs/DEWP.md for the format and ledger/roots for the
 // published end-of-day roots. Surfaced on the CLI as `sakra audit-verify`.
 
 export {
+  ALGORITHM_REGISTRY,
+  type AlgorithmRegistry,
+  AUDIT_PROFILE,
   BUNDLE_KIND,
   BUNDLE_KIND_ALIASES,
   type BundleVerification,
   type CheckResult,
+  DEWP_PROTOCOL,
+  DEWP_VERSION,
   deriveVerificationLevel,
   type ProofBundle,
   type VerificationLevel,
@@ -539,6 +553,7 @@ export {
   type EvidenceEntry,
   type EvidenceVerification,
   type EvidenceVerifyOptions,
+  type RedactionRecord,
   verifyEvidenceBundle,
 } from "./ledger-evidence.js"
 export {

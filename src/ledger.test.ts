@@ -104,7 +104,8 @@ test("verifyBundle: independent root + canonical leaf => ok", () => {
       canonical: makeLeaf(target),
     },
     proof,
-    anchor: { dailyRoot, anchorRef: proof.anchorRef, anchored: true },
+    anchorRef: proof.anchorRef,
+    anchored: true,
   }
 
   const good = verifyBundle(bundle, { trustedRoot: dailyRoot })
@@ -179,7 +180,8 @@ test("verifyBundle: a signed event verifies its embedded ES256 signature => SIGN
       canonical: leafRow,
     },
     proof,
-    anchor: { dailyRoot, anchorRef: proof.anchorRef, anchored: true },
+    anchorRef: proof.anchorRef,
+    anchored: true,
   }
 
   const res = verifyBundle(bundle, { trustedRoot: dailyRoot })
@@ -225,11 +227,79 @@ test("verifyBundle: canonical that doesn't match the leaf fails leaf binding", (
       canonical: makeLeaf(999), // wrong content
     },
     proof,
-    anchor: { dailyRoot, anchorRef: proof.anchorRef, anchored: true },
+    anchorRef: proof.anchorRef,
+    anchored: true,
   }
   const res = verifyBundle(bundle, { trustedRoot: dailyRoot })
   assert.equal(res.checks.leafBinding.pass, false)
   assert.equal(res.ok, false)
+})
+
+// Bundles exported before DEWP §6.2 carried the root and publication status under the name `anchor`,
+// which the spec reserves for a SIGNED anchor object. Those bundles must keep verifying.
+test("verifyBundle: a legacy pre-§6.2 `anchor` block still supplies the self-asserted root", () => {
+  const target = 3
+  const { proof, dailyRoot } = buildProof(target)
+  const bundle: ProofBundle = {
+    kind: "sakra.audit.inclusion-proof",
+    version: 1,
+    exportedAt: "2026-07-15T00:00:00.000Z",
+    event: {
+      seq: String(target),
+      createdAt: "2026-07-15T00:00:00.000Z",
+      type: "TEST_EVENT",
+      outcome: "SUCCESS",
+      detail: `event ${target}`,
+      actorDid: null,
+      subjectDid: null,
+      signerDid: null,
+      signature: null,
+      sigAlg: null,
+      canonical: makeLeaf(target),
+    },
+    proof,
+    legacyAnchor: { dailyRoot, anchorRef: proof.anchorRef, anchored: true },
+  }
+  const res = verifyBundle(bundle)
+  assert.equal(res.rootSource, "self-asserted")
+  assert.equal(res.dailyRoot, dailyRoot)
+  assert.equal(res.properties.commitmentVerified, true)
+})
+
+// An unfamiliar Application Profile means an unfamiliar canonical array layout. Hashing it under this
+// profile's field order would report a leaf mismatch that is indistinguishable from tampering, so the
+// verifier must decline to bind content rather than guess — while still verifying the commitment.
+test("verifyBundle: an unknown canonical profile suspends leaf binding but not commitment", () => {
+  const target = 2
+  const { proof, dailyRoot } = buildProof(target)
+  const bundle: ProofBundle = {
+    kind: "dewp.audit.inclusion-proof",
+    version: "1.0",
+    profile: "com.someone-else.audit.v9",
+    exportedAt: "2026-07-15T00:00:00.000Z",
+    event: {
+      seq: String(target),
+      createdAt: "2026-07-15T00:00:00.000Z",
+      type: "TEST_EVENT",
+      outcome: "SUCCESS",
+      detail: `event ${target}`,
+      actorDid: null,
+      subjectDid: null,
+      signerDid: null,
+      signature: null,
+      sigAlg: null,
+      canonical: makeLeaf(target),
+    },
+    proof,
+    anchorRef: proof.anchorRef,
+    anchored: true,
+  }
+  const res = verifyBundle(bundle, { trustedRoot: dailyRoot })
+  assert.equal(res.properties.commitmentVerified, true)
+  assert.equal(res.checks.leafBinding.pass, null)
+  assert.equal(res.properties.contentVerified, false)
+  assert.equal(res.verificationLevel, "COMMITMENT_VERIFIED")
+  assert.ok(res.notes.some((n) => n.includes("com.someone-else.audit.v9")))
 })
 
 test("verifyMerkleProof is order-sensitive (position matters)", () => {

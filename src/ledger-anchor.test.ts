@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import crypto from "node:crypto"
 import { test } from "node:test"
 import {
+  anchorDigest,
   anchorDigestHex,
   anchorPreimage,
   type SignedAnchor,
@@ -9,6 +10,7 @@ import {
   verifyAnchorQuorum,
   verifyAnchorSignature,
 } from "./ledger-anchor.js"
+import { emptyRoot, hashLeaf } from "./ledger-merkle.js"
 
 const DAILY_ROOT = "e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8"
 const base = {
@@ -112,4 +114,44 @@ test("quorum: divergence (a trusted issuer signs a DIFFERENT root) is fatal", ()
   const res = verifyAnchorQuorum([anchorA, anchorBFork], DAILY_ROOT, policy, resolve)
   assert.equal(res.divergence, true)
   assert.equal(res.ok, false)
+})
+
+// The reference vectors printed in docs/DEWP.md §10 exist so a third party can check their SHA-256
+// implementation against ours without running our code. If the spec's numbers and the implementation
+// ever disagree, the spec is publishing values nobody can reproduce — so pin them here.
+test("DEWP §10 published reference vectors reproduce exactly", () => {
+  const coreLeaf = [
+    "1048576",
+    "2026-07-24T12:00:00.000Z",
+    "ACTION_APPROVED",
+    "SUCCESS",
+    "Database drop approved",
+    '{"target":"users"}',
+    "did:example:human:alice",
+    "base64-spki",
+    '{"actionType":"db:dropTable","type":"div-intent-verification","v":1}',
+    "base64-sig",
+    "ES256",
+    "42",
+  ]
+  assert.equal(
+    hashLeaf(JSON.stringify(coreLeaf)),
+    "0d82acddaf17b6fecccffa03e13d97174d0d0aaf69893251dcd3d79ba48385fe",
+  )
+
+  const anchor = {
+    dailyRoot: "e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8",
+    timestamp: "2026-07-24T23:59:00.000Z",
+    issuer: "https://transparency.example.org",
+    algorithm: "ES256" as const,
+  }
+  assert.equal(
+    anchorPreimage(anchor),
+    '["e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8","2026-07-24T23:59:00.000Z","https://transparency.example.org","ES256"]',
+  )
+  assert.equal(anchorDigestHex(anchor), "005978edb1a6227bb93622874436fc662e01ee9bb53d3708d245f728e98d5120")
+  // The signed message is the RAW digest, never its hex text (§5.2).
+  assert.equal(anchorDigest(anchor).length, 32)
+
+  assert.equal(emptyRoot(), "dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986")
 })
