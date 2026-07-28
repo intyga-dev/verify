@@ -111,9 +111,34 @@ test("quorum: divergence (a trusted issuer signs a DIFFERENT root) is fatal", ()
     trustedIssuers: ["https://a.example", "https://b.example"],
     quorum: "N_OF_M" as const,
   }
-  const res = verifyAnchorQuorum([anchorA, anchorBFork], DAILY_ROOT, policy, resolve)
+  // Divergence is only established by anchors the CALLER fetched per checkpoint. The signed anchor
+  // preimage carries no checkpoint identity, so a conflicting root and a perfectly ordinary anchor
+  // from another day look identical — see verifyAnchorQuorum's divergenceAnchors.
+  const res = verifyAnchorQuorum([anchorA, anchorBFork], DAILY_ROOT, policy, resolve, {
+    divergenceAnchors: [anchorBFork],
+  })
   assert.equal(res.divergence, true)
   assert.equal(res.ok, false)
+})
+
+test("quorum: an anchor the caller did NOT vouch for cannot manufacture divergence", () => {
+  // The regression: appending a genuine, publicly available anchor for a DIFFERENT day used to force
+  // an INVALID verdict with a tamper alarm — denial of evidence by anyone who can edit a bundle.
+  const a = es256()
+  const b = es256()
+  const anchorA = mkAnchor("https://a.example", a.privateKey, DAILY_ROOT)
+  const otherDay = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  const anchorBOtherDay = mkAnchor("https://b.example", b.privateKey, otherDay)
+  const resolve = (an: SignedAnchor) =>
+    ({ "https://a.example": a.publicKey, "https://b.example": b.publicKey })[an.issuer] ?? null
+  const policy = {
+    requiredAnchors: 1,
+    trustedIssuers: ["https://a.example", "https://b.example"],
+    quorum: "N_OF_M" as const,
+  }
+  const res = verifyAnchorQuorum([anchorA, anchorBOtherDay], DAILY_ROOT, policy, resolve)
+  assert.equal(res.divergence, false, "an unvouched anchor must not be read as divergence")
+  assert.equal(res.ok, true, "the genuine quorum over this root still stands")
 })
 
 // The reference vectors printed in docs/DEWP.md §10 exist so a third party can check their SHA-256

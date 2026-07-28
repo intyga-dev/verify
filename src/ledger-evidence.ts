@@ -1,3 +1,10 @@
+import {
+  type AnchorKeyResolver,
+  type AnchorPolicy,
+  type ExternalAnchorKeys,
+  type SignedAnchor,
+  verifyAnchorQuorum,
+} from "./ledger-anchor.js"
 import { type AlgorithmRegistry, AUDIT_PROFILE } from "./ledger-bundle.js"
 import { type AuditLeaf, leafHash } from "./ledger-leaf.js"
 import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
@@ -8,10 +15,9 @@ import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
 // existed at this position under this anchored root" — while unredacted entries additionally bind
 // the displayed content to the leaf (CONTENT-VERIFIED).
 
-// DEWP canonical kind (docs/DEWP.md §6.3). The legacy `sakra.audit.*` form is accepted as an alias
-// on read (§6.5) so previously-exported bundles still verify.
+// DEWP canonical kind (docs/DEWP.md §6.3). Producers emit this form and verifiers require it; there
+// is no vendor-prefixed alias, since no bundle has ever been exported under one.
 export const EVIDENCE_BUNDLE_KIND = "dewp.audit.evidence-bundle"
-export const EVIDENCE_BUNDLE_KIND_ALIASES = ["sakra.audit.evidence-bundle"] as const
 
 /**
  * DEWP §6.3/§16 redaction record. `COMMITMENT_ONLY` means content was lawfully purged under a
@@ -37,10 +43,11 @@ export interface EvidenceEntry {
     /** Legacy boolean form, still read so bundles exported before `redaction` keep verifying. */
     redacted?: boolean
     /**
-     * Per-tenant monotonic counter, present on redacted entries too (DEWP §16). The gapless check
-     * below reads THIS, not `canonical.tenantSeq`: a redacted entry has no canonical preimage, so
-     * keying completeness off the preimage makes redacted entries invisible to the check and turns
-     * a lawfully redacted log into a phantom gap.
+     * Per-tenant monotonic counter, present on redacted entries too (DEWP §16).
+     *
+     * DISPLAY COPY. It is a sibling of `canonical` and is covered by nothing — not the leaf, not the
+     * root, not any anchor. The gapless check therefore prefers `canonical.tenantSeq`, and where it
+     * must fall back (redacted entries have no preimage) it says so in the verdict notes.
      */
     tenantSeq?: string | null
     signerDid: string | null
@@ -54,7 +61,7 @@ export interface EvidenceEntry {
 export interface EvidenceBundle {
   /** DEWP §6.3 envelope. Absent on bundles exported before the envelope was added. */
   protocol?: string
-  kind: typeof EVIDENCE_BUNDLE_KIND | (typeof EVIDENCE_BUNDLE_KIND_ALIASES)[number]
+  kind: typeof EVIDENCE_BUNDLE_KIND
   version: string | number
   /** Canonical-preimage Application Profile (§4.5). */
   profile?: string
@@ -89,8 +96,17 @@ export interface EvidenceVerification {
   contentVerified: number
   commitmentOnly: number
   failed: { seq: string; reason: string }[]
-  /** Distinct daily roots the entries chain up to — confirm each against its external anchor. */
-  roots: { root: string; anchorRef: string | null }[]
+  /**
+   * Distinct daily roots the entries chain up to. `anchorVerified` is true only when a quorum of
+   * trusted issuers signed that root (requires anchors + policy + resolver in the options); it is
+   * null when no policy was supplied, i.e. nobody checked.
+   */
+  roots: {
+    root: string
+    anchorRef: string | null
+    anchorVerified: boolean | null
+    verifiedIssuers: string[]
+  }[]
   notes: string[]
 }
 
@@ -98,6 +114,45 @@ export interface EvidenceVerifyOptions {
   /** Daily roots obtained from the external anchor (root hex strings). When supplied, every entry
    * must chain to one of them for a trustworthy verdict. */
   trustedRoots?: string[]
+  /**
+   * Signed anchors for the roots below, fetched by YOU from each issuer (DEWP §5.3).
+   *
+   * Without these the strongest verdict this function can reach is "the roots I was handed match" —
+   * nobody has checked a signature over those roots. verifyBundle has implemented quorum since §6.2;
+   * the evidence path, which is the auditor-facing artifact, had no way to express it at all.
+   */
+  anchors?: SignedAnchor[]
+  anchorPolicy?: AnchorPolicy
+  resolveAnchorKey?: AnchorKeyResolver
+  /** Pinned external-log keys (Rekor). Unpinned ⇒ that anchor is unverifiable ⇒ it does not count. */
+  externalKeys?: ExternalAnchorKeys
+}
+
+/**
+ * Compare an entry's DISPLAYED fields against the committed preimage.
+ *
+ * The leaf commits to `canonical`. Every field duplicated next to it — seq, createdAt, type,
+ * outcome, signerDid, sigAlg, tenantSeq — is unsigned, and this is the artifact a human, a console
+ * or a SIEM actually reads. Without this check a bundle could carry genuine proofs under a real
+ * anchored root while displaying `outcome: "SUCCESS"` over a committed `FAILURE`, and still come
+ * back fully verified. Returns a reason on mismatch, or null.
+ */
+function displayMismatch(event: EvidenceEntry["event"]): string | null {
+  const c = event.canonical
+  if (!c) return null
+  const differs = (label: string, shown: unknown, committed: unknown): string | null =>
+    shown != null && String(shown) !== String(committed)
+      ? `displayed ${label} ("${String(shown)}") does not match the committed value ("${String(committed)}")`
+      : null
+  return (
+    differs("seq", event.seq, c.seq) ??
+    differs("createdAt", event.createdAt, c.createdAt) ??
+    differs("type", event.type, c.event) ??
+    differs("outcome", event.outcome, c.outcome) ??
+    differs("signerDid", event.signerDid, c.signerDid) ??
+    differs("sigAlg", event.sigAlg, c.sigAlg) ??
+    differs("tenantSeq", event.tenantSeq, c.tenantSeq)
+  )
 }
 
 export function verifyEvidenceBundle(
@@ -109,8 +164,14 @@ export function verifyEvidenceBundle(
   let contentVerified = 0
   let commitmentOnly = 0
 
-  if (bundle.kind !== EVIDENCE_BUNDLE_KIND && !EVIDENCE_BUNDLE_KIND_ALIASES.includes(bundle.kind as never)) {
-    notes.push(`Unexpected bundle kind "${bundle.kind}" (expected "${EVIDENCE_BUNDLE_KIND}").`)
+  // DEWP §6.5: "a compliant verifier MUST reject any other value." A note let a container of one
+  // type be fed to the verifier for another and still come back ok — the caller would be reading a
+  // verdict produced under semantics the artifact was never built for.
+  if (bundle.kind !== EVIDENCE_BUNDLE_KIND) {
+    failed.push({
+      seq: "-",
+      reason: `refusing bundle kind "${bundle.kind}" (expected "${EVIDENCE_BUNDLE_KIND}") — DEWP §6.5`,
+    })
   }
   // Unknown canonical layout ⇒ leaf binding is not attempted (see verifyBundle for the rationale).
   const unknownProfile = bundle.profile !== undefined && bundle.profile !== AUDIT_PROFILE
@@ -129,7 +190,7 @@ export function verifyEvidenceBundle(
   if (!trusted) {
     notes.push(
       "No independent roots supplied — verifying against the roots inside the bundle. This proves " +
-        "internal consistency, NOT that the bundle matches SÄKRA's anchored log. Re-run with the " +
+        "internal consistency, NOT that the bundle matches Intyga's anchored log. Re-run with the " +
         "roots from the external anchors (see `roots`/anchorRef) for a real verdict.",
     )
   }
@@ -192,6 +253,27 @@ export function verifyEvidenceBundle(
         })
         continue
       }
+      // The leaf commits to `canonical`. Everything ALONGSIDE it on the entry is a display copy that
+      // nothing signs, so it has to be checked against the committed value or it is just a caption.
+      const bad = displayMismatch(entry.event)
+      if (bad) {
+        failed.push({ seq, reason: bad })
+        continue
+      }
+      // The entry belongs to THIS bundle's tenant. canonical.tenantId is committed; without this an
+      // entry from another tenant, with a genuine proof under a root the auditor trusts, counts as
+      // one of this tenant's own records.
+      if (
+        entry.event.canonical.tenantId != null &&
+        bundle.tenant?.id != null &&
+        entry.event.canonical.tenantId !== bundle.tenant.id
+      ) {
+        failed.push({
+          seq,
+          reason: `entry belongs to tenant ${entry.event.canonical.tenantId}, not ${bundle.tenant.id}`,
+        })
+        continue
+      }
       contentVerified++
     } else {
       failed.push({
@@ -205,14 +287,21 @@ export function verifyEvidenceBundle(
   // requires rejecting gaps, duplicates AND out-of-order values, so compare against tenantSeq_N + 1
   // exactly rather than merely checking for forward movement.
   //
-  // The counter is read from the ENTRY, falling back to the canonical preimage for bundles exported
-  // before entries carried it. A redacted entry has no preimage, so reading only the preimage would
-  // skip it and report the hole it leaves as an omission — flagging lawful redaction as tampering.
+  // The counter is read from the COMMITTED preimage first. Reading `entry.tenantSeq` first was the
+  // bug: that field is a sibling of `canonical` and is covered by nothing — not the leaf, not the
+  // root, not any anchor. A producer could omit the incriminating events, keep the honest entries
+  // with their genuine proofs, renumber the display counters to close the hole, and the contiguity
+  // check would report no gap (verified). A redacted entry has no preimage, so it falls back to the
+  // redaction commitment and then to the entry, or the hole lawful redaction leaves would read as an
+  // omission — but those values are NOT leaf-bound, which the note below now says plainly.
   let lastTenantSeq: bigint | null = null
   let firstTenantSeq: bigint | null = null
   let sawUncountedEntry = false
+  let sawUnboundCounter = false
   for (const entry of bundle.entries) {
-    const tenantSeqStr = entry.event.tenantSeq ?? entry.event.canonical?.tenantSeq
+    const bound = entry.event.canonical?.tenantSeq
+    const tenantSeqStr = bound ?? entry.event.redaction?.commitment?.tenantSeq ?? entry.event.tenantSeq
+    if (bound == null && tenantSeqStr != null) sawUnboundCounter = true
     if (tenantSeqStr == null) {
       sawUncountedEntry = true
       continue
@@ -234,6 +323,12 @@ export function verifyEvidenceBundle(
     notes.push(
       "Some entries carry no tenantSeq, so gapless completeness could not be checked across them. " +
         "(Bundles exported before redacted entries carried tenantSeq — re-export for a complete check.)",
+    )
+  }
+  if (sawUnboundCounter) {
+    notes.push(
+      "Some entries' tenantSeq is NOT covered by the Merkle leaf (redacted entries have no preimage). " +
+        "Gaplessness across those rests on the producer's redaction record, not on the anchored log.",
     )
   }
 
@@ -266,11 +361,37 @@ export function verifyEvidenceBundle(
     }
   }
 
-  const roots = [...knownRoots.entries()].map(([root, anchorRef]) => ({
-    root,
-    anchorRef,
-  }))
-  const ok = failed.length === 0 && bundle.entries.length > 0 && !!trusted
+  // DEWP §5.3 anchor quorum, per distinct root. Only runs when the caller supplied anchors, a policy
+  // AND a key resolver — signatures are checked against keys the VERIFIER trusts, so a bundle cannot
+  // vouch for itself. Divergence deliberately uses the same caller-supplied set (see
+  // verifyAnchorQuorum's divergenceAnchors): the anchor preimage carries no checkpoint identity, so
+  // only anchors fetched per checkpoint can distinguish a conflicting root from another day's.
+  const canCheckAnchors = Boolean(opts.anchors?.length && opts.anchorPolicy && opts.resolveAnchorKey)
+  const roots = [...knownRoots.entries()].map(([root, anchorRef]) => {
+    if (!canCheckAnchors || !opts.anchorPolicy || !opts.resolveAnchorKey) {
+      return { root, anchorRef, anchorVerified: null, verifiedIssuers: [] as string[] }
+    }
+    const q = verifyAnchorQuorum(opts.anchors ?? [], root, opts.anchorPolicy, opts.resolveAnchorKey, {
+      divergenceAnchors: opts.anchors ?? [],
+      externalKeys: opts.externalKeys,
+    })
+    if (q.divergence) {
+      failed.push({ seq: "-", reason: `ANCHOR DIVERGENCE for root ${root.slice(0, 16)}…: ${q.reason}` })
+    } else if (!q.ok && q.reason) {
+      notes.push(`Root ${root.slice(0, 16)}…: ${q.reason}`)
+    }
+    return { root, anchorRef, anchorVerified: q.ok, verifiedIssuers: q.verifiedIssuers }
+  })
+  if (!canCheckAnchors) {
+    notes.push(
+      "No anchor policy supplied — the roots above were compared, but no independent signature over " +
+        "them was checked. Pass anchors + anchorPolicy + resolveAnchorKey for a DEWP §5.3 verdict.",
+    )
+  }
+  // When a policy WAS supplied, every root must reach quorum; a bundle resting on an unanchored root
+  // is not independently attested no matter how well its proofs verify.
+  const allAnchored = !canCheckAnchors || roots.every((r) => r.anchorVerified === true)
+  const ok = failed.length === 0 && bundle.entries.length > 0 && !!trusted && allAnchored
   if (!trusted && failed.length === 0 && bundle.entries.length > 0) {
     notes.push("All entries internally consistent; supply --roots for an independent verdict.")
   }

@@ -1,22 +1,26 @@
-# @sakra-trust/verify
+# @intyga/verify
 
-**Independently confirm that a human cryptographically approved exactly the action you're about to run — with no SÄKRA secret.**
+**Independently confirm that a human cryptographically approved exactly the action you're about to run — with no Intyga secret.**
 
-When SÄKRA returns an approval, it hands you a **receipt**: the exact canonical payload the human's key signed, plus the signature and public key. This library lets your own code re-derive that payload from *your* parameters, check it byte-for-byte against what was signed, and verify the signature — entirely offline. You don't have to trust SÄKRA's word that the approval is real; you check the math yourself.
+When Intyga returns an approval, it hands you a **receipt**: the exact canonical payload the human's key signed, plus the signature and public key. This library lets your own code re-derive that payload from *your* parameters, check it byte-for-byte against what was signed, and verify the signature — entirely offline. You don't have to trust Intyga's word that the approval is real; you check the math yourself.
 
 - **Zero runtime dependencies** (`node:crypto` only). Read the whole thing — ~500 lines for receipt verification, under 1,000 including the Merkle inclusion-proof code.
-- **No SÄKRA secret required.** Verification uses only the signer's public key from the receipt.
+- **No Intyga secret required.** Verification uses approver keys **you** resolve — never a key read out of the receipt (see [Whose key?](#whose-key-the-trust-anchor)).
 - Verifies both **WebAuthn** approvals (passkey / hardware security key — the normal path) and **raw P-256** signatures (legacy/headless signer keys), plus policy `AUTO_APPROVED` receipts.
 
 ```ts
-import { verifyApprovalReceipt } from "@sakra-trust/verify";
+import { verifyApprovalReceipt } from "@intyga/verify";
 
-// `receipt` came back from SÄKRA when the human approved.
+// `receipt` came back from Intyga when the human approved.
 const check = verifyApprovalReceipt(receipt, {
   target: "prod-payments-eu",                           // YOUR service identifier — see below
   actionType: "wipe_production",
   params: { target: "prod-db-1", region: "eu-north-1" }, // what you're ACTUALLY about to do
   nonce, // the challenge YOU issued — see "Replay" below
+  approvers: {                       // WHOSE signature you accept — see "Whose key?" below
+    dids: ["did:intyga:cfo-alice", "did:intyga:cto-bob"],
+    resolveKey: (did) => APPROVER_KEYS[did] ?? null,    // from YOUR config/directory
+  },
 });
 
 if (!check.ok) throw new Error(`Refusing to proceed: ${check.reason}`);
@@ -25,12 +29,46 @@ if (!check.ok) throw new Error(`Refusing to proceed: ${check.reason}`);
 
 Why re-pass the params? So the approval can't be swapped: if what you're about to execute differs by a
 single byte from what the human saw and signed, `verifyApprovalReceipt` returns `{ ok: false }`. This is
-your defense-in-depth even against a compromised SÄKRA gateway.
+your defense-in-depth even against a compromised Intyga gateway.
 
 `target` is **required and must come from your own configuration, never from the receipt**. It is what
 rejects an approval that was minted for a *different* service (DIV Target Isolation): if the verifier
 read the target out of the receipt, the receipt would be defining the scope it is checked against, and
 a proof harvested from another relying party would verify. Omitting it is refused rather than defaulted.
+
+## Whose key? (the trust anchor)
+
+`approvers` is **required**, and it is the single most important input. Everything else this library
+does is arithmetic; this is the part that decides *whose* approval counts.
+
+Verification never uses `receipt.signerPublicKey`. If it did, the receipt would be vouching for its own
+signer: anyone able to hand you a receipt — and under the DIV threat model that includes the untrusted
+agent — could generate a keypair, sign a payload over the nonce you issued and the params you are about
+to run, put any string in `signerDid`, and be told a human approved. Everything would check out, because
+the signature really would verify against the key in the object.
+
+So you supply the keys. Two forms:
+
+```ts
+// A pinned allowlist. Simplest, and the identity IS the key — the receipt's signerDid is not trusted.
+approvers: { publicKeys: [ALICE_SPKI_B64, BOB_SPKI_B64] }
+
+// Or a DID allowlist plus your own resolver (directory lookup, enrollment record, config map).
+approvers: { dids: [...], resolveKey: (did) => myDirectory.get(did) ?? null }
+```
+
+**Where the key must come from.** Somewhere you control and that an attacker who can forge a receipt
+cannot also change: your deployment config, your secrets manager, your own IdP/directory, or keys you
+pinned at enrollment.
+
+**Where it must NOT come from.** Fetching approver keys from the Intyga gateway at verification time
+defeats the entire property — a compromised gateway would then supply both the receipt and the key that
+validates it, and this library would happily agree. If you are going to trust the gateway for keys, you
+do not need this library; you can just trust its answer.
+
+For quorum receipts, count is enforced for you: the signed payload carries `requirement.requiredApprovals`
+and verification counts **distinct** approvers whose signature verifies under a key you resolved. In
+`publicKeys` mode distinctness is by key, because `signerDid` is unverified there.
 
 ## Expiry and replay: what this does and does not prove
 
@@ -82,8 +120,8 @@ verifyApprovalReceipt(receipt, expected, { allowAutoApproved: true }); // → { 
 - `verificationCode(canonical)` → the short `XXXX-XXXX` code shown on the approval screen
 - `verifyEcdsaP256(publicKeyB64, payload, signatureB64)` → `boolean`
 
-> The canonicalization here is byte-for-byte identical to the SÄKRA gateway, the approval UI, and
-> `@sakra-trust/mcp-schemas`. That identity is the whole point — don't reformat it.
+> The canonicalization here is byte-for-byte identical to the Intyga gateway, the approval UI, and
+> `@intyga/mcp-schemas`. That identity is the whole point — don't reformat it.
 
 Requires Node ≥18 (`node:crypto`).
 

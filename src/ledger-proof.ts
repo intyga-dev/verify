@@ -13,9 +13,15 @@ export interface InclusionProof {
   blockIndex: string
   blockRoot: string
   blockProof: ProofStep[] // event leaf → block root
+  /** Position of this event's leaf within its block, and how many leaves that block had. */
+  leafIndex: number
+  blockLeafCount: number
   checkpointId: string | null
   checkpointRoot: string | null
   checkpointProof: ProofStep[] // block root → daily root
+  /** Position of the block root within the daily tree, and that tree's leaf count. */
+  checkpointLeafIndex: number
+  checkpointLeafCount: number
   anchorRef: string | null
   anchored: boolean
 }
@@ -26,6 +32,28 @@ export interface InclusionProof {
  * trusting the root shipped inside the proof would let a forged bundle vouch for itself.
  */
 export function verifyInclusionProof(proof: InclusionProof, dailyRoot: string): boolean {
-  if (!verifyMerkleProof(proof.leaf, proof.blockProof, proof.blockRoot)) return false
-  return verifyMerkleProof(hashLeaf(proof.blockRoot), proof.checkpointProof, dailyRoot)
+  // Position is REQUIRED, and its absence is a rejection rather than a skipped check. This tree pads
+  // an unpaired trailing node against itself, so without an index and a leaf count a path to a leaf
+  // that was never in the tree recomputes the real root (verified: a proof for index 3 verifies
+  // against a 3-leaf root). A proof that cannot say where its leaf sits does not establish inclusion.
+  if (
+    !Number.isInteger(proof.leafIndex) ||
+    !Number.isInteger(proof.blockLeafCount) ||
+    !Number.isInteger(proof.checkpointLeafIndex) ||
+    !Number.isInteger(proof.checkpointLeafCount)
+  ) {
+    return false
+  }
+  if (
+    !verifyMerkleProof(proof.leaf, proof.blockProof, proof.blockRoot, {
+      index: proof.leafIndex,
+      leafCount: proof.blockLeafCount,
+    })
+  ) {
+    return false
+  }
+  return verifyMerkleProof(hashLeaf(proof.blockRoot), proof.checkpointProof, dailyRoot, {
+    index: proof.checkpointLeafIndex,
+    leafCount: proof.checkpointLeafCount,
+  })
 }

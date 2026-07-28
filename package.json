@@ -1,7 +1,7 @@
 {
-  "name": "@sakra-trust/verify",
+  "name": "@intyga/verify",
   "version": "0.1.0",
-  "description": "Independently verify SÄKRA approval receipts — confirm a human cryptographically approved exactly the action about to run, with NO SÄKRA secret. Zero runtime dependencies; inspect it yourself.",
+  "description": "Independently verify Intyga approval receipts — confirm a human cryptographically approved exactly the action about to run, with NO Intyga secret. Zero runtime dependencies; inspect it yourself.",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/index.js",

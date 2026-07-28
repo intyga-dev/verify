@@ -2,7 +2,7 @@ import crypto from "node:crypto"
 
 // Pure Merkle primitives — zero dependencies beyond node:crypto. This file is the trust root of the
 // verifier: an auditor should be able to read it end to end and be convinced. It is a byte-for-byte
-// port of the tree construction used to build SÄKRA's two-tier witness anchor
+// port of the tree construction used to build Intyga's two-tier witness anchor
 // (per-event leaves → block roots → daily root). If this and the producer ever disagree, proofs fail
 // closed (verification returns false), never open.
 
@@ -14,7 +14,7 @@ export function sha256Hex(s: string): string {
 // under DISTINCT one-byte prefixes so an interior-node hash can never be reinterpreted as a leaf
 // (blocks second-preimage / proof malleability where a subtree root is passed off as a leaf).
 // 0x00 = leaf, 0x01 = node, 0x02 = empty root. Node children are HEX-DECODED to their raw 32 bytes
-// before hashing (NOT concatenated as hex text). Must stay byte-identical to the @sakra-trust/db producer.
+// before hashing (NOT concatenated as hex text). Must stay byte-identical to the @intyga/db producer.
 const LEAF_TAG = 0x00
 const NODE_TAG = 0x01
 const EMPTY_TAG = 0x02
@@ -106,8 +106,65 @@ export function merkleProof(leaves: string[], index: number): ProofStep[] {
   return proof
 }
 
+/**
+ * The audit-path length for `index` in a duplicate-last tree of `leafCount` leaves.
+ * One sibling per level, and the tree has ceil(log2(n)) levels above the leaves.
+ */
+export function expectedPathLength(leafCount: number): number {
+  return leafCount <= 1 ? 0 : Math.ceil(Math.log2(leafCount))
+}
+
+/**
+ * Position of the leaf a proof is for, and how many leaves its tree had. Supplying these turns an
+ * "is there SOME path from this leaf to this root" check into "is this leaf at this position".
+ */
+export interface ProofBounds {
+  index: number
+  leafCount: number
+}
+
 /** Recompute the root from a leaf + its proof and compare. This is what a third party runs. */
-export function verifyMerkleProof(leaf: string, proof: ProofStep[], root: string): boolean {
+export function verifyMerkleProof(
+  leaf: string,
+  proof: ProofStep[],
+  root: string,
+  bounds?: ProofBounds,
+): boolean {
+  // Bounds are what make this a proof of membership rather than a proof that A path exists.
+  //
+  // This tree pads an unpaired trailing node by hashing it against ITSELF (DEWP §5.1.1 rule 3), so
+  // merkleRoot([a,b,c]) === merkleRoot([a,b,c,c]) and a path for the nonexistent index 3 recomputes
+  // the 3-leaf root exactly. Without a length and index there is nothing to reject it with, which
+  // falsifies DEWP §17.1's claim that forging an inclusion path needs a SHA-256 second preimage.
+  if (bounds) {
+    const { index, leafCount } = bounds
+    if (!Number.isInteger(index) || !Number.isInteger(leafCount)) return false
+    if (leafCount < 1 || index < 0 || index >= leafCount) return false
+    if (proof.length !== expectedPathLength(leafCount)) return false
+    // Each sibling's side follows from the index; letting the prover choose it freely would hand
+    // back the flexibility the length check just removed.
+    //
+    // The self-pairing check is what actually closes the padding forgery. `leafCount` comes from the
+    // proof, so a prover can simply inflate it: claiming leafCount 4 on a 3-leaf tree makes index 3
+    // "in range" and the path length correct, and the duplicate-last root is identical — so range
+    // and length alone still accept it (verified). But padding is observable: a node hashed against
+    // ITSELF only legitimately occurs at the unpaired END of an odd level. A step whose sibling
+    // equals the running node anywhere else is the signature of an index pointing into padding.
+    let idx = index
+    let levelSize = leafCount
+    let node = leaf
+    for (const step of proof) {
+      const expectedSide = idx % 2 === 1 ? "LEFT" : "RIGHT"
+      if (step.siblingPosition !== expectedSide) return false
+      const selfPaired = step.siblingHash === node
+      const legitimatelyUnpaired = idx === levelSize - 1 && levelSize % 2 === 1
+      if (selfPaired && !legitimatelyUnpaired) return false
+      node =
+        step.siblingPosition === "LEFT" ? hashPair(step.siblingHash, node) : hashPair(node, step.siblingHash)
+      idx = Math.floor(idx / 2)
+      levelSize = Math.ceil(levelSize / 2)
+    }
+  }
   let h = leaf
   for (const step of proof) {
     h = step.siblingPosition === "LEFT" ? hashPair(step.siblingHash, h) : hashPair(h, step.siblingHash)

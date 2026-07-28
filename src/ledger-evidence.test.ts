@@ -1,11 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import {
-  EVIDENCE_BUNDLE_KIND,
-  EVIDENCE_BUNDLE_KIND_ALIASES,
-  type EvidenceBundle,
-  verifyEvidenceBundle,
-} from "./ledger-evidence.js"
+import { EVIDENCE_BUNDLE_KIND, type EvidenceBundle, verifyEvidenceBundle } from "./ledger-evidence.js"
 import { type AuditLeaf, leafHash } from "./ledger-leaf.js"
 import { hashLeaf, merkleProof, merkleRoot, emptyRoot, sha256Hex } from "./ledger-merkle.js"
 import type { InclusionProof } from "./ledger-proof.js"
@@ -62,9 +57,13 @@ function buildBundle(
     blockIndex: "0",
     blockRoot,
     blockProof: merkleProof(blockLeaves, 0),
+    leafIndex: 0,
+    blockLeafCount: blockLeaves.length,
     checkpointId: "cp-1",
     checkpointRoot: opts.missingCheckpointRoot ? "" : opts.unknownCheckpointRoot ? "0".repeat(64) : dailyRoot,
     checkpointProof: merkleProof(dailyLeaves, 0),
+    checkpointLeafIndex: 0,
+    checkpointLeafCount: dailyLeaves.length,
     anchorRef: "anchor://test/1",
     anchored: true,
   }
@@ -75,9 +74,13 @@ function buildBundle(
     blockIndex: "0",
     blockRoot,
     blockProof: merkleProof(blockLeaves, 1),
+    leafIndex: 1,
+    blockLeafCount: blockLeaves.length,
     checkpointId: "cp-1",
     checkpointRoot: dailyRoot,
     checkpointProof: merkleProof(dailyLeaves, 0),
+    checkpointLeafIndex: 0,
+    checkpointLeafCount: dailyLeaves.length,
     anchorRef: "anchor://test/1",
     anchored: true,
   }
@@ -177,9 +180,13 @@ function buildThreeEntryBundle(
         blockIndex: "0",
         blockRoot,
         blockProof: merkleProof(leafHashes, i),
+        leafIndex: i,
+        blockLeafCount: leafHashes.length,
         checkpointId: "cp-1",
         checkpointRoot: dailyRoot,
         checkpointProof: merkleProof(dailyLeaves, 0),
+        checkpointLeafIndex: 0,
+        checkpointLeafCount: dailyLeaves.length,
         anchorRef: "anchor://test/1",
         anchored: true,
       },
@@ -221,18 +228,14 @@ test("verifyEvidenceBundle: valid unredacted bundle with trusted roots", () => {
   assert.equal(res.roots[0]?.root, dailyRoot)
 })
 
-test("verifyEvidenceBundle: accepts legacy evidence bundle alias kind", () => {
-  const { bundle, dailyRoot } = buildBundle({ kind: EVIDENCE_BUNDLE_KIND_ALIASES[0] })
-  const res = verifyEvidenceBundle(bundle, { trustedRoots: [dailyRoot] })
-  assert.equal(res.ok, true)
-  assert.equal(res.notes.length, 0)
-})
-
-test("verifyEvidenceBundle: warns on unexpected bundle kind", () => {
+test("verifyEvidenceBundle: REFUSES an unexpected bundle kind (DEWP §6.5)", () => {
+  // Previously a note, so a container of one type fed to the verifier for another still came back
+  // ok — a passing verdict produced under semantics the artifact was never built for. §6.5 says a
+  // compliant verifier MUST reject.
   const { bundle, dailyRoot } = buildBundle({ kind: "invalid.kind" })
   const res = verifyEvidenceBundle(bundle, { trustedRoots: [dailyRoot] })
-  assert.equal(res.ok, true)
-  assert.ok(res.notes.some((n) => n.includes('Unexpected bundle kind "invalid.kind"')))
+  assert.equal(res.ok, false)
+  assert.ok(res.failed.some((f) => f.reason.includes('refusing bundle kind "invalid.kind"')))
 })
 
 test("verifyEvidenceBundle: un-trusted run adds note and returns ok=false", () => {
@@ -331,4 +334,57 @@ test("verifyEvidenceBundle: sequence gap between tenantSeq detects omission", ()
 test("merkle primitives: sha256Hex and emptyRoot", () => {
   assert.equal(sha256Hex("hello"), "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
   assert.equal(emptyRoot().length, 64)
+})
+
+// ─── Display-vs-commitment binding (July 2026 review) ────────────────────────
+// The leaf commits to `canonical`. Everything alongside it on an entry — seq, outcome, tenantSeq,
+// tenantId — is an unsigned display copy, and the bundle is what a human, a console or a SIEM
+// actually reads. These pin that the two must agree.
+
+test("evidence: a renumbered tenantSeq cannot paper over an omission", () => {
+  // THE attack: drop the incriminating events, keep the honest entries with their genuine proofs,
+  // and renumber the DISPLAY counters so the contiguity check sees no gap. It used to work, because
+  // the check read entry.tenantSeq — a field covered by nothing.
+  const { bundle, dailyRoot } = buildBundle()
+  const entries = bundle.entries
+  assert.ok(entries.length >= 2, "fixture needs two entries")
+  // Leave `canonical.tenantSeq` alone (it is committed) and rewrite only the display copy, to
+  // values that close a hypothetical gap.
+  for (const [i, e] of entries.entries()) {
+    e.event.tenantSeq = String(100 + i)
+  }
+  const res = verifyEvidenceBundle(bundle, { trustedRoots: [dailyRoot] })
+  assert.equal(res.ok, false, "a display counter that contradicts the commitment must be refused")
+  assert.ok(
+    res.failed.some((f) => f.reason.includes("tenantSeq")),
+    `expected a tenantSeq mismatch, got ${JSON.stringify(res.failed)}`,
+  )
+})
+
+test("evidence: a displayed outcome that contradicts the commitment is refused", () => {
+  const { bundle, dailyRoot } = buildBundle()
+  const first = bundle.entries[0]
+  assert.ok(first?.event.canonical)
+  first.event.outcome = first.event.canonical.outcome === "SUCCESS" ? "FAILURE" : "SUCCESS"
+  const res = verifyEvidenceBundle(bundle, { trustedRoots: [dailyRoot] })
+  assert.equal(res.ok, false)
+  assert.ok(res.failed.some((f) => f.reason.includes("displayed outcome")))
+})
+
+test("evidence: an entry belonging to another tenant is not counted as this tenant's", () => {
+  // A genuine proof, under a root the auditor trusts, for an event that is simply somebody else's.
+  const { bundle, dailyRoot } = buildBundle()
+  const first = bundle.entries[0]
+  assert.ok(first?.event.canonical)
+  first.event.canonical.tenantId = "tenant-SOMEONE-ELSE"
+  const res = verifyEvidenceBundle(bundle, { trustedRoots: [dailyRoot] })
+  assert.equal(res.ok, false)
+  // Editing the committed preimage also breaks leaf binding, which fires first — either rejection is
+  // correct, and both are the point: a foreign entry cannot be counted as this tenant's.
+  assert.ok(
+    res.failed.some(
+      (f) => f.reason.includes("belongs to tenant") || f.reason.includes("leaf hash does not match"),
+    ),
+    `expected a rejection, got ${JSON.stringify(res.failed)}`,
+  )
 })

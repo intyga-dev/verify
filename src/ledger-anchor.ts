@@ -1,4 +1,5 @@
 import crypto from "node:crypto"
+import { parseRekorEvidence, verifyRekorAnchor } from "./ledger-rekor.js"
 
 // DEWP signed anchor objects (docs/DEWP.md §5.2/§5.3). A Daily Checkpoint Root becomes trustworthy
 // only when independent external parties SIGN it. This module computes the domain-separated anchor
@@ -14,7 +15,11 @@ export interface SignedAnchor {
   issuer: string // HTTPS URI or DID of the anchor provider
   algorithm: "ES256" | "Ed25519" | "RSA-PSS"
   keyId: string
-  signature: string // base64, over the raw 32-byte anchorDigest
+  signature: string // base64, over the raw 32-byte anchorDigest. EMPTY for external anchors.
+  /** SELF | REKOR | TSA | WEBHOOK. Decides WHICH verification applies; absent ⇒ treated as DEWP. */
+  kind?: string
+  /** The external log's own attestation, base64 (Rekor: entry + SET + inclusion proof). */
+  evidence?: string | null
 }
 
 /**
@@ -104,6 +109,16 @@ export function verifyAnchorSignature(anchor: SignedAnchor, publicKey: crypto.Ke
 }
 
 /** The verifier's anchor-trust policy (DEWP §5.3). */
+/**
+ * How an anchor of a given kind is verified. SELF/DEWP anchors carry a §5.2 signature; external ones
+ * (Rekor, TSA) carry the third party's own attestation in `evidence` instead, and their `signature`
+ * is empty by construction.
+ */
+export interface ExternalAnchorKeys {
+  /** Rekor log public key (PEM or base64 SPKI), pinned by the CALLER — Sigstore publishes it via TUF. */
+  rekor?: string
+}
+
 export interface AnchorPolicy {
   /** Minimum count of distinct trusted issuers that must sign the SAME root. SHOULD be ≥ 2. */
   requiredAnchors: number
@@ -134,10 +149,32 @@ export function verifyAnchorQuorum(
   dailyRoot: string,
   policy: AnchorPolicy,
   resolveKey: AnchorKeyResolver,
+  opts: {
+    /**
+     * Anchors that may be used to declare DIVERGENCE. Defaults to none.
+     *
+     * Divergence is a fatal, tamper-shaped verdict, so what feeds it matters. `anchorPreimage` binds
+     * [dailyRoot, timestamp, issuer, algorithm] and NOT any checkpoint identity, which means this
+     * function cannot tell "issuer X signed a different root FOR THIS CHECKPOINT" (real divergence)
+     * from "issuer X signed some other day's root" (entirely normal — every anchor they have ever
+     * published looks like that). Treating any non-matching anchor as divergence therefore lets
+     * anyone who can add an anchor to a bundle attach a GENUINE, publicly available anchor from
+     * another day and force an INVALID verdict with a tamper alarm.
+     *
+     * So the caller must say which anchors it fetched itself, per checkpoint, from each issuer.
+     */
+    divergenceAnchors?: SignedAnchor[]
+    /** Pinned public keys for external logs, so their attestations can actually be checked. */
+    externalKeys?: ExternalAnchorKeys
+  } = {},
 ): AnchorQuorumResult {
   const trusted = anchors.filter((a) => policy.trustedIssuers.includes(a.issuer))
-  // Divergence: a trusted issuer that validly signed a DIFFERENT root for this checkpoint.
-  for (const a of trusted) {
+  // Divergence: a trusted issuer that validly signed a DIFFERENT root for this checkpoint. Only
+  // anchors the CALLER vouched for as being for this checkpoint can establish that.
+  const divergenceCandidates = (opts.divergenceAnchors ?? []).filter((a) =>
+    policy.trustedIssuers.includes(a.issuer),
+  )
+  for (const a of divergenceCandidates) {
     if (a.dailyRoot === dailyRoot) continue
     const key = resolveKey(a)
     if (key && verifyAnchorSignature(a, key)) {
@@ -145,13 +182,24 @@ export function verifyAnchorQuorum(
         ok: false,
         verifiedIssuers: [],
         divergence: true,
-        reason: `anchor divergence: issuer ${a.issuer} signed a different root`,
+        reason: `anchor divergence: issuer ${a.issuer} signed a different root for this checkpoint`,
       }
     }
   }
   const verifiedIssuers = new Set<string>()
   for (const a of trusted) {
     if (a.dailyRoot !== dailyRoot) continue
+    // External anchors (Rekor today) carry no DEWP signature — the third party's attestation IS the
+    // evidence. Verifying them was previously impossible here, which meant a quorum could only ever
+    // be met by anchors Intyga signed itself: the opposite of independence.
+    if (a.kind === "REKOR") {
+      const rekorKey = opts.externalKeys?.rekor
+      if (!rekorKey) continue // no pinned log key ⇒ unverifiable ⇒ does not count
+      const evidence = parseRekorEvidence(a.evidence)
+      if (!evidence) continue
+      if (verifyRekorAnchor(evidence, a, rekorKey).ok) verifiedIssuers.add(a.issuer)
+      continue
+    }
     const key = resolveKey(a)
     if (key && verifyAnchorSignature(a, key)) verifiedIssuers.add(a.issuer)
   }

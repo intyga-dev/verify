@@ -1,4 +1,5 @@
 import crypto from "node:crypto"
+import type { ExternalAnchorKeys } from "./ledger-anchor.js"
 import {
   type AnchorKeyResolver,
   type AnchorPolicy,
@@ -12,10 +13,9 @@ import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
 // verify one. A verdict is only as strong as the daily root you check against: obtain that root from
 // the EXTERNAL anchor (anchorRef), never from the bundle itself.
 
-// DEWP canonical kind (docs/DEWP.md §6.2). The legacy `sakra.audit.*` form is accepted as an alias
-// on read (§6.5) so previously-exported bundles still verify.
+// DEWP canonical kind (docs/DEWP.md §6.2). Producers emit this form and verifiers require it; there
+// is no vendor-prefixed alias, since no bundle has ever been exported under one.
 export const BUNDLE_KIND = "dewp.audit.inclusion-proof"
-export const BUNDLE_KIND_ALIASES = ["sakra.audit.inclusion-proof"] as const
 
 /** DEWP envelope discriminator and specification version this producer/verifier implements (§6). */
 export const DEWP_PROTOCOL = "DEWP"
@@ -31,7 +31,7 @@ export const DEWP_VERSION = "1.0"
  * of hashing an unfamiliar array with this one's field ordering and reporting a leaf mismatch that
  * looks like tampering.
  */
-export const AUDIT_PROFILE = "trust.sakra.audit.v1"
+export const AUDIT_PROFILE = "trust.intyga.audit.v1"
 
 /** DEWP §6.1 algorithm registry — what this implementation commits to. */
 export const ALGORITHM_REGISTRY = {
@@ -51,7 +51,7 @@ export interface AlgorithmRegistry {
 export interface ProofBundle {
   /** DEWP §6.2 envelope. Absent on bundles exported before the envelope was added. */
   protocol?: string
-  kind: typeof BUNDLE_KIND | (typeof BUNDLE_KIND_ALIASES)[number]
+  kind: typeof BUNDLE_KIND
   /** Spec version. String ("1.0") per §6.2; older exports carried the numeric bundle revision. */
   version: string | number
   /** Canonical-preimage Application Profile (§4.5). Absent ⇒ assumed to be this implementation's. */
@@ -145,6 +145,8 @@ export interface BundleVerification {
     inclusion: CheckResult // event leaf → block root → daily root recomputes
     rootConsistency: CheckResult // the root inside the proof equals the root we verified against
     leafBinding: CheckResult // leaf hash actually corresponds to the event fields (needs canonical)
+    /** Displayed header fields equal the committed preimage — they are otherwise unsigned copies. */
+    headerBinding: CheckResult
     anchored: CheckResult // the daily root is claimed to be externally anchored
   }
   notes: string[]
@@ -194,6 +196,13 @@ export function deriveVerificationLevel(p: VerificationProperties, hasSigner: bo
 }
 
 export interface VerifyOptions {
+  /**
+   * Pinned public keys for EXTERNAL logs (Rekor today). A Rekor anchor carries no DEWP signature —
+   * its Signed Entry Timestamp is the attestation — so without the log key it cannot be verified and
+   * does not count toward quorum. Supply from Sigstore's TUF root, never from the bundle.
+   */
+  externalKeys?: ExternalAnchorKeys
+
   /** The daily root obtained from the external anchor. Required for a trustworthy verdict. */
   trustedRoot?: string
   /**
@@ -209,7 +218,7 @@ export interface VerifyOptions {
 export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): BundleVerification {
   const notes: string[] = []
 
-  if (bundle.kind !== BUNDLE_KIND && !BUNDLE_KIND_ALIASES.includes(bundle.kind as never)) {
+  if (bundle.kind !== BUNDLE_KIND) {
     notes.push(`Unexpected bundle kind "${bundle.kind}" (expected "${BUNDLE_KIND}").`)
   }
 
@@ -237,7 +246,7 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     rootSource = "self-asserted"
     notes.push(
       "No independent root supplied — verifying against the root inside the bundle. This proves the " +
-        "bundle is internally consistent, NOT that it matches SÄKRA's anchored log. Re-run with the " +
+        "bundle is internally consistent, NOT that it matches Intyga's anchored log. Re-run with the " +
         "root from the external anchor (anchorRef) for a real verdict.",
     )
   } else {
@@ -271,6 +280,40 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
             pass: false,
             detail: "Proof's checkpoint root differs from the root being verified against.",
           }
+
+  // The displayed header must BE the committed data, not a caption over it. ProofBundle.event
+  // duplicates seq/createdAt/type/outcome/detail/signerDid/signature/sigAlg alongside `canonical`,
+  // and only `canonical` is hashed into the leaf. Unchecked, a bundle could show
+  // outcome "SUCCESS" over a committed "FAILURE" and still return FULLY_VERIFIED.
+  const headerBinding: CheckResult = bundle.event.canonical
+    ? (() => {
+        const c = bundle.event.canonical
+        const e = bundle.event
+        const differs = (label: string, shown: unknown, committed: unknown): string | null =>
+          shown != null && String(shown) !== String(committed)
+            ? `displayed ${label} ("${String(shown)}") does not match the committed value ("${String(committed)}")`
+            : null
+        const bad =
+          differs("seq", e.seq, c.seq) ??
+          differs("proof.seq", bundle.proof.seq, c.seq) ??
+          differs("createdAt", e.createdAt, c.createdAt) ??
+          differs("type", e.type, c.event) ??
+          differs("outcome", e.outcome, c.outcome) ??
+          differs("detail", e.detail, c.detail) ??
+          differs("signerDid", e.signerDid, c.signerDid) ??
+          differs("signature", e.signature, c.signature) ??
+          differs("sigAlg", e.sigAlg, c.sigAlg)
+        return bad === null
+          ? { pass: true as const, detail: "Displayed fields match the committed preimage." }
+          : {
+              pass: false as const,
+              detail: `${bad} — the bundle displays something other than what was committed.`,
+            }
+      })()
+    : {
+        pass: null,
+        detail: "No canonical preimage, so the displayed fields cannot be bound to the commitment.",
+      }
 
   const leafBinding: CheckResult = unknownProfile
     ? {
@@ -315,7 +358,7 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
 
   // DEWP §7.1 independent properties.
   const commitmentVerified = inclusion.pass === true && rootConsistency.pass === true
-  const contentVerified = commitmentVerified && leafBinding.pass === true
+  const contentVerified = commitmentVerified && leafBinding.pass === true && headerBinding.pass !== false
   const hasSigner = Boolean(bundle.event.canonical?.signature && bundle.event.canonical?.signerPublicKey)
   const signatureVerified =
     contentVerified && bundle.event.canonical ? verifyEmbeddedSignature(bundle.event.canonical) : false
@@ -330,9 +373,19 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     ...(bundle.anchors ?? []),
     ...(bundle.anchor ? [bundle.anchor] : []),
   ]
+  // Bundle-carried anchors may COUNT toward quorum — they still have to verify under a key the
+  // caller trusts, so a bundle cannot vouch for itself. They may not, however, trigger the fatal
+  // DIVERGENCE verdict: an anchor's signed preimage carries no checkpoint identity, so a genuine
+  // anchor from another day is indistinguishable from a conflicting one, and appending a real,
+  // publicly available anchor would be enough to make a valid proof read as tampering. Only anchors
+  // the caller fetched itself, per checkpoint, can establish divergence.
+  const divergenceAnchors = opts.anchors ?? []
   let anchorVerified: boolean
   if (candidateAnchors.length > 0 && opts.anchorPolicy && opts.resolveAnchorKey && dailyRoot) {
-    const q = verifyAnchorQuorum(candidateAnchors, dailyRoot, opts.anchorPolicy, opts.resolveAnchorKey)
+    const q = verifyAnchorQuorum(candidateAnchors, dailyRoot, opts.anchorPolicy, opts.resolveAnchorKey, {
+      divergenceAnchors,
+      externalKeys: opts.externalKeys,
+    })
     anchorVerified = commitmentVerified && q.ok
     if (q.divergence) {
       notes.push(`ANCHOR DIVERGENCE — ${q.reason}. Treating as INVALID.`)
@@ -354,7 +407,7 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
           anchorVerified: false,
         },
         verificationLevel: "INVALID",
-        checks: { inclusion, rootConsistency, leafBinding, anchored },
+        checks: { inclusion, rootConsistency, leafBinding, headerBinding, anchored },
         notes,
       }
     }
@@ -375,7 +428,7 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     rootSource,
     properties,
     verificationLevel,
-    checks: { inclusion, rootConsistency, leafBinding, anchored },
+    checks: { inclusion, rootConsistency, leafBinding, headerBinding, anchored },
     notes,
   }
 }

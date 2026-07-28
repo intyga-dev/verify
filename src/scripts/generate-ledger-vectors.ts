@@ -1,6 +1,6 @@
 // Generates the cross-language DEWP ledger golden vectors. The Go/Rust/Python ledger verifiers MUST
 // byte-match these, exactly like the DIV canonical vectors. Regenerate only on a deliberate format
-// change:  pnpm --filter @sakra-trust/verify exec tsx src/scripts/generate-ledger-vectors.ts
+// change:  pnpm --filter @intyga/verify exec tsx src/scripts/generate-ledger-vectors.ts
 
 import fs from "node:fs"
 import path from "node:path"

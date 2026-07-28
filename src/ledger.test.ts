@@ -56,9 +56,13 @@ function buildProof(targetSeq: number): {
     blockIndex: String(blockIndex),
     blockRoot: blockRoots[blockIndex]!,
     blockProof: merkleProof(blockLeafArrays[blockIndex]!, leafIdx),
+    leafIndex: leafIdx,
+    blockLeafCount: blockLeafArrays[blockIndex]!.length,
     checkpointId: "cp-1",
     checkpointRoot: dailyRoot,
     checkpointProof: merkleProof(dailyLeaves, blockIndex),
+    checkpointLeafIndex: blockIndex,
+    checkpointLeafCount: dailyLeaves.length,
     anchorRef: "anchor://test/1",
     anchored: true,
   }
@@ -87,7 +91,7 @@ test("verifyBundle: independent root + canonical leaf => ok", () => {
   const target = 5
   const { proof, dailyRoot } = buildProof(target)
   const bundle: ProofBundle = {
-    kind: "sakra.audit.inclusion-proof",
+    kind: "dewp.audit.inclusion-proof",
     version: 2,
     exportedAt: "2026-07-15T00:00:00.000Z",
     event: {
@@ -140,7 +144,7 @@ test("verifyBundle: a signed event verifies its embedded ES256 signature => SIGN
     .toString("base64")
   const leafRow: AuditLeaf = {
     ...makeLeaf(1),
-    signerDid: "did:sakra:alice",
+    signerDid: "did:intyga:alice",
     signerPublicKey: spki,
     signedPayload,
     signature,
@@ -156,9 +160,13 @@ test("verifyBundle: a signed event verifies its embedded ES256 signature => SIGN
     blockIndex: "0",
     blockRoot,
     blockProof: merkleProof([leaf], 0),
+    leafIndex: 0,
+    blockLeafCount: 1,
     checkpointId: "cp-1",
     checkpointRoot: dailyRoot,
     checkpointProof: merkleProof([hashLeaf(blockRoot)], 0),
+    checkpointLeafIndex: 0,
+    checkpointLeafCount: 1,
     anchorRef: "anchor://test/signed",
     anchored: true,
   }
@@ -210,7 +218,7 @@ test("verifyBundle: a signed event verifies its embedded ES256 signature => SIGN
 test("verifyBundle: canonical that doesn't match the leaf fails leaf binding", () => {
   const { proof, dailyRoot } = buildProof(1)
   const bundle: ProofBundle = {
-    kind: "sakra.audit.inclusion-proof",
+    kind: "dewp.audit.inclusion-proof",
     version: 2,
     exportedAt: "2026-07-15T00:00:00.000Z",
     event: {
@@ -241,7 +249,7 @@ test("verifyBundle: a legacy pre-§6.2 `anchor` block still supplies the self-as
   const target = 3
   const { proof, dailyRoot } = buildProof(target)
   const bundle: ProofBundle = {
-    kind: "sakra.audit.inclusion-proof",
+    kind: "dewp.audit.inclusion-proof",
     version: 1,
     exportedAt: "2026-07-15T00:00:00.000Z",
     event: {
@@ -309,4 +317,55 @@ test("verifyMerkleProof is order-sensitive (position matters)", () => {
   assert.equal(verifyMerkleProof(leaves[1]!, p, root), true)
   // using the proof for index 1 against index 2's leaf must fail
   assert.equal(verifyMerkleProof(leaves[2]!, p, root), false)
+})
+
+// ─── Duplicate-last padding forgery (July 2026 review) ───────────────────────
+// merkleRoot pads an unpaired trailing node by hashing it against ITSELF (DEWP §5.1.1 rule 3), so
+// merkleRoot([a,b,c]) === merkleRoot([a,b,c,c]). Verification used to walk whatever path it was
+// handed with no index and no leaf count, which meant a path to a leaf slot that never existed
+// recomputed the real root — falsifying DEWP §17.1's claim that forging an inclusion path requires
+// a SHA-256 second preimage.
+
+test("duplicate-last padding: a path to a nonexistent leaf slot is refused", () => {
+  const leaves = ["a", "b", "c"].map((x) => hashLeaf(x))
+  const root = merkleRoot(leaves)
+  // The padded 4-leaf tree has the SAME root, so its index-3 path recomputes `root` exactly.
+  const forged = merkleProof([...leaves, leaves[2]!], 3)
+
+  assert.equal(
+    verifyMerkleProof(leaves[2]!, forged, root, { index: 3, leafCount: 3 }),
+    false,
+    "an index outside the tree must be refused",
+  )
+  // leafCount comes from the prover, so inflating it is the obvious next move: it makes index 3
+  // in-range AND the path length correct. Padding is still observable — a node hashed against itself
+  // anywhere but the unpaired end of an odd level.
+  assert.equal(
+    verifyMerkleProof(leaves[2]!, forged, root, { index: 3, leafCount: 4 }),
+    false,
+    "inflating leafCount must not rescue the forgery",
+  )
+})
+
+test("legitimate duplicate-last padding still verifies (odd tree, last leaf)", () => {
+  // The honest counterpart: index 2 of 3 IS the unpaired end, so self-pairing is correct there and
+  // must not be mistaken for the forgery above.
+  const leaves = ["a", "b", "c"].map((x) => hashLeaf(x))
+  const root = merkleRoot(leaves)
+  assert.equal(verifyMerkleProof(leaves[2]!, merkleProof(leaves, 2), root, { index: 2, leafCount: 3 }), true)
+  for (const i of [0, 1, 2]) {
+    assert.equal(
+      verifyMerkleProof(leaves[i]!, merkleProof(leaves, i), root, { index: i, leafCount: 3 }),
+      true,
+      `honest index ${i}`,
+    )
+  }
+})
+
+test("verifyInclusionProof refuses a proof that cannot say where its leaf sits", () => {
+  const { proof, dailyRoot } = buildProof(0)
+  assert.equal(verifyInclusionProof(proof, dailyRoot), true)
+  // A proof missing its position fields establishes only that SOME path exists.
+  const positionless = { ...proof, leafIndex: undefined as unknown as number }
+  assert.equal(verifyInclusionProof(positionless, dailyRoot), false)
 })
