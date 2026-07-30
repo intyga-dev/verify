@@ -234,6 +234,52 @@ export const DIV_VERSION = 1
 export const DIV_INTENT_TYPE = "div-intent-verification"
 
 /**
+ * OFFLINE APPROVAL (docs/DIV.md §5a.2): a normal approval, signed by real humans through the normal
+ * quorum, but collected OUT OF BAND at incident time because the gateway is unreachable. The relying
+ * party builds the challenge itself, the humans review and sign it on a disconnected device, and the
+ * result is verified by the ordinary §5 procedure.
+ *
+ * This deliberately replaces the older pre-signed "sealed break-glass" token. Pre-signing puts a
+ * bearer capability on disk and captures a human judgment about a HYPOTHETICAL; moving the ceremony
+ * off the network instead keeps the human in the loop for the ACTUAL incident and leaves nothing at
+ * rest to steal. See DIV §5a.1.
+ *
+ * The distinct `type` is the single most important guardrail in the whole mechanism. It sits inside
+ * the signed bytes, so:
+ *   - an offline proof can NEVER verify as a normal approval, and
+ *   - a normal approval can NEVER be replayed as an offline one.
+ * Neither direction is possible even with a byte-identical action, because the reconstructed payload
+ * differs and the signature comparison fails. Do not "simplify" this into a flag outside the payload.
+ */
+export const DIV_OFFLINE_INTENT_TYPE = "div-offline-intent"
+
+/**
+ * DELEGATION (docs/DIV.md §5a.5): signed in advance by the ordinary quorum, it transfers the
+ * AUTHORITY TO APPROVE one pre-declared action to a named set of local operators.
+ *
+ * A delegation authorizes NOTHING by itself. `verifyApprovalReceipt` refuses this type outright and
+ * there is deliberately no opt-in flag that would let it through — see `verifyDelegation`, which is a
+ * separate operation for exactly that reason. A delegation that could authorize its own action would
+ * be the pre-signed bearer capability DIV §5a.1 rejects.
+ */
+export const DIV_DELEGATION_TYPE = "div-delegation"
+
+/**
+ * Hard ceiling on an offline proof's validity window, enforced at verification and not only at mint.
+ * An offline proof is created and redeemed within one incident, so the window is minutes — it exists
+ * to bound a proof whose `expiresAt` was minted over-long, which is otherwise indistinguishable at
+ * verification time from a correct one (DIV §5a.3).
+ */
+export const MAX_OFFLINE_WINDOW_MINUTES = 60
+
+/**
+ * Hard ceiling on a delegation's validity window. Hours, not the 30 days the old sealed token
+ * allowed: a delegation cannot be revoked at an offline relying party, so the short window IS the
+ * revocation story (DIV §5a.6).
+ */
+export const MAX_DELEGATION_WINDOW_HOURS = 72
+
+/**
  * The approval policy in force for a challenge, frozen at creation and SIGNED as part of the payload.
  *
  * This exists because the gateway enforces a rich requirement (quorum, four-eyes, hardware class) that
@@ -276,8 +322,6 @@ export function canonicalIntentPayload(input: {
   nonce: string
   expiresAt: string
 }): string {
-  const a = input.requester.attestation
-  const r = input.requirement
   return stableStringify({
     v: DIV_VERSION,
     type: DIV_INTENT_TYPE,
@@ -285,19 +329,109 @@ export function canonicalIntentPayload(input: {
     actionType: input.actionType,
     display: input.display,
     params: input.params,
+    ...commonSignedFields(input.requester, input.requirement),
+    nonce: input.nonce,
+    expiresAt: input.expiresAt,
+  })
+}
+
+/**
+ * The requester + requirement projection shared by all three canonical builders.
+ *
+ * One definition rather than three copies: these bytes are the contract, and a field added to one
+ * builder but not the others is precisely the drift the cross-package vectors exist to catch. The
+ * golden vectors pin the output, so this factoring is verified rather than assumed.
+ */
+function commonSignedFields(requester: RequesterIdentity, requirement: ApprovalRequirementAttestation) {
+  const a = requester.attestation
+  return {
     requester: {
-      did: input.requester.did,
+      did: requester.did,
       attestation: a ? { method: a.method, issuer: a.issuer, subject: a.subject } : null,
     },
     requirement: {
-      requiredApprovals: r.requiredApprovals,
-      requireHardwareKey: r.requireHardwareKey,
+      requiredApprovals: requirement.requiredApprovals,
+      requireHardwareKey: requirement.requireHardwareKey,
       // Sorted: the set is what matters, and an unordered list would make two identical policies
       // produce different bytes depending on how the rule happened to be written.
-      allowedAaguids: [...r.allowedAaguids].sort(),
-      requesterCannotApprove: r.requesterCannotApprove,
+      allowedAaguids: [...requirement.allowedAaguids].sort(),
+      requesterCannotApprove: requirement.requesterCannotApprove,
     },
+  }
+}
+
+/**
+ * Canonical OFFLINE INTENT payload (DIV §5a.2). Deliberately a separate function rather than a `type`
+ * parameter on `canonicalIntentPayload`.
+ *
+ * A parameter would mean every existing call site could silently produce the wrong kind by passing
+ * the wrong argument, and the normal approval path — which is the overwhelmingly common one — would
+ * carry a footgun for the sake of a rare one. Two functions cannot be confused: you either called the
+ * offline builder or you did not.
+ *
+ * `challengedAt` is the only extra field, and it exists so the verifier can bound the validity
+ * WINDOW. Without it, a payload minted with a 10-year `expiresAt` would be indistinguishable from a
+ * correctly minted one at verification time.
+ */
+export function canonicalOfflineIntentPayload(input: {
+  target: string
+  actionType: string
+  display: string
+  params: Record<string, unknown>
+  requester: RequesterIdentity
+  requirement: ApprovalRequirementAttestation
+  nonce: string
+  challengedAt: string
+  expiresAt: string
+}): string {
+  return stableStringify({
+    v: DIV_VERSION,
+    type: DIV_OFFLINE_INTENT_TYPE,
+    target: input.target,
+    actionType: input.actionType,
+    display: input.display,
+    params: input.params,
+    ...commonSignedFields(input.requester, input.requirement),
     nonce: input.nonce,
+    challengedAt: input.challengedAt,
+    expiresAt: input.expiresAt,
+  })
+}
+
+/**
+ * Canonical DELEGATION payload (DIV §5a.5) — a signed statement about WHO MAY APPROVE, not about
+ * what may run.
+ *
+ * `delegatedTo` is sorted because it is a SET: the same three operators in a different order must
+ * produce the same bytes, exactly as for `allowedAaguids`. `requirement` here describes the quorum
+ * that signed this delegation, while `delegatedQuorum` is how many of `delegatedTo` must sign at
+ * incident time — two different quorums, which is why both are in the signed bytes.
+ */
+export function canonicalDelegationPayload(input: {
+  target: string
+  actionType: string
+  display: string
+  params: Record<string, unknown>
+  requester: RequesterIdentity
+  requirement: ApprovalRequirementAttestation
+  delegatedTo: string[]
+  delegatedQuorum: number
+  nonce: string
+  sealedAt: string
+  expiresAt: string
+}): string {
+  return stableStringify({
+    v: DIV_VERSION,
+    type: DIV_DELEGATION_TYPE,
+    target: input.target,
+    actionType: input.actionType,
+    display: input.display,
+    params: input.params,
+    ...commonSignedFields(input.requester, input.requirement),
+    delegatedTo: [...input.delegatedTo].sort(),
+    delegatedQuorum: input.delegatedQuorum,
+    nonce: input.nonce,
+    sealedAt: input.sealedAt,
     expiresAt: input.expiresAt,
   })
 }
@@ -382,10 +516,23 @@ export const DEFAULT_CLOCK_SKEW_SECONDS = 30
  *  - `{ publicKeys }`  — a direct allowlist of base64 SPKI / COSE keys.
  *  - `{ dids, resolveKey }` — a DID allowlist plus your own resolver (directory lookup, pinned
  *    enrollment record, etc). Return `null` for an unknown DID to reject it.
+ *
+ * PREFER DID MODE where you can. In `publicKeys` mode the receipt's `signerDid` is an unverified
+ * string, so quorum has to count distinct KEYS instead of distinct approvers — and a delegation
+ * (DIV §5a.6), which names identities, cannot be enforced at all.
+ *
+ * `resolveKey` may return SEVERAL keys for one DID. An approver commonly holds a software key plus
+ * one or more registered authenticators, and any of them is legitimately theirs; returning them all
+ * keeps the identity intact instead of forcing callers to flatten everything into `publicKeys` mode
+ * and lose the DID binding. Every key returned for a DID counts as that ONE approver.
  */
 export type ApproverTrustAnchor =
   | { publicKeys: string[]; dids?: undefined; resolveKey?: undefined }
-  | { dids: string[]; resolveKey: (did: string) => string | null; publicKeys?: undefined }
+  | {
+      dids: string[]
+      resolveKey: (did: string) => string | string[] | null
+      publicKeys?: undefined
+    }
 
 /** What you assert the receipt must say. `target`, `nonce` and `approvers` are required. */
 export interface ReceiptExpectation {
@@ -414,6 +561,30 @@ export interface ReceiptExpectation {
 /** Verification options. The WebAuthn expectations are mandatory for a WEBAUTHN receipt. */
 export interface VerifyReceiptOptions {
   allowAutoApproved?: boolean
+  /**
+   * Accept an OFFLINE APPROVAL (`type: "div-offline-intent"`). Defaults to FALSE — an offline proof is
+   * refused on every ordinary call site, exactly like `allowAutoApproved`.
+   *
+   * Pass this at the SPECIFIC call that is allowed to run under an offline approval, never globally. A
+   * process-wide default would mean every gated action in the service silently accepts an
+   * out-of-band approval, which is the difference between an emergency mechanism and a hole.
+   *
+   * Setting it does not weaken any other check: the quorum, four-eyes and target binding signed into
+   * the payload are still enforced, the window is capped at MAX_OFFLINE_WINDOW_MINUTES, and a proof
+   * whose signed policy demands a hardware key is REFUSED (DIV §5a.3 step 4) because that requirement
+   * cannot be satisfied offline.
+   */
+  allowOffline?: boolean
+  /**
+   * A delegation that has ALREADY been verified by `verifyDelegation`, substituting the eligible
+   * approver set and the quorum for this one verification (DIV §5a.6).
+   *
+   * Only meaningful together with `allowOffline`. This narrows rather than widens: the delegation's
+   * target/actionType/params must equal what you are executing, and the offline payload's signed
+   * `requiredApprovals` must equal the delegation's `delegatedQuorum`, so the operators still sign the
+   * policy their signatures are counted toward.
+   */
+  delegation?: VerifiedDelegation
   /** Exact `origin` the assertion must carry, e.g. "https://app.example.com". Required for WEBAUTHN. */
   expectedOrigin?: string
   /** RP ID the authenticatorData must hash to, e.g. "app.example.com". Required for WEBAUTHN. */
@@ -463,17 +634,37 @@ const AUTH_DATA_FLAG_UV = 0x04 // User Verified
 function candidateKeys(
   anchor: ApproverTrustAnchor,
   witness: ApprovalWitness,
+  /**
+   * When a delegation is in force, the eligible approvers are narrowed to the identities it names
+   * (DIV §5a.6 step 3). Applied ON TOP of the trust anchor, never instead of it: a delegation says
+   * WHO may approve, and the anchor still says which key is actually theirs.
+   */
+  restrictTo?: string[],
 ): { keys: { key: string; identity: string }[] } | { reason: string } {
   if (anchor.publicKeys) {
+    // A delegation names identities, and in publicKeys mode `signerDid` is an unverified string —
+    // enforcing `delegatedTo` against it would be security theatre. Refuse rather than pretend.
+    if (restrictTo)
+      return {
+        reason:
+          "a delegation names approver identities, so it requires a DID-mode trust anchor ({ dids, resolveKey }); in publicKeys mode signerDid is unverified and delegatedTo cannot be enforced",
+      }
     if (anchor.publicKeys.length === 0) return { reason: "trusted approver allowlist is empty" }
     return { keys: anchor.publicKeys.map((key) => ({ key, identity: key })) }
   }
   if (!witness.signerDid || !anchor.dids.includes(witness.signerDid)) {
     return { reason: `signer ${witness.signerDid || "(unknown)"} is not an authorized approver` }
   }
+  if (restrictTo && !restrictTo.includes(witness.signerDid)) {
+    return { reason: `signer ${witness.signerDid} is not named in the delegation` }
+  }
   const resolved = anchor.resolveKey(witness.signerDid)
   if (!resolved) return { reason: `no trusted key could be resolved for ${witness.signerDid}` }
-  return { keys: [{ key: resolved, identity: witness.signerDid }] }
+  // One DID may legitimately hold several keys; all of them identify the SAME approver, so quorum
+  // still counts one. Flattening them into separate identities would let one person meet an N-of-M.
+  const keys = (Array.isArray(resolved) ? resolved : [resolved]).filter((k) => Boolean(k))
+  if (keys.length === 0) return { reason: `no trusted key could be resolved for ${witness.signerDid}` }
+  return { keys: keys.map((key) => ({ key, identity: witness.signerDid })) }
 }
 
 /** Verify one witness signature over the canonical payload, using an already-TRUSTED key. */
@@ -621,8 +812,33 @@ export function verifyApprovalReceipt(
   const version = parseVersion(receipt.canonicalPayload)
   if (version !== DIV_VERSION)
     return { ok: false, reason: `unsupported DIV payload version (${version || "unparseable"})` }
-  if (parseField(receipt.canonicalPayload, "type") !== DIV_INTENT_TYPE)
+  // Which KIND of proof is this? The type is inside the signed bytes, so this is not spoofable
+  // without breaking the signature — and the kinds rebuild through different canonical builders,
+  // so none can ever be mistaken for another further down.
+  const payloadType = parseField(receipt.canonicalPayload, "type")
+  // A DELEGATION authorizes nothing (DIV §5a.5). It is refused here unconditionally — there is
+  // deliberately NO option that would let one through, because a delegation that could authorize its
+  // own action would be exactly the pre-signed bearer capability the design exists to avoid. Use
+  // `verifyDelegation` to check one, then pass the result as `opts.delegation`.
+  if (payloadType === DIV_DELEGATION_TYPE)
+    return {
+      ok: false,
+      reason:
+        "this is a delegation, which authorizes no action on its own — verify it with verifyDelegation and pass the result as { delegation }, together with an offline approval signed by the delegated operators",
+    }
+  const offline = payloadType === DIV_OFFLINE_INTENT_TYPE
+  if (!offline && payloadType !== DIV_INTENT_TYPE)
     return { ok: false, reason: "payload is not a div-intent-verification" }
+  if (offline && !opts.allowOffline)
+    return {
+      ok: false,
+      reason:
+        "this is an offline approval; pass { allowOffline: true } at the specific call site permitted to run under one",
+    }
+  // A delegation only ever substitutes the approver set for an OFFLINE proof. Accepting it against an
+  // ordinary gateway-mediated receipt would silently replace the quorum the gateway enforced.
+  if (opts.delegation && !offline)
+    return { ok: false, reason: "a delegation can only substitute the approver set for an offline approval" }
 
   // Bind the receipt to the challenge the caller is redeeming, before anything else.
   if (parseNonce(receipt.canonicalPayload) !== expected.nonce)
@@ -661,23 +877,96 @@ export function verifyApprovalReceipt(
   if (!requirement || typeof requirement.requiredApprovals !== "number")
     return { ok: false, reason: "receipt payload is missing the signed approval requirement" }
 
+  // Offline proofs carry `challengedAt` so the validity WINDOW can be bounded here, not merely at
+  // mint. A proof whose window exceeds the cap is refused even though its signature is perfectly
+  // good — an offline relying party has no revocation channel, so the short window is the only one.
+  let challengedAt = ""
+  if (offline) {
+    const raw = parseField<string>(receipt.canonicalPayload, "challengedAt")
+    if (typeof raw !== "string" || raw.length === 0)
+      return { ok: false, reason: "offline proof is missing challengedAt" }
+    challengedAt = raw
+    const challengedMs = Date.parse(challengedAt)
+    if (Number.isNaN(challengedMs))
+      return { ok: false, reason: "challengedAt is not a valid RFC3339 timestamp" }
+    const expiryMs = Date.parse(expiresAt)
+    if (!Number.isNaN(expiryMs)) {
+      const windowMinutes = (expiryMs - challengedMs) / 60_000
+      if (windowMinutes > MAX_OFFLINE_WINDOW_MINUTES)
+        return {
+          ok: false,
+          reason: `offline window is ${windowMinutes.toFixed(1)} minutes, over the ${MAX_OFFLINE_WINDOW_MINUTES}-minute maximum`,
+        }
+      if (windowMinutes < 0) return { ok: false, reason: "offline proof expires before it was challenged" }
+    }
+
+    // A hardware-key policy CANNOT be satisfied offline (DIV §5a.3 step 4, §5a.8). WebAuthn needs a
+    // secure context and an RP ID that an offline signing surface will not match, so an offline
+    // witness is always a bare key. Accepting the proof anyway would silently downgrade the very
+    // policy the approver attested to, so it is refused instead — fail closed, and say why.
+    if (requirement.requireHardwareKey === true)
+      return {
+        ok: false,
+        reason:
+          "the signed policy requires a hardware-backed WebAuthn credential, which cannot be produced offline — this action cannot be approved out of band (DIV §5a.3)",
+      }
+  }
+
+  // A delegation substitutes WHO may approve and HOW MANY, and nothing else (DIV §5a.6). Every
+  // agreement check below is on the SIGNED bytes of both proofs, so neither can widen the other.
+  let delegatedTo: string[] | undefined
+  let delegatedQuorum: number | undefined
+  if (opts.delegation) {
+    const d = opts.delegation
+    // The delegation must be for the action actually being executed. `expected.*` is what the caller
+    // is about to run, so comparing against it — not against the receipt — is what stops a delegation
+    // for one action authorizing another.
+    if (d.target !== expected.target)
+      return { ok: false, reason: "the delegation was issued for a different target" }
+    if (d.actionType !== expected.actionType)
+      return { ok: false, reason: "the delegation was issued for a different actionType" }
+    let delegationParams: string
+    let executingParams: string
+    try {
+      delegationParams = stableStringify(d.params)
+      executingParams = stableStringify(expected.params)
+    } catch (err) {
+      return { ok: false, reason: `params are not canonicalizable: ${(err as Error).message}` }
+    }
+    if (delegationParams !== executingParams)
+      return { ok: false, reason: "the delegation was issued for different params" }
+    // The offline payload's signed quorum must equal the delegated one, so the operators signed the
+    // policy their signatures are being counted toward rather than a different one.
+    if (requirement.requiredApprovals !== d.delegatedQuorum)
+      return {
+        ok: false,
+        reason: `offline proof declares ${requirement.requiredApprovals} required approval(s) but the delegation delegates a quorum of ${d.delegatedQuorum}`,
+      }
+    delegatedTo = d.delegatedTo
+    delegatedQuorum = d.delegatedQuorum
+  }
+
+  const rebuild = {
+    target: expected.target,
+    actionType: expected.actionType,
+    display: receipt.actionDescription,
+    params: expected.params,
+    requester: receipt.requester,
+    requirement: {
+      requiredApprovals: requirement.requiredApprovals,
+      requireHardwareKey: requirement.requireHardwareKey === true,
+      allowedAaguids: Array.isArray(requirement.allowedAaguids) ? requirement.allowedAaguids : [],
+      requesterCannotApprove: requirement.requesterCannotApprove === true,
+    },
+    nonce: parseNonce(receipt.canonicalPayload),
+    expiresAt,
+  }
+
   let recomputed: string
   try {
-    recomputed = canonicalIntentPayload({
-      target: expected.target,
-      actionType: expected.actionType,
-      display: receipt.actionDescription,
-      params: expected.params,
-      requester: receipt.requester,
-      requirement: {
-        requiredApprovals: requirement.requiredApprovals,
-        requireHardwareKey: requirement.requireHardwareKey === true,
-        allowedAaguids: Array.isArray(requirement.allowedAaguids) ? requirement.allowedAaguids : [],
-        requesterCannotApprove: requirement.requesterCannotApprove === true,
-      },
-      nonce: parseNonce(receipt.canonicalPayload),
-      expiresAt,
-    })
+    recomputed = offline
+      ? canonicalOfflineIntentPayload({ ...rebuild, challengedAt })
+      : canonicalIntentPayload(rebuild)
   } catch (err) {
     // Almost always expected.params containing a Date/Map/class instance — say so, rather than
     // reporting it as a params mismatch and sending the caller hunting for a tampering that isn't there.
@@ -710,7 +999,17 @@ export function verifyApprovalReceipt(
   // A policy AUTO_APPROVED receipt carries NO human signature — there is nothing to cryptographically
   // verify, and such a receipt is trivially forgeable. We therefore REFUSE to attest it by default
   // (so `if (!verify().ok) throw` correctly blocks unsigned approvals). A relying party that has
-  // consciously accepted policy pre-approval / break-glass must opt in with `allowAutoApproved: true`.
+  // consciously accepted policy pre-approval must opt in with `allowAutoApproved: true`.
+  //
+  // An OFFLINE proof is never auto-approved: the entire point is that humans signed it out of band, so
+  // an unsigned one is a contradiction and `allowAutoApproved` must not rescue it.
+  if (receipt.sigAlg === "AUTO_APPROVED" && offline) {
+    return {
+      ok: false,
+      autoApproved: true,
+      reason: "an offline approval cannot be auto-approved — there is no human signature to verify",
+    }
+  }
   if (receipt.sigAlg === "AUTO_APPROVED") {
     return opts.allowAutoApproved
       ? { ok: true, autoApproved: true }
@@ -729,13 +1028,13 @@ export function verifyApprovalReceipt(
   const verifiedSigners = new Set<string>()
   const failures: string[] = []
   for (const witness of witnesses) {
-    const candidates = candidateKeys(expected.approvers, witness)
+    const candidates = candidateKeys(expected.approvers, witness, delegatedTo)
     if ("reason" in candidates) {
       failures.push(candidates.reason)
       continue
     }
-    // Try each trusted candidate; the one that verifies identifies the approver. In DID mode there is
-    // exactly one candidate, so this is a single check.
+    // Try each trusted candidate; the one that verifies identifies the approver. In DID mode the
+    // candidates are all keys held by that one DID, so a match still counts as a single approver.
     let matched: string | null = null
     let lastReason = "signature does not verify against any trusted approver key"
     for (const candidate of candidates.keys) {
@@ -767,7 +1066,10 @@ export function verifyApprovalReceipt(
     verifiedSigners.add(matched)
   }
 
-  const required = Math.max(1, requirement.requiredApprovals)
+  // Under a delegation the quorum is the DELEGATED one. It was already checked to equal the offline
+  // payload's signed `requiredApprovals`, so this is the same number by a different route — stated
+  // explicitly so the substitution is visible at the point it takes effect.
+  const required = Math.max(1, delegatedQuorum ?? requirement.requiredApprovals)
   if (verifiedSigners.size < required) {
     const detail = failures.length > 0 ? ` (${failures.join("; ")})` : ""
     return {
@@ -776,6 +1078,221 @@ export function verifyApprovalReceipt(
     }
   }
   return { ok: true, signers: [...verifiedSigners] }
+}
+
+/** A delegation whose own signature, quorum and window have been verified by `verifyDelegation`. */
+export interface VerifiedDelegation {
+  /** Identities permitted to approve at incident time. Enforced against the witness DIDs. */
+  delegatedTo: string[]
+  /** How many distinct members of `delegatedTo` must sign. */
+  delegatedQuorum: number
+  /** The single action this delegation covers. All three must equal what is being executed. */
+  target: string
+  actionType: string
+  params: Record<string, unknown>
+  /** The delegation's OWN nonce — for the audit trail, never for authorization. */
+  nonce: string
+  /** Who signed the delegation itself. */
+  signers: string[]
+  expiresAt: string
+}
+
+/**
+ * Verify a DELEGATION (DIV §5a.6 step 1) — a statement, signed in advance by the ordinary quorum, that
+ * names local operators who may approve one pre-declared action while the gateway is unreachable.
+ *
+ * Deliberately a SEPARATE function from `verifyApprovalReceipt`, which refuses this payload type
+ * outright. A delegation authorizes nothing, and the only way to keep that true structurally is to
+ * make it impossible to hand one to the approval verifier and get an `ok: true` back. What you get here
+ * is a `VerifiedDelegation` — an input to a later approval check, never a substitute for one.
+ *
+ * `approvers` MUST be the ORDINARY approver set (from your trust bundle), not the delegated operators:
+ * the point of the check is that the people entitled to approve this action are the ones who signed
+ * away that entitlement.
+ */
+export function verifyDelegation(
+  receipt: ApprovalReceipt,
+  expected: {
+    /** The ORDINARY approvers entitled to delegate. Resolved from your own trust policy. */
+    approvers: ApproverTrustAnchor
+    /** YOUR target identifier, asserted independently of the delegation (DIV Target Isolation). */
+    target: string
+    actionType: string
+    params: Record<string, unknown>
+  },
+  opts: VerifyReceiptOptions = {},
+): { ok: boolean; reason?: string; delegation?: VerifiedDelegation } {
+  const version = parseVersion(receipt.canonicalPayload)
+  if (version !== DIV_VERSION)
+    return { ok: false, reason: `unsupported DIV payload version (${version || "unparseable"})` }
+  if (parseField(receipt.canonicalPayload, "type") !== DIV_DELEGATION_TYPE)
+    return { ok: false, reason: "payload is not a div-delegation" }
+
+  const delegatedTo = parseField<unknown>(receipt.canonicalPayload, "delegatedTo")
+  const delegatedQuorum = parseField<unknown>(receipt.canonicalPayload, "delegatedQuorum")
+  if (!Array.isArray(delegatedTo) || delegatedTo.some((d) => typeof d !== "string" || d.length === 0))
+    return { ok: false, reason: "delegation is missing a valid delegatedTo set" }
+  if (typeof delegatedQuorum !== "number" || !Number.isInteger(delegatedQuorum) || delegatedQuorum < 1)
+    return { ok: false, reason: "delegation is missing a valid delegatedQuorum" }
+  // Deduplicate before the size check: a delegatedTo listing one operator three times would otherwise
+  // appear to support a 3-of-3 quorum that one person could satisfy alone.
+  const distinctDelegates = [...new Set(delegatedTo as string[])]
+  if (distinctDelegates.length < delegatedQuorum)
+    return {
+      ok: false,
+      reason: `delegation names ${distinctDelegates.length} distinct operator(s) but delegates a quorum of ${delegatedQuorum} — it can never be satisfied`,
+    }
+
+  const sealedAt = parseField<string>(receipt.canonicalPayload, "sealedAt")
+  const expiresAt = parseField<string>(receipt.canonicalPayload, "expiresAt")
+  if (typeof sealedAt !== "string" || sealedAt.length === 0)
+    return { ok: false, reason: "delegation is missing sealedAt" }
+  if (typeof expiresAt !== "string" || expiresAt.length === 0)
+    return { ok: false, reason: "delegation is missing expiresAt" }
+  const sealedMs = Date.parse(sealedAt)
+  const expiryMs = Date.parse(expiresAt)
+  if (Number.isNaN(sealedMs)) return { ok: false, reason: "sealedAt is not a valid RFC3339 timestamp" }
+  if (Number.isNaN(expiryMs)) return { ok: false, reason: "expiresAt is not a valid RFC3339 timestamp" }
+  const windowHours = (expiryMs - sealedMs) / 3_600_000
+  if (windowHours < 0) return { ok: false, reason: "delegation expires before it was sealed" }
+  if (windowHours > MAX_DELEGATION_WINDOW_HOURS)
+    return {
+      ok: false,
+      reason: `delegation window is ${windowHours.toFixed(1)} hours, over the ${MAX_DELEGATION_WINDOW_HOURS}-hour maximum`,
+    }
+
+  // Reconstruct and check the signature by delegating to the ordinary verifier. Building the expected
+  // bytes here and comparing them ourselves would be a second implementation of the check that already
+  // exists — and the one place the two could disagree is the place it matters most. The trick is that
+  // the reconstruction needs the delegation-specific fields, which `verifyApprovalReceipt` will not
+  // produce, so the byte comparison happens here and the CRYPTO happens there.
+  const nonce = parseNonce(receipt.canonicalPayload)
+  if (!receipt.requester) return { ok: false, reason: "delegation missing requester" }
+  const requirement = parseField<Partial<ApprovalRequirementAttestation>>(
+    receipt.canonicalPayload,
+    "requirement",
+  )
+  if (!requirement || typeof requirement.requiredApprovals !== "number")
+    return { ok: false, reason: "delegation payload is missing the signed approval requirement" }
+  if (typeof expected.target !== "string" || expected.target.length === 0)
+    return {
+      ok: false,
+      reason:
+        "expected.target is required — it must be YOUR target identifier, asserted independently of the delegation (DIV Target Isolation)",
+    }
+  if (!expected.approvers)
+    return {
+      ok: false,
+      reason:
+        "expected.approvers is required — the delegating approvers MUST come from your own trust policy, never from the delegation (DIV Invariant 3)",
+    }
+
+  let recomputed: string
+  try {
+    recomputed = canonicalDelegationPayload({
+      target: expected.target,
+      actionType: expected.actionType,
+      display: receipt.actionDescription,
+      params: expected.params,
+      requester: receipt.requester,
+      requirement: {
+        requiredApprovals: requirement.requiredApprovals,
+        requireHardwareKey: requirement.requireHardwareKey === true,
+        allowedAaguids: Array.isArray(requirement.allowedAaguids) ? requirement.allowedAaguids : [],
+        requesterCannotApprove: requirement.requesterCannotApprove === true,
+      },
+      delegatedTo: delegatedTo as string[],
+      delegatedQuorum,
+      nonce,
+      sealedAt,
+      expiresAt,
+    })
+  } catch (err) {
+    return { ok: false, reason: `expected.params is not canonicalizable: ${(err as Error).message}` }
+  }
+  if (recomputed !== receipt.canonicalPayload)
+    return { ok: false, reason: "target/params/actionType do not match what was delegated" }
+
+  // Expiry, then the signatures and quorum. `allowExpired` is honoured for forensic re-verification,
+  // exactly as on the approval path.
+  if (!opts.allowExpired) {
+    const nowMs = (opts.asOf ?? new Date()).getTime()
+    const skewMs = (opts.clockSkewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS) * 1000
+    if (nowMs > expiryMs + skewMs)
+      return {
+        ok: false,
+        reason: "delegation has expired (pass { allowExpired: true } for audit re-verification)",
+      }
+  }
+
+  if (receipt.sigAlg === "AUTO_APPROVED")
+    return {
+      ok: false,
+      reason:
+        "a delegation cannot be auto-approved — delegating approval authority requires human signatures",
+    }
+  const witnesses = witnessesOf(receipt)
+  if (witnesses.length === 0) return { ok: false, reason: "delegation missing signature material" }
+
+  const verifiedSigners = new Set<string>()
+  const failures: string[] = []
+  for (const witness of witnesses) {
+    const candidates = candidateKeys(expected.approvers, witness)
+    if ("reason" in candidates) {
+      failures.push(candidates.reason)
+      continue
+    }
+    let matched: string | null = null
+    let lastReason = "signature does not verify against any trusted approver key"
+    for (const candidate of candidates.keys) {
+      const attempt = verifyWitness(witness, candidate.key, receipt.canonicalPayload, opts)
+      if (attempt.ok) {
+        matched = candidate.identity
+        break
+      }
+      lastReason = attempt.reason
+    }
+    if (matched === null) {
+      failures.push(lastReason)
+      continue
+    }
+    if (requirement.requireHardwareKey === true && witness.sigAlg !== "WEBAUTHN") {
+      failures.push(
+        `signer ${witness.signerDid} used a bare key, but the signed policy requires a hardware-backed WebAuthn credential`,
+      )
+      continue
+    }
+    if (requirement.requesterCannotApprove === true && witness.signerDid === receipt.requester.did) {
+      failures.push(`four-eyes: requester ${witness.signerDid} cannot delegate to themselves`)
+      continue
+    }
+    verifiedSigners.add(matched)
+  }
+
+  const required = Math.max(1, requirement.requiredApprovals)
+  if (verifiedSigners.size < required) {
+    const detail = failures.length > 0 ? ` (${failures.join("; ")})` : ""
+    return {
+      ok: false,
+      reason: `delegation quorum not met: ${verifiedSigners.size} of ${required} required approver signatures verified${detail}`,
+    }
+  }
+
+  return {
+    ok: true,
+    delegation: {
+      // The DEDUPLICATED set: this is what gets enforced against witness DIDs later, and a duplicate
+      // entry must not create the illusion of a larger eligible pool.
+      delegatedTo: distinctDelegates,
+      delegatedQuorum,
+      target: expected.target,
+      actionType: expected.actionType,
+      params: expected.params,
+      nonce,
+      signers: [...verifiedSigners],
+      expiresAt,
+    },
+  }
 }
 
 // ─── Audit ledger inclusion proofs ───────────────────────────────────────────
