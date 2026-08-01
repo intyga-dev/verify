@@ -87,6 +87,14 @@ export interface EvidenceBundle {
     anchoredAt: string | null
     seqStart: string
     seqEnd: string
+    /**
+     * The §5.2 signed anchors over this checkpoint's root — the set the §5.3 quorum rule is
+     * evaluated over (§6.3). Used as quorum candidates when the caller supplies none of its own;
+     * they still verify only under keys the CALLER trusts, so a bundle cannot vouch for itself.
+     */
+    anchors?: SignedAnchor[]
+    /** Producer claim of §5.3 quorum (distinct non-SELF issuers). Display only — never trusted. */
+    externallyAnchored?: boolean
   }[]
 }
 
@@ -115,11 +123,10 @@ export interface EvidenceVerifyOptions {
    * must chain to one of them for a trustworthy verdict. */
   trustedRoots?: string[]
   /**
-   * Signed anchors for the roots below, fetched by YOU from each issuer (DEWP §5.3).
-   *
-   * Without these the strongest verdict this function can reach is "the roots I was handed match" —
-   * nobody has checked a signature over those roots. verifyBundle has implemented quorum since §6.2;
-   * the evidence path, which is the auditor-facing artifact, had no way to express it at all.
+   * Signed anchors for the roots below, fetched by YOU from each issuer (DEWP §5.3). When omitted,
+   * quorum falls back to the anchors carried in the bundle's own `checkpoints[].anchors` — still
+   * checked under YOUR keys via `resolveAnchorKey`, but see the divergence carve-out at the quorum
+   * loop: only caller-fetched anchors can establish divergence.
    */
   anchors?: SignedAnchor[]
   anchorPolicy?: AnchorPolicy
@@ -163,6 +170,8 @@ export function verifyEvidenceBundle(
   const failed: { seq: string; reason: string }[] = []
   let contentVerified = 0
   let commitmentOnly = 0
+  /** Entries whose displayed type/outcome rest on the producer's redaction record, not on the log. */
+  let redactedDisplayed = 0
 
   // DEWP §6.5: "a compliant verifier MUST reject any other value." A note let a container of one
   // type be fed to the verifier for another and still come back ok — the caller would be reading a
@@ -186,6 +195,22 @@ export function verifyEvidenceBundle(
   const isRedacted = (event: EvidenceEntry["event"]): boolean =>
     event.redaction ? event.redaction.mode === "COMMITMENT_ONLY" : event.redacted === true
 
+  /**
+   * `tenantSeq` arrives as an untrusted string. Bare `BigInt(x)` THROWS on anything non-numeric, so a
+   * malformed counter propagated a SyntaxError out of this function instead of returning a verdict —
+   * fail-closed only by accident of the CLI exiting non-zero, and an exception for any library
+   * consumer. Oversized digit strings are also superlinear to parse, hence the length bound: a 64-bit
+   * counter needs 20 digits.
+   */
+  const parseCounter = (raw: string): bigint | null => {
+    if (typeof raw !== "string" || !/^-?\d{1,20}$/.test(raw)) return null
+    try {
+      return BigInt(raw)
+    } catch {
+      return null
+    }
+  }
+
   const trusted = opts.trustedRoots ? new Set(opts.trustedRoots) : null
   if (!trusted) {
     notes.push(
@@ -196,7 +221,11 @@ export function verifyEvidenceBundle(
   }
 
   const knownRoots = new Map<string, string | null>()
-  for (const cp of bundle.checkpoints) knownRoots.set(cp.root, cp.anchorRef)
+  const bundleAnchorsByRoot = new Map<string, SignedAnchor[]>()
+  for (const cp of bundle.checkpoints) {
+    knownRoots.set(cp.root, cp.anchorRef)
+    if (cp.anchors?.length) bundleAnchorsByRoot.set(cp.root, cp.anchors)
+  }
 
   for (const entry of bundle.entries) {
     const seq = entry.event.seq
@@ -229,8 +258,14 @@ export function verifyEvidenceBundle(
       })
       continue
     }
-    if (isRedacted(entry.event)) {
-      // §16: a COMMITMENT_ONLY entry MUST keep the ORIGINAL leaf hash — it is what still verifies
+    // A redaction marker is read from the bundle, so it must not be able to switch off a check the
+    // entry's own data would otherwise satisfy. DEWP §15 says a verifier MUST NOT attempt
+    // contentVerified for a COMMITMENT_ONLY entry *because the preimage is intentionally absent* —
+    // an entry that ships a preimage AND claims redaction is self-contradictory, and the preimage is
+    // the thing that can actually be checked. Bind it. Otherwise a fabricated `canonical` plus
+    // `redaction: {mode: "COMMITMENT_ONLY"}` relabels any real committed leaf to anything at all.
+    if (isRedacted(entry.event) && !entry.event.canonical) {
+      // §15: a COMMITMENT_ONLY entry MUST keep the ORIGINAL leaf hash — it is what still verifies
       // against the anchored root. If the redaction record names a different one, the commitment was
       // rewritten during redaction, which is exactly what redaction must not be able to do.
       const retained = entry.event.redaction?.commitment?.leaf
@@ -241,6 +276,7 @@ export function verifyEvidenceBundle(
         })
         continue
       }
+      redactedDisplayed++
       commitmentOnly++
     } else if (unknownProfile) {
       // Commitment verified above; content cannot be bound under an unrecognised layout.
@@ -306,7 +342,14 @@ export function verifyEvidenceBundle(
       sawUncountedEntry = true
       continue
     }
-    const currentTenantSeq = BigInt(tenantSeqStr)
+    const currentTenantSeq = parseCounter(tenantSeqStr)
+    if (currentTenantSeq === null) {
+      failed.push({
+        seq: entry.event.seq,
+        reason: `tenantSeq ${JSON.stringify(tenantSeqStr)} is not a valid integer counter`,
+      })
+      continue
+    }
     if (lastTenantSeq !== null && currentTenantSeq !== lastTenantSeq + 1n) {
       failed.push({
         seq: entry.event.seq,
@@ -318,6 +361,14 @@ export function verifyEvidenceBundle(
     }
     if (firstTenantSeq === null) firstTenantSeq = currentTenantSeq
     lastTenantSeq = currentTenantSeq
+  }
+  if (redactedDisplayed > 0) {
+    notes.push(
+      `${redactedDisplayed} entr${redactedDisplayed === 1 ? "y is" : "ies are"} COMMITMENT_ONLY: inclusion ` +
+        "is proven against the retained leaf, but the displayed type/outcome/detail are NOT covered by " +
+        "it — the preimage they would be checked against is gone. They rest on the producer's redaction " +
+        "record (DEWP §15), not on the anchored log.",
+    )
   }
   if (sawUncountedEntry) {
     notes.push(
@@ -344,16 +395,25 @@ export function verifyEvidenceBundle(
         "Bundle declares a tenantSequenceCommitment but no entry carries a tenantSeq to check it against.",
       )
     } else {
-      if (firstSeen !== BigInt(commitment.firstTenantSeq))
+      const claimedFirst = parseCounter(commitment.firstTenantSeq)
+      const claimedLast = parseCounter(commitment.lastTenantSeq)
+      if (claimedFirst === null || claimedLast === null) {
         failed.push({
           seq: bundle.entries[0]?.event.seq ?? "?",
-          reason: `bundle claims it starts at tenantSeq ${commitment.firstTenantSeq} but the first entry is ${firstSeen.toString()}`,
+          reason: "tenantSequenceCommitment carries a non-numeric firstTenantSeq/lastTenantSeq",
         })
-      if (lastSeen !== BigInt(commitment.lastTenantSeq))
-        failed.push({
-          seq: bundle.entries.at(-1)?.event.seq ?? "?",
-          reason: `bundle claims it ends at tenantSeq ${commitment.lastTenantSeq} but the last entry is ${lastSeen.toString()}`,
-        })
+      } else {
+        if (firstSeen !== claimedFirst)
+          failed.push({
+            seq: bundle.entries[0]?.event.seq ?? "?",
+            reason: `bundle claims it starts at tenantSeq ${commitment.firstTenantSeq} but the first entry is ${firstSeen.toString()}`,
+          })
+        if (lastSeen !== claimedLast)
+          failed.push({
+            seq: bundle.entries.at(-1)?.event.seq ?? "?",
+            reason: `bundle claims it ends at tenantSeq ${commitment.lastTenantSeq} but the last entry is ${lastSeen.toString()}`,
+          })
+      }
       if (commitment.tenantId !== bundle.tenant.id)
         notes.push(
           `tenantSequenceCommitment names tenant ${commitment.tenantId}, which differs from the bundle's tenant ${bundle.tenant.id}.`,
@@ -361,17 +421,29 @@ export function verifyEvidenceBundle(
     }
   }
 
-  // DEWP §5.3 anchor quorum, per distinct root. Only runs when the caller supplied anchors, a policy
-  // AND a key resolver — signatures are checked against keys the VERIFIER trusts, so a bundle cannot
-  // vouch for itself. Divergence deliberately uses the same caller-supplied set (see
-  // verifyAnchorQuorum's divergenceAnchors): the anchor preimage carries no checkpoint identity, so
-  // only anchors fetched per checkpoint can distinguish a conflicting root from another day's.
-  const canCheckAnchors = Boolean(opts.anchors?.length && opts.anchorPolicy && opts.resolveAnchorKey)
+  // DEWP §5.3 anchor quorum, per distinct root. Candidate anchors come from the caller when
+  // supplied, otherwise from the bundle's own per-checkpoint `anchors` — the §6.3 set the quorum
+  // rule is defined over. Either way the check only runs when the caller supplied a policy AND a key
+  // resolver: signatures are checked against keys the VERIFIER trusts, so a bundle cannot vouch for
+  // itself by shipping anchors it signed with its own key.
+  //
+  // Bundle-carried anchors may COUNT toward quorum but may never trigger the fatal DIVERGENCE
+  // verdict (mirrors verifyBundle): an anchor's signed preimage carries no checkpoint identity, so a
+  // genuine anchor from another day is indistinguishable from a conflicting one, and appending a
+  // real, publicly available anchor would be enough to make a valid bundle read as tampering. Only
+  // anchors the caller fetched itself, per checkpoint, can establish divergence.
+  // Gated on the CALLER having asked (policy + resolver), never on candidates existing: a producer
+  // who strips `checkpoints[].anchors` must get "quorum not met (0/N)", not a skipped check. Gating
+  // on candidates was the same shape as the trap verifyBundle documents — a check the prover can
+  // switch off — with the CLI then printing VERIFIED under a policy nobody evaluated.
+  const canCheckAnchors = Boolean(opts.anchorPolicy && opts.resolveAnchorKey)
+  const usedBundleAnchors = canCheckAnchors && !opts.anchors?.length && bundleAnchorsByRoot.size > 0
   const roots = [...knownRoots.entries()].map(([root, anchorRef]) => {
     if (!canCheckAnchors || !opts.anchorPolicy || !opts.resolveAnchorKey) {
       return { root, anchorRef, anchorVerified: null, verifiedIssuers: [] as string[] }
     }
-    const q = verifyAnchorQuorum(opts.anchors ?? [], root, opts.anchorPolicy, opts.resolveAnchorKey, {
+    const candidates = opts.anchors?.length ? opts.anchors : (bundleAnchorsByRoot.get(root) ?? [])
+    const q = verifyAnchorQuorum(candidates, root, opts.anchorPolicy, opts.resolveAnchorKey, {
       divergenceAnchors: opts.anchors ?? [],
       externalKeys: opts.externalKeys,
     })
@@ -380,12 +452,28 @@ export function verifyEvidenceBundle(
     } else if (!q.ok && q.reason) {
       notes.push(`Root ${root.slice(0, 16)}…: ${q.reason}`)
     }
+    // RFC 3161 honesty: a TSA anchor is real evidence this tool cannot check offline; say so rather
+    // than let "quorum not met" read as "unanchored".
+    if (q.note) notes.push(`Root ${root.slice(0, 16)}…: ${q.note}`)
     return { root, anchorRef, anchorVerified: q.ok, verifiedIssuers: q.verifiedIssuers }
   })
-  if (!canCheckAnchors) {
+  if (usedBundleAnchors) {
+    notes.push(
+      "Anchor quorum was evaluated over the anchors carried in the bundle's checkpoints. They verify " +
+        "only under keys YOU trust, so the result is sound — but divergence detection needs anchors " +
+        "you fetched per checkpoint yourself (pass `anchors`).",
+    )
+  }
+  if (!canCheckAnchors && !(opts.anchorPolicy || opts.resolveAnchorKey)) {
     notes.push(
       "No anchor policy supplied — the roots above were compared, but no independent signature over " +
-        "them was checked. Pass anchors + anchorPolicy + resolveAnchorKey for a DEWP §5.3 verdict.",
+        "them was checked. Pass anchorPolicy + resolveAnchorKey (and optionally your own anchors) " +
+        "for a DEWP §5.3 verdict.",
+    )
+  } else if (!canCheckAnchors) {
+    notes.push(
+      "Anchor policy incomplete — both anchorPolicy AND resolveAnchorKey are required for a DEWP " +
+        "§5.3 verdict; neither alone can check a signature.",
     )
   }
   // When a policy WAS supplied, every root must reach quorum; a bundle resting on an unanchored root

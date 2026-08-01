@@ -117,6 +117,11 @@ export function expectedPathLength(leafCount: number): number {
 /**
  * Position of the leaf a proof is for, and how many leaves its tree had. Supplying these turns an
  * "is there SOME path from this leaf to this root" check into "is this leaf at this position".
+ *
+ * REQUIRED, per DEWP §3 invariant 3 ("The bounds are REQUIRED, not advisory") and §11.1. This was
+ * an optional parameter, which made the unbounded check reachable by omission from outside this
+ * package — the one place it must not be reachable, since external relying parties are exactly who
+ * this package exists for.
  */
 export interface ProofBounds {
   index: number
@@ -128,7 +133,7 @@ export function verifyMerkleProof(
   leaf: string,
   proof: ProofStep[],
   root: string,
-  bounds?: ProofBounds,
+  bounds: ProofBounds,
 ): boolean {
   // Bounds are what make this a proof of membership rather than a proof that A path exists.
   //
@@ -136,38 +141,40 @@ export function verifyMerkleProof(
   // merkleRoot([a,b,c]) === merkleRoot([a,b,c,c]) and a path for the nonexistent index 3 recomputes
   // the 3-leaf root exactly. Without a length and index there is nothing to reject it with, which
   // falsifies DEWP §17.1's claim that forging an inclusion path needs a SHA-256 second preimage.
-  if (bounds) {
-    const { index, leafCount } = bounds
-    if (!Number.isInteger(index) || !Number.isInteger(leafCount)) return false
-    if (leafCount < 1 || index < 0 || index >= leafCount) return false
-    if (proof.length !== expectedPathLength(leafCount)) return false
-    // Each sibling's side follows from the index; letting the prover choose it freely would hand
-    // back the flexibility the length check just removed.
-    //
-    // The self-pairing check is what actually closes the padding forgery. `leafCount` comes from the
-    // proof, so a prover can simply inflate it: claiming leafCount 4 on a 3-leaf tree makes index 3
-    // "in range" and the path length correct, and the duplicate-last root is identical — so range
-    // and length alone still accept it (verified). But padding is observable: a node hashed against
-    // ITSELF only legitimately occurs at the unpaired END of an odd level. A step whose sibling
-    // equals the running node anywhere else is the signature of an index pointing into padding.
-    let idx = index
-    let levelSize = leafCount
-    let node = leaf
-    for (const step of proof) {
-      const expectedSide = idx % 2 === 1 ? "LEFT" : "RIGHT"
-      if (step.siblingPosition !== expectedSide) return false
-      const selfPaired = step.siblingHash === node
-      const legitimatelyUnpaired = idx === levelSize - 1 && levelSize % 2 === 1
-      if (selfPaired && !legitimatelyUnpaired) return false
-      node =
-        step.siblingPosition === "LEFT" ? hashPair(step.siblingHash, node) : hashPair(node, step.siblingHash)
-      idx = Math.floor(idx / 2)
-      levelSize = Math.ceil(levelSize / 2)
-    }
-  }
-  let h = leaf
+  // DEWP §11.1 states outright that an implementation stopping at root recomputation is
+  // non-conformant, so this is a rejection, never a skipped check.
+  //
+  // `bounds` is required for every TS caller, but this package is the dependency-free, plain-JS-
+  // callable trust anchor (see packages/verify/README.md) — nothing enforces that for a legacy
+  // 3-argument call from an untyped consumer. Refusing here keeps this a boolean predicate for that
+  // caller instead of a thrown TypeError.
+  if (!bounds) return false
+  const { index, leafCount } = bounds
+  if (!Number.isInteger(index) || !Number.isInteger(leafCount)) return false
+  if (leafCount < 1 || index < 0 || index >= leafCount) return false
+  if (proof.length !== expectedPathLength(leafCount)) return false
+  // Each sibling's side follows from the index; letting the prover choose it freely would hand
+  // back the flexibility the length check just removed.
+  //
+  // The self-pairing check is what actually closes the padding forgery. `leafCount` comes from the
+  // proof, so a prover can simply inflate it: claiming leafCount 4 on a 3-leaf tree makes index 3
+  // "in range" and the path length correct, and the duplicate-last root is identical — so range
+  // and length alone still accept it (verified). But padding is observable: a node hashed against
+  // ITSELF only legitimately occurs at the unpaired END of an odd level. A step whose sibling
+  // equals the running node anywhere else is the signature of an index pointing into padding.
+  let idx = index
+  let levelSize = leafCount
+  let node = leaf
   for (const step of proof) {
-    h = step.siblingPosition === "LEFT" ? hashPair(step.siblingHash, h) : hashPair(h, step.siblingHash)
+    const expectedSide = idx % 2 === 1 ? "LEFT" : "RIGHT"
+    if (step.siblingPosition !== expectedSide) return false
+    const selfPaired = step.siblingHash === node
+    const legitimatelyUnpaired = idx === levelSize - 1 && levelSize % 2 === 1
+    if (selfPaired && !legitimatelyUnpaired) return false
+    node =
+      step.siblingPosition === "LEFT" ? hashPair(step.siblingHash, node) : hashPair(node, step.siblingHash)
+    idx = Math.floor(idx / 2)
+    levelSize = Math.ceil(levelSize / 2)
   }
-  return h === root
+  return node === root
 }

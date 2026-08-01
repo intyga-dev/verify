@@ -185,8 +185,12 @@ export class NonCanonicalValue extends Error {}
  * whose entire job is "these bytes are exactly what was signed", quietly mapping several inputs onto
  * one output is the wrong failure mode: the relying party's `expected.params` come from its own live
  * runtime objects, so it is the caller most likely to hand us a Date.
+ *
+ * Exported so the shared golden vectors can pin THIS copy directly (vectors.test.ts) — every other
+ * port pins its canonicalizer against the committed file; the shipped relying-party verifier must
+ * not be the one implementation pinned only transitively.
  */
-function stableStringify(value: unknown): string {
+export function stableStringify(value: unknown): string {
   if (value === null) return "null"
   const t = typeof value
   if (t === "string" || t === "boolean") return JSON.stringify(value)
@@ -271,6 +275,16 @@ export const DIV_DELEGATION_TYPE = "div-delegation"
  * verification time from a correct one (DIV §5a.3).
  */
 export const MAX_OFFLINE_WINDOW_MINUTES = 60
+
+/**
+ * Ceiling on the witness list this verifier will process. A DIV quorum is single digits — this is a
+ * denial-of-service bound, not a policy limit, because verification runs in the relying party's own
+ * process on an attacker-supplied receipt immediately before an irreversible action.
+ */
+export const MAX_WITNESSES = 64
+
+/** How many per-witness failure reasons are folded into the returned `reason` string. */
+const MAX_REPORTED_FAILURES = 8
 
 /**
  * Hard ceiling on a delegation's validity window. Hours, not the 30 days the old sealed token
@@ -889,16 +903,18 @@ export function verifyApprovalReceipt(
     const challengedMs = Date.parse(challengedAt)
     if (Number.isNaN(challengedMs))
       return { ok: false, reason: "challengedAt is not a valid RFC3339 timestamp" }
+    // An unparseable `expiresAt` must be refused HERE rather than skipping the window cap and relying
+    // on the expiry check below — that check is disabled by `allowExpired`, so the combination left
+    // the cap unenforced on a proof whose window could not be computed at all.
     const expiryMs = Date.parse(expiresAt)
-    if (!Number.isNaN(expiryMs)) {
-      const windowMinutes = (expiryMs - challengedMs) / 60_000
-      if (windowMinutes > MAX_OFFLINE_WINDOW_MINUTES)
-        return {
-          ok: false,
-          reason: `offline window is ${windowMinutes.toFixed(1)} minutes, over the ${MAX_OFFLINE_WINDOW_MINUTES}-minute maximum`,
-        }
-      if (windowMinutes < 0) return { ok: false, reason: "offline proof expires before it was challenged" }
-    }
+    if (Number.isNaN(expiryMs)) return { ok: false, reason: "expiresAt is not a valid RFC3339 timestamp" }
+    const windowMinutes = (expiryMs - challengedMs) / 60_000
+    if (windowMinutes > MAX_OFFLINE_WINDOW_MINUTES)
+      return {
+        ok: false,
+        reason: `offline window is ${windowMinutes.toFixed(1)} minutes, over the ${MAX_OFFLINE_WINDOW_MINUTES}-minute maximum`,
+      }
+    if (windowMinutes < 0) return { ok: false, reason: "offline proof expires before it was challenged" }
 
     // A hardware-key policy CANNOT be satisfied offline (DIV §5a.3 step 4, §5a.8). WebAuthn needs a
     // secure context and an RP ID that an offline signing surface will not match, so an offline
@@ -1022,6 +1038,15 @@ export function verifyApprovalReceipt(
   }
   const witnesses = witnessesOf(receipt)
   if (witnesses.length === 0) return { ok: false, reason: "receipt missing signature material" }
+  // The witness list is attacker-supplied and every entry costs an ECDSA verification per candidate
+  // key. A real quorum is single digits; 20 000 witnesses measured at 3.6s of blocked event loop and
+  // a 1.16 MB failure string, in the relying party's process, before the action it gates. Bound it.
+  if (witnesses.length > MAX_WITNESSES) {
+    return {
+      ok: false,
+      reason: `receipt carries ${witnesses.length} witnesses, above the ${MAX_WITNESSES} this verifier will process`,
+    }
+  }
 
   // Count DISTINCT approvers whose signature verifies under a key we independently trust. Distinct is
   // load-bearing: without it, N copies of one approver's signature would satisfy an N-of-M quorum.
@@ -1071,7 +1096,11 @@ export function verifyApprovalReceipt(
   // explicitly so the substitution is visible at the point it takes effect.
   const required = Math.max(1, delegatedQuorum ?? requirement.requiredApprovals)
   if (verifiedSigners.size < required) {
-    const detail = failures.length > 0 ? ` (${failures.join("; ")})` : ""
+    // Report the first few reasons only. Folding every failure into one string is what turned a long
+    // witness list into a megabyte of error text; the leading reasons are the diagnostic ones anyway.
+    const shown = failures.slice(0, MAX_REPORTED_FAILURES)
+    const elided = failures.length - shown.length
+    const detail = shown.length > 0 ? ` (${shown.join("; ")}${elided > 0 ? `; +${elided} more` : ""})` : ""
     return {
       ok: false,
       reason: `quorum not met: ${verifiedSigners.size} of ${required} required approver signatures verified${detail}`,
@@ -1233,6 +1262,16 @@ export function verifyDelegation(
     }
   const witnesses = witnessesOf(receipt)
   if (witnesses.length === 0) return { ok: false, reason: "delegation missing signature material" }
+  // Same resource bound as the approval path: signature verification is the expensive step, and a
+  // delegation is verified in the same process, right before the same irreversible action. Go, Rust
+  // and Python bound both paths; leaving this one open re-creates the measured 3.6s event-loop stall
+  // one function over.
+  if (witnesses.length > MAX_WITNESSES) {
+    return {
+      ok: false,
+      reason: `delegation carries ${witnesses.length} witnesses, above the ${MAX_WITNESSES} this verifier will process`,
+    }
+  }
 
   const verifiedSigners = new Set<string>()
   const failures: string[] = []
@@ -1271,7 +1310,11 @@ export function verifyDelegation(
 
   const required = Math.max(1, requirement.requiredApprovals)
   if (verifiedSigners.size < required) {
-    const detail = failures.length > 0 ? ` (${failures.join("; ")})` : ""
+    // Folded like the approval path: an attacker-shaped witness list must not be able to inflate the
+    // reason string (the 1.16 MB error the approval path once produced).
+    const shown = failures.slice(0, MAX_REPORTED_FAILURES)
+    const elided = failures.length - shown.length
+    const detail = shown.length > 0 ? ` (${shown.join("; ")}${elided > 0 ? `; +${elided} more` : ""})` : ""
     return {
       ok: false,
       reason: `delegation quorum not met: ${verifiedSigners.size} of ${required} required approver signatures verified${detail}`,

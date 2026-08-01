@@ -572,4 +572,39 @@ describe("delegation", () => {
     assert.equal(r.ok, false)
     assert.match(r.reason ?? "", /cannot be auto-approved/)
   })
+
+  // Resource bounds, mirroring the approval path (and Go/Rust/Python, which bound both paths). A
+  // delegation is verified in the same process, right before the same irreversible action, so an
+  // unbounded witness list is the same measured 3.6s event-loop stall one function over.
+  it("refuses a delegation carrying more witnesses than the resource bound", () => {
+    const { receipt } = delegationProof()
+    const junk = Array.from({ length: 65 }, (_, i) => ({
+      signerDid: `did:example:flood-${i}`,
+      signerPublicKey: "AAAA",
+      signature: "AAAA",
+      sigAlg: "ES256",
+    }))
+    const flooded = { ...receipt, signatures: [...(receipt.signatures ?? []), ...junk] }
+    const r = verifyDelegation(flooded, delegationExpectation)
+    assert.equal(r.ok, false)
+    assert.match(r.reason ?? "", /above the 64/)
+  })
+
+  it("folds delegation failure reasons instead of concatenating all of them", () => {
+    // One valid signer against a 2-signature requirement, padded with junk up to the bound: quorum
+    // fails with 62 individual failure reasons, of which only 8 may reach the reason string.
+    const { receipt } = delegationProof({ signers: [ALICE] })
+    const junk = Array.from({ length: 62 }, (_, i) => ({
+      signerDid: `did:example:flood-${i}`,
+      signerPublicKey: "AAAA",
+      signature: "AAAA",
+      sigAlg: "ES256",
+    }))
+    const flooded = { ...receipt, signatures: [...(receipt.signatures ?? []), ...junk] }
+    const r = verifyDelegation(flooded, delegationExpectation)
+    assert.equal(r.ok, false)
+    assert.match(r.reason ?? "", /delegation quorum not met/)
+    assert.match(r.reason ?? "", /\+54 more/)
+    assert.ok((r.reason ?? "").length < 2_000, `reason must stay bounded, got ${r.reason?.length} chars`)
+  })
 })

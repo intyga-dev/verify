@@ -16,7 +16,7 @@ export interface SignedAnchor {
   algorithm: "ES256" | "Ed25519" | "RSA-PSS"
   keyId: string
   signature: string // base64, over the raw 32-byte anchorDigest. EMPTY for external anchors.
-  /** SELF | REKOR | TSA | WEBHOOK. Decides WHICH verification applies; absent ⇒ treated as DEWP. */
+  /** SELF | REKOR | RFC3161 | WEBHOOK. Decides WHICH verification applies; absent ⇒ treated as DEWP. */
   kind?: string
   /** The external log's own attestation, base64 (Rekor: entry + SET + inclusion proof). */
   evidence?: string | null
@@ -138,6 +138,14 @@ export interface AnchorQuorumResult {
   /** True if two trusted issuers signed DIFFERENT roots for this checkpoint (fatal → not ok). */
   divergence: boolean
   reason?: string
+  /**
+   * Set when trusted RFC 3161 TSA anchors over THIS root were present but could not be counted:
+   * their attestation is a CMS/DER TimeStampToken that this zero-dependency verifier deliberately
+   * does not parse (verify it out of band with `openssl ts -verify`). Without this note, "0
+   * verified issuers" over a TSA-anchored root reads as "unanchored", which misstates the evidence
+   * that actually exists — the producer's publication quorum legitimately counts TSA anchors.
+   */
+  note?: string
 }
 
 /**
@@ -187,6 +195,7 @@ export function verifyAnchorQuorum(
     }
   }
   const verifiedIssuers = new Set<string>()
+  let rfc3161Present = 0
   for (const a of trusted) {
     if (a.dailyRoot !== dailyRoot) continue
     // External anchors (Rekor today) carry no DEWP signature — the third party's attestation IS the
@@ -198,6 +207,14 @@ export function verifyAnchorQuorum(
       const evidence = parseRekorEvidence(a.evidence)
       if (!evidence) continue
       if (verifyRekorAnchor(evidence, a, rekorKey).ok) verifiedIssuers.add(a.issuer)
+      continue
+    }
+    if (a.kind === "RFC3161") {
+      // A TSA anchor's attestation is a DER TimeStampToken (CMS SignedData). Checking it needs an
+      // ASN.1/X.509 stack this zero-dependency verifier deliberately does not carry, so it can
+      // never count toward quorum HERE — but it IS genuine third-party evidence (the producer's
+      // publication quorum counts it), so its presence is reported instead of silently dropped.
+      rfc3161Present++
       continue
     }
     const key = resolveKey(a)
@@ -214,5 +231,13 @@ export function verifyAnchorQuorum(
     verifiedIssuers: [...verifiedIssuers],
     divergence: false,
     reason: count >= need ? undefined : `anchor quorum not met (${count}/${need})`,
+    ...(rfc3161Present > 0
+      ? {
+          note:
+            `${rfc3161Present} RFC 3161 TSA anchor(s) over this root are present but not verifiable ` +
+            "offline by this tool — verify the token out of band with `openssl ts -verify` and the " +
+            "TSA's certificate.",
+        }
+      : {}),
   }
 }

@@ -180,3 +180,118 @@ test("DEWP §10 published reference vectors reproduce exactly", () => {
 
   assert.equal(emptyRoot(), "dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986")
 })
+
+// ── Shared signedAnchor golden vectors ───────────────────────────────────────
+// The committed ledger vectors pinned the anchor DIGEST but carried no key or signature, so anchor
+// SIGNING — the §5.2 raw-32-bytes-not-hex interop trap — was pinned by nothing shared. Every port
+// consumes this same section; an implementation that signs the 64-char hex text matches the digest
+// vector and fails here, which is the trap's exact signature.
+test("shared signedAnchor vectors verify (raw-digest signing, cross-language)", async () => {
+  const fs = await import("node:fs")
+  const path = await import("node:path")
+  const { fileURLToPath } = await import("node:url")
+  const vectors = JSON.parse(
+    fs.readFileSync(
+      path.join(
+        path.dirname(fileURLToPath(import.meta.url)),
+        "..",
+        "..",
+        "mcp-schemas",
+        "vectors",
+        "ledger-vectors.json",
+      ),
+      "utf8",
+    ),
+  ) as {
+    signedAnchor: {
+      signerKey: { spkiB64: string }
+      cases: { name: string; anchor: SignedAnchor; digestHex?: string; expectOk: boolean }[]
+    }
+  }
+  const publicKey = crypto.createPublicKey({
+    key: Buffer.from(vectors.signedAnchor.signerKey.spkiB64, "base64"),
+    format: "der",
+    type: "spki",
+  })
+  for (const c of vectors.signedAnchor.cases) {
+    if (c.digestHex) assert.equal(anchorDigestHex(c.anchor), c.digestHex, c.name)
+    assert.equal(verifyAnchorSignature(c.anchor, publicKey), c.expectOk, c.name)
+    // The same anchor through the quorum path: a 1-of-1 policy naming its issuer must agree.
+    const q = verifyAnchorQuorum(
+      [c.anchor],
+      c.anchor.dailyRoot,
+      { requiredAnchors: 1, trustedIssuers: [c.anchor.issuer], quorum: "ALL_MUST_AGREE" },
+      () => publicKey,
+    )
+    assert.equal(q.ok, c.expectOk, `${c.name} (quorum path)`)
+  }
+})
+
+// ── RFC 3161 honesty ─────────────────────────────────────────────────────────
+// The producer's publication quorum legitimately counts TSA anchors (they ARE third-party
+// evidence, checkable with `openssl ts -verify`), but this zero-dependency verifier deliberately
+// carries no CMS/X.509 stack and cannot check them. That asymmetry must be REPORTED, not silent:
+// "0 verified issuers" over a TSA-anchored root would otherwise read as "unanchored".
+test("RFC 3161 TSA anchors are reported present-but-unverifiable, never silently dropped", () => {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  const dewpInput = { ...base, issuer: "https://dewp.example", algorithm: "ES256" as const }
+  const dewpAnchor: SignedAnchor = {
+    ...dewpInput,
+    keyId: "k1",
+    signature: signAnchor(dewpInput, privateKey),
+  }
+  const tsaAnchor: SignedAnchor = {
+    ...base,
+    issuer: "https://tsa.example",
+    algorithm: "ES256",
+    keyId: "tsa-2026",
+    signature: "", // a TSA anchor carries no DEWP signature — its DER token lives in `evidence`
+    kind: "RFC3161",
+    evidence: Buffer.from("stand-in DER TimeStampToken").toString("base64"),
+  }
+  const resolve = (a: SignedAnchor) => (a.issuer === "https://dewp.example" ? publicKey : null)
+  const issuers = ["https://dewp.example", "https://tsa.example"]
+
+  // Quorum met without the TSA: the note still surfaces the TSA evidence.
+  const met = verifyAnchorQuorum(
+    [dewpAnchor, tsaAnchor],
+    DAILY_ROOT,
+    {
+      requiredAnchors: 1,
+      trustedIssuers: issuers,
+      quorum: "N_OF_M",
+    },
+    resolve,
+  )
+  assert.equal(met.ok, true)
+  assert.match(met.note ?? "", /RFC 3161/)
+
+  // Quorum NOT met because the second trusted anchor is the TSA: the verdict must carry the
+  // out-of-band pointer rather than reading as "unanchored".
+  const notMet = verifyAnchorQuorum(
+    [dewpAnchor, tsaAnchor],
+    DAILY_ROOT,
+    {
+      requiredAnchors: 2,
+      trustedIssuers: issuers,
+      quorum: "N_OF_M",
+    },
+    resolve,
+  )
+  assert.equal(notMet.ok, false)
+  assert.match(notMet.reason ?? "", /anchor quorum not met \(1\/2\)/)
+  assert.match(notMet.note ?? "", /openssl ts -verify/)
+
+  // No TSA present ⇒ no note. The note must never fire vacuously, or it trains readers to skip it.
+  const clean = verifyAnchorQuorum(
+    [dewpAnchor],
+    DAILY_ROOT,
+    {
+      requiredAnchors: 1,
+      trustedIssuers: issuers,
+      quorum: "N_OF_M",
+    },
+    resolve,
+  )
+  assert.equal(clean.note, undefined)
+})

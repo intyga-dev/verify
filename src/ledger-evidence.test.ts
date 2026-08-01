@@ -1,5 +1,7 @@
 import assert from "node:assert/strict"
+import crypto from "node:crypto"
 import { test } from "node:test"
+import { type SignedAnchor, signAnchor } from "./ledger-anchor.js"
 import { EVIDENCE_BUNDLE_KIND, type EvidenceBundle, verifyEvidenceBundle } from "./ledger-evidence.js"
 import { type AuditLeaf, leafHash } from "./ledger-leaf.js"
 import { hashLeaf, merkleProof, merkleRoot, emptyRoot, sha256Hex } from "./ledger-merkle.js"
@@ -386,5 +388,119 @@ test("evidence: an entry belonging to another tenant is not counted as this tena
       (f) => f.reason.includes("belongs to tenant") || f.reason.includes("leaf hash does not match"),
     ),
     `expected a rejection, got ${JSON.stringify(res.failed)}`,
+  )
+})
+
+// ─── In-bundle anchor quorum (§6.3 checkpoints[].anchors) ────────────────────
+//
+// The evidence bundle carries the §5.2 signed anchors per checkpoint — the set the §5.3 quorum rule
+// is defined over — yet the verifier used to ignore them entirely: without caller-fetched anchors,
+// `anchorVerified` was unreachable. These pin the fallback: bundle anchors count toward quorum
+// (they still verify only under keys the CALLER trusts) but can never force the fatal DIVERGENCE
+// verdict, which stays reserved for anchors the caller fetched per checkpoint itself.
+
+function makeAnchorIssuer(issuer: string) {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" })
+  const anchorFor = (dailyRoot: string): SignedAnchor => {
+    const base = { dailyRoot, timestamp: "2026-07-15T23:59:00.000Z", issuer, algorithm: "ES256" as const }
+    return { ...base, keyId: `${issuer}#key-1`, signature: signAnchor(base, privateKey) }
+  }
+  const resolveKey = (a: SignedAnchor) => (a.issuer === issuer ? publicKey : null)
+  return { issuer, anchorFor, resolveKey }
+}
+
+test("evidence: bundle-carried checkpoint anchors reach quorum under the caller's policy and keys", () => {
+  const { bundle, dailyRoot } = buildBundle()
+  const iss = makeAnchorIssuer("https://anchors.example")
+  const cp = bundle.checkpoints[0]
+  assert.ok(cp)
+  cp.anchors = [iss.anchorFor(dailyRoot)]
+
+  const res = verifyEvidenceBundle(bundle, {
+    trustedRoots: [dailyRoot],
+    anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "ALL_MUST_AGREE" },
+    resolveAnchorKey: iss.resolveKey,
+  })
+  assert.equal(res.ok, true, res.notes.concat(res.failed.map((f) => f.reason)).join("; "))
+  assert.deepEqual(
+    res.roots.map((r) => r.anchorVerified),
+    [true],
+  )
+  assert.deepEqual(res.roots[0]?.verifiedIssuers, [iss.issuer])
+  // The verdict says where the anchors came from, so an auditor knows divergence was not assessable.
+  assert.ok(res.notes.some((n) => /carried in the bundle/.test(n)))
+})
+
+test("evidence: without a policy, bundle-carried anchors change nothing (nobody checked)", () => {
+  const { bundle, dailyRoot } = buildBundle()
+  const iss = makeAnchorIssuer("https://anchors.example")
+  const cp = bundle.checkpoints[0]
+  assert.ok(cp)
+  cp.anchors = [iss.anchorFor(dailyRoot)]
+
+  const res = verifyEvidenceBundle(bundle, { trustedRoots: [dailyRoot] })
+  assert.equal(res.roots[0]?.anchorVerified, null)
+  assert.ok(res.notes.some((n) => /No anchor policy supplied/.test(n)))
+})
+
+test("evidence: a bundle anchor over a DIFFERENT root neither counts nor forces divergence", () => {
+  // The attack the divergence carve-out exists for: append a GENUINE, publicly available anchor from
+  // another day to a valid bundle. It must not satisfy quorum for this root (it did not sign it) and
+  // it must not flip the verdict to divergence (only caller-fetched anchors can establish that).
+  const { bundle, dailyRoot } = buildBundle()
+  const iss = makeAnchorIssuer("https://anchors.example")
+  const cp = bundle.checkpoints[0]
+  assert.ok(cp)
+  cp.anchors = [iss.anchorFor(dailyRoot), iss.anchorFor("f".repeat(64))]
+
+  const res = verifyEvidenceBundle(bundle, {
+    trustedRoots: [dailyRoot],
+    anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "N_OF_M" },
+    resolveAnchorKey: iss.resolveKey,
+  })
+  assert.equal(res.roots[0]?.anchorVerified, true)
+  assert.equal(res.ok, true)
+  assert.ok(
+    !res.failed.some((f) => f.reason.includes("DIVERGENCE")),
+    `bundle anchors must not be able to fabricate divergence: ${JSON.stringify(res.failed)}`,
+  )
+})
+
+test("evidence: bundle anchors from an untrusted issuer never reach quorum, and ok fails with them", () => {
+  const { bundle, dailyRoot } = buildBundle()
+  const iss = makeAnchorIssuer("https://anchors.example")
+  const cp = bundle.checkpoints[0]
+  assert.ok(cp)
+  cp.anchors = [iss.anchorFor(dailyRoot)]
+
+  const res = verifyEvidenceBundle(bundle, {
+    trustedRoots: [dailyRoot],
+    anchorPolicy: {
+      requiredAnchors: 1,
+      trustedIssuers: ["https://someone-else.example"],
+      quorum: "ALL_MUST_AGREE",
+    },
+    resolveAnchorKey: iss.resolveKey,
+  })
+  assert.equal(res.roots[0]?.anchorVerified, false)
+  assert.equal(res.ok, false, "a policy was supplied and no root reached quorum — ok must fail")
+})
+
+test("evidence: a producer stripping checkpoint anchors cannot bypass a supplied quorum policy", () => {
+  // The fail-open shape: caller supplies policy + resolver, bundle carries no anchors at all. The
+  // check must evaluate to "quorum not met (0/N)" and fail ok — never silently skip because there
+  // was nothing to check, which is a check the prover switches off by deleting a field.
+  const { bundle, dailyRoot } = buildBundle()
+  const iss = makeAnchorIssuer("https://anchors.example")
+  const res = verifyEvidenceBundle(bundle, {
+    trustedRoots: [dailyRoot],
+    anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "ALL_MUST_AGREE" },
+    resolveAnchorKey: iss.resolveKey,
+  })
+  assert.equal(res.roots[0]?.anchorVerified, false, "stripped anchors must read as quorum NOT met")
+  assert.equal(res.ok, false)
+  assert.ok(
+    res.notes.some((n) => /anchor quorum not met \(0\/1\)/.test(n)),
+    `expected the 0/N verdict to be stated, got: ${res.notes.join("; ")}`,
   )
 })

@@ -23,7 +23,15 @@ export interface InclusionProof {
   checkpointLeafIndex: number
   checkpointLeafCount: number
   anchorRef: string | null
+  /** Producer claim: a self publication receipt exists. Commitment only — NOT independence. */
   anchored: boolean
+  /**
+   * Producer claim: the producer says a §5.3 external anchor quorum (distinct non-SELF issuers >=
+   * its configured requirement) exists for this checkpoint. Absent on bundles exported before the
+   * field shipped. Display/triage only — independence is established by THIS verifier's own anchor
+   * quorum evaluation (`anchorVerified`), never by trusting the flag.
+   */
+  externallyAnchored?: boolean
 }
 
 /**

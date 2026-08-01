@@ -87,8 +87,18 @@ export interface ProofBundle {
   anchors?: SignedAnchor[]
   /** External publication reference for the daily root (transparency-log id, commit hash, receipt). */
   anchorRef?: string | null
-  /** Whether the daily root was published to the external anchoring medium. */
+  /**
+   * Producer claim that a publication receipt exists — COMMITMENT only. The producer writes one for
+   * every checkpoint, so this being true says nothing about independence; see `externallyAnchored`.
+   */
   anchored?: boolean
+  /**
+   * Producer claim that a §5.3 external anchor quorum (distinct non-SELF issuers >= the producer's
+   * configured requirement) exists for this root. Absent on bundles exported before the field
+   * shipped. Display/triage only — independence is established by THIS verifier's own quorum
+   * evaluation (`anchorVerified`), never by trusting the flag.
+   */
+  externallyAnchored?: boolean
   /**
    * Legacy pre-§6.2 shape, where `anchor` carried the root and publication status rather than a
    * signature. Read for backward compatibility only; new exports use the fields above.
@@ -147,7 +157,13 @@ export interface BundleVerification {
     leafBinding: CheckResult // leaf hash actually corresponds to the event fields (needs canonical)
     /** Displayed header fields equal the committed preimage — they are otherwise unsigned copies. */
     headerBinding: CheckResult
-    anchored: CheckResult // the daily root is claimed to be externally anchored
+    /**
+     * The producer's external-anchoring CLAIM (`externallyAnchored`), reported for display/triage.
+     * It is self-asserted either way — `anchorVerified` is the actual check. `pass: null` on bundles
+     * exported before the claim shipped, whose legacy `anchored` flag meant only "publication
+     * receipt exists" and must not read as independence.
+     */
+    anchored: CheckResult
   }
   notes: string[]
 }
@@ -218,8 +234,13 @@ export interface VerifyOptions {
 export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): BundleVerification {
   const notes: string[] = []
 
-  if (bundle.kind !== BUNDLE_KIND) {
-    notes.push(`Unexpected bundle kind "${bundle.kind}" (expected "${BUNDLE_KIND}").`)
+  // DEWP §6.5: "a compliant producer MUST emit these forms and a compliant verifier MUST reject any
+  // other value." A note let a container of one type be fed to the verifier for another and still
+  // come back ok — the caller would be reading a verdict produced under semantics the artifact was
+  // never built for. `verifyEvidenceBundle` has always rejected; this is the same rule.
+  const kindRejected = bundle.kind !== BUNDLE_KIND
+  if (kindRejected) {
+    notes.push(`Refusing bundle kind "${bundle.kind}" (expected "${BUNDLE_KIND}") — DEWP §6.5.`)
   }
 
   // An unknown Application Profile means an unknown canonical-array layout (DEWP §4.5). Recomputing
@@ -342,19 +363,52 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     )
   }
 
+  // The producer's independence CLAIM. The historic `anchored` flag is commitment-only (the producer
+  // writes a publication receipt for every checkpoint, so it is structurally always true) and MUST
+  // NOT read as external anchoring — that wiring previously made the CLI print "[PASS] anchored" for
+  // roots no third party had ever seen. Only the explicit quorum-derived `externallyAnchored` claim
+  // can pass this check, and even then it is reported as a claim: `anchorVerified` is the check.
+  const externallyAnchoredClaim = bundle.externallyAnchored ?? bundle.proof.externallyAnchored
   const anchored: CheckResult =
-    anchoredFlag && bundle.proof.anchored
+    externallyAnchoredClaim === true
       ? {
           pass: true,
-          detail: `Daily root anchored externally${anchorRef ? ` (${anchorRef})` : ""}.`,
+          detail:
+            "Producer claims a §5.3 external anchor quorum for this root" +
+            `${anchorRef ? ` (${anchorRef})` : ""}. Claim only — anchorVerified is the check.`,
         }
-      : { pass: false, detail: "Daily root not yet externally anchored." }
+      : externallyAnchoredClaim === false
+        ? {
+            pass: false,
+            detail: "Root is committed and self-signed only — the producer claims no external anchor quorum.",
+          }
+        : {
+            pass: null,
+            detail:
+              "Bundle predates the externallyAnchored claim — external anchoring is unknown from the " +
+              `bundle${anchoredFlag ? " (its legacy `anchored` flag means only that a publication receipt exists)" : ""}. ` +
+              "Evaluate the signed anchors under your own policy (anchorVerified).",
+          }
 
+  // `ok` is the flag callers branch on (`if (!ok) throw`), so it must mean what its doc comment says:
+  // every APPLICABLE check passed. Two traps, both previously open:
+  //
+  //  - `headerBinding` was computed and then left out of this expression, so a bundle displaying
+  //    outcome "SUCCESS" over a committed "FAILURE" returned ok:true with headerBinding.pass:false.
+  //  - `leafBinding.pass === null` is legitimate ONLY when there is no canonical preimage to bind
+  //    (a redacted, commitment-only entry). It must never be accepted because an attacker-supplied
+  //    `profile` made this verifier skip the check on content the bundle did ship — that is a check
+  //    the prover can switch off. DEWP §4.5 requires reporting contentVerified:false and continuing
+  //    to evaluate commitmentVerified, which we do; it does not make the bundle ok.
+  const contentBoundWhenPresent = bundle.event.canonical ? leafBinding.pass === true : true
   const ok =
+    !kindRejected &&
     rootSource === "independent" &&
     inclusion.pass === true &&
     rootConsistency.pass === true &&
-    leafBinding.pass !== false
+    leafBinding.pass !== false &&
+    headerBinding.pass !== false &&
+    contentBoundWhenPresent
 
   // DEWP §7.1 independent properties.
   const commitmentVerified = inclusion.pass === true && rootConsistency.pass === true
@@ -381,7 +435,11 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
   // the caller fetched itself, per checkpoint, can establish divergence.
   const divergenceAnchors = opts.anchors ?? []
   let anchorVerified: boolean
-  if (candidateAnchors.length > 0 && opts.anchorPolicy && opts.resolveAnchorKey && dailyRoot) {
+  // Gated on the CALLER having asked (policy + resolver), never on candidates existing: a bundle
+  // shipped with its anchors stripped must evaluate to "quorum not met (0/N)" under a supplied
+  // policy — falling back to the weaker independent-root signal there would let the prover switch
+  // off the very check the caller configured.
+  if (opts.anchorPolicy && opts.resolveAnchorKey && dailyRoot) {
     const q = verifyAnchorQuorum(candidateAnchors, dailyRoot, opts.anchorPolicy, opts.resolveAnchorKey, {
       divergenceAnchors,
       externalKeys: opts.externalKeys,
@@ -394,6 +452,9 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     } else if (q.ok) {
       notes.push(`Anchor quorum met: ${q.verifiedIssuers.length} independent issuer(s) signed this root.`)
     }
+    // RFC 3161 honesty: a TSA anchor is real evidence this tool cannot check offline; say so rather
+    // than let "quorum not met" read as "unanchored".
+    if (q.note) notes.push(q.note)
     // A divergent anchor is fatal regardless of inclusion.
     if (q.divergence) {
       return {
@@ -420,7 +481,10 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     signatureVerified,
     anchorVerified,
   }
-  const verificationLevel = deriveVerificationLevel(properties, hasSigner)
+  // A refused `kind` is not a partially-verified bundle: the container was never the one these
+  // semantics apply to, so it reports INVALID rather than a level derived from checks we should not
+  // have run at all.
+  const verificationLevel = kindRejected ? "INVALID" : deriveVerificationLevel(properties, hasSigner)
 
   return {
     ok,

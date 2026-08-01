@@ -115,8 +115,8 @@ verifyApprovalReceipt(receipt, expected, { allowAutoApproved: true }); // → { 
 `ok: true` without `allowAutoApproved` therefore always means **a real human signature verified**.
 
 ## API
-- `verifyApprovalReceipt(receipt, { target, actionType, params, nonce, requesterDid? }, { allowAutoApproved?, expectedOrigin?, expectedRpId?, requireUserVerification?, allowExpired?, asOf?, clockSkewSeconds? })` → `{ ok, reason?, autoApproved? }` — `target` and `nonce` are required and asserted from your own state
-- `canonicalAuthorizationPayload({ nonce, actionType, actionDescription, params })` → the exact signed string
+- `verifyApprovalReceipt(receipt, { approvers, target, actionType, params, nonce, requesterDid? }, { allowAutoApproved?, allowOffline?, delegation?, expectedOrigin?, expectedRpId?, requireUserVerification?, allowExpired?, asOf?, clockSkewSeconds? })` → `{ ok, reason?, autoApproved?, signers? }` — `approvers`, `target` and `nonce` are all required and asserted from your own state, never read from the receipt
+- `canonicalIntentPayload({ target, actionType, display, params, requester, requirement, nonce, expiresAt })` → the exact signed string (DIV v1). Also exported: `canonicalOfflineIntentPayload` (DIV §5a offline approval) and `canonicalDelegationPayload`. The pre-DIV `canonicalAuthorizationPayload`/`V3` builders were removed with the v2/v3 formats (ADR 005/014); `verifyApprovalReceipt` rejects anything where `v !== 1`.
 - `verificationCode(canonical)` → the short `XXXX-XXXX` code shown on the approval screen
 - `verifyEcdsaP256(publicKeyB64, payload, signatureB64)` → `boolean`
 

@@ -1,9 +1,10 @@
 import assert from "node:assert/strict"
 import crypto from "node:crypto"
+import fs from "node:fs"
 import { test } from "node:test"
 import { type ProofBundle, verifyBundle } from "./ledger-bundle.js"
 import { type AuditLeaf, leafHash } from "./ledger-leaf.js"
-import { hashLeaf, merkleProof, merkleRoot, verifyMerkleProof } from "./ledger-merkle.js"
+import { hashLeaf, merkleProof, merkleRoot, type ProofStep, verifyMerkleProof } from "./ledger-merkle.js"
 import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
 
 // Build a synthetic two-tier tree (events → blocks → day) the same way the producer does, so these
@@ -314,9 +315,20 @@ test("verifyMerkleProof is order-sensitive (position matters)", () => {
   const leaves = ["a", "b", "c", "d"].map(hashLeaf)
   const root = merkleRoot(leaves)
   const p = merkleProof(leaves, 1)
-  assert.equal(verifyMerkleProof(leaves[1]!, p, root), true)
+  assert.equal(verifyMerkleProof(leaves[1]!, p, root, { index: 1, leafCount: 4 }), true)
   // using the proof for index 1 against index 2's leaf must fail
-  assert.equal(verifyMerkleProof(leaves[2]!, p, root), false)
+  assert.equal(verifyMerkleProof(leaves[2]!, p, root, { index: 2, leafCount: 4 }), false)
+})
+
+test("verifyMerkleProof refuses instead of throwing when bounds are missing", () => {
+  // `bounds` is required for every TS caller, but this package is the dependency-free trust anchor a
+  // plain-JS consumer calls from outside the type system — a legacy 3-argument call reaches this as
+  // `undefined`. It must return false, the same answer as any other malformed bounds, not throw.
+  const leaves = ["a", "b", "c", "d"].map(hashLeaf)
+  const root = merkleRoot(leaves)
+  const p = merkleProof(leaves, 1)
+  // @ts-expect-error — exercising the untyped-caller path deliberately.
+  assert.equal(verifyMerkleProof(leaves[1]!, p, root, undefined), false)
 })
 
 // ─── Duplicate-last padding forgery (July 2026 review) ───────────────────────
@@ -368,4 +380,160 @@ test("verifyInclusionProof refuses a proof that cannot say where its leaf sits",
   // A proof missing its position fields establishes only that SOME path exists.
   const positionless = { ...proof, leafIndex: undefined as unknown as number }
   assert.equal(verifyInclusionProof(positionless, dailyRoot), false)
+})
+
+// ─── The verdict flag must reflect the checks that ran (July 2026 audit) ─────
+// `verifyBundle` computed `headerBinding` and then left it out of `ok`, so a bundle displaying
+// something other than what was committed returned ok:true with headerBinding.pass:false. The SDK
+// CLI branches on `.ok`, so that printed a green VERIFIED. These pin the flag to its contract.
+
+/** A well-formed, independently-anchored, content-verified bundle — the baseline these mutate. */
+function goodBundle(target = 5): { bundle: ProofBundle; dailyRoot: string } {
+  const { proof, dailyRoot } = buildProof(target)
+  const leaf = makeLeaf(target)
+  return {
+    bundle: {
+      kind: "dewp.audit.inclusion-proof",
+      version: 2,
+      exportedAt: "2026-07-15T00:00:00.000Z",
+      event: {
+        seq: String(target),
+        createdAt: leaf.createdAt,
+        type: leaf.event,
+        outcome: leaf.outcome,
+        detail: leaf.detail,
+        actorDid: null,
+        subjectDid: null,
+        signerDid: null,
+        signature: null,
+        sigAlg: null,
+        canonical: leaf,
+      },
+      proof,
+      anchorRef: proof.anchorRef,
+      anchored: true,
+    },
+    dailyRoot,
+  }
+}
+
+test("verifyBundle: ok is false when the displayed header contradicts the commitment", () => {
+  const { bundle, dailyRoot } = goodBundle()
+  assert.equal(verifyBundle(bundle, { trustedRoot: dailyRoot }).ok, true)
+
+  // Leave `canonical` and `proof` untouched, so leaf binding still passes, and rewrite only the
+  // unsigned sibling display fields an auditor actually reads.
+  const lying: ProofBundle = {
+    ...bundle,
+    event: { ...bundle.event, type: "NOTHING_HAPPENED", outcome: "SUCCESS", detail: "routine" },
+  }
+  const r = verifyBundle(lying, { trustedRoot: dailyRoot })
+  assert.equal(r.checks.leafBinding.pass, true, "leaf binding is untouched — that is the point")
+  assert.equal(r.checks.headerBinding.pass, false)
+  assert.equal(r.ok, false, "a bundle that displays something other than what it committed is not ok")
+  assert.equal(r.properties.contentVerified, false)
+})
+
+test("verifyBundle: refuses a bundle of the wrong kind (DEWP §6.5)", () => {
+  const { bundle, dailyRoot } = goodBundle()
+  for (const kind of ["dewp.audit.evidence-bundle", "vendor.audit.proof", ""]) {
+    const r = verifyBundle({ ...bundle, kind }, { trustedRoot: dailyRoot })
+    assert.equal(r.ok, false, `kind ${JSON.stringify(kind)} must be refused, not noted`)
+    assert.equal(r.verificationLevel, "INVALID")
+  }
+})
+
+test("verifyBundle: an unknown profile cannot switch off leaf binding and stay ok", () => {
+  const { bundle, dailyRoot } = goodBundle()
+  // `profile` is attacker-supplied. Under an unknown one the verifier correctly declines to
+  // recompute the leaf (DEWP §4.5) — but a check the prover can disable must not leave ok true.
+  const forged: ProofBundle = {
+    ...bundle,
+    profile: "com.attacker.v1",
+    event: { ...bundle.event, canonical: { ...makeLeaf(5), detail: "fabricated content" } },
+  }
+  const r = verifyBundle(forged, { trustedRoot: dailyRoot })
+  assert.equal(r.checks.leafBinding.pass, null, "not attempted, per DEWP §4.5")
+  assert.equal(r.properties.contentVerified, false)
+  assert.equal(r.ok, false, "unverifiable content is not ok content")
+  assert.equal(r.verificationLevel, "COMMITMENT_VERIFIED")
+})
+
+test("verifyBundle: a genuinely redacted entry stays ok at COMMITMENT_VERIFIED", () => {
+  // The legitimate counterpart to the test above: leafBinding is null because there is no canonical
+  // preimage to bind (retention purged it), not because a profile string disabled the check.
+  const { bundle, dailyRoot } = goodBundle()
+  const redacted: ProofBundle = {
+    ...bundle,
+    event: { ...bundle.event, canonical: undefined },
+  }
+  const r = verifyBundle(redacted, { trustedRoot: dailyRoot })
+  assert.equal(r.checks.leafBinding.pass, null)
+  assert.equal(r.ok, true, "commitment-only is a valid DEWP outcome for a redacted entry")
+  assert.equal(r.verificationLevel, "COMMITMENT_VERIFIED")
+})
+
+// ─── The shared golden vectors, checked against the REFERENCE implementation ──
+// These vectors are the cross-language parity mechanism: the Go, Rust and Python ledger verifiers
+// all pin to them. Nothing in TypeScript consumed them, so when the ports and the reference
+// disagreed the vectors sided with the ports — `inclusion` shipped without its four position fields,
+// which made a positionless proof "correct" for three languages while this implementation rejected
+// it. Reading them here closes the loop: one file, four languages, one answer.
+
+const LEDGER_VECTORS = JSON.parse(
+  fs.readFileSync(new URL("../../mcp-schemas/vectors/ledger-vectors.json", import.meta.url), "utf8"),
+) as {
+  inclusion: InclusionProof & { dailyRoot: string }
+  inclusionNegative: {
+    name: string
+    leaf: string
+    proof: ProofStep[]
+    root: string
+    bounds: { index: number; leafCount: number }
+    expected: boolean
+  }[]
+}
+
+test("golden vectors: the shared inclusion proof verifies, positions and all", () => {
+  const v = LEDGER_VECTORS.inclusion
+  // The position fields must be present — their absence is what the ports were pinned to.
+  for (const k of ["leafIndex", "blockLeafCount", "checkpointLeafIndex", "checkpointLeafCount"] as const) {
+    assert.equal(typeof v[k], "number", `ledger-vectors.json inclusion is missing ${k}`)
+  }
+  assert.equal(verifyInclusionProof({ ...v, checkpointRoot: v.dailyRoot }, v.dailyRoot), true)
+})
+
+test("golden vectors: every negative inclusion case is refused", () => {
+  for (const c of LEDGER_VECTORS.inclusionNegative) {
+    assert.equal(
+      verifyMerkleProof(c.leaf, c.proof, c.root, c.bounds),
+      c.expected,
+      `${c.name} should be ${c.expected}`,
+    )
+  }
+})
+
+// A caller that configured an anchor quorum must get a quorum verdict even when the bundle ships
+// with its anchors stripped. Falling back to the weaker "an independent root was handed to me"
+// signal there was a check the prover could switch off — the CLI printed `anchor:yes` under a
+// policy nobody evaluated.
+test("verifyBundle: a supplied anchor policy is evaluated even when the bundle carries no anchors", () => {
+  const { bundle, dailyRoot } = goodBundle()
+  const r = verifyBundle(bundle, {
+    trustedRoot: dailyRoot,
+    anchorPolicy: {
+      requiredAnchors: 1,
+      trustedIssuers: ["https://anchors.example"],
+      quorum: "ALL_MUST_AGREE",
+    },
+    resolveAnchorKey: () => null,
+  })
+  assert.equal(r.properties.anchorVerified, false, "no anchors can never satisfy a supplied quorum")
+  assert.ok(
+    r.notes.some((n) => /anchor quorum not met \(0\/1\)/.test(n)),
+    `expected the 0/N verdict to be stated, got: ${r.notes.join("; ")}`,
+  )
+  // Without a policy the weaker independent-root signal still applies, unchanged.
+  const weak = verifyBundle(bundle, { trustedRoot: dailyRoot })
+  assert.equal(weak.properties.anchorVerified, true)
 })
