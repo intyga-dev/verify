@@ -16,7 +16,7 @@ import crypto from "node:crypto"
 //
 // MUST stay byte-identical to the producer in @intyga/db (chain.ts).
 
-const CHAIN_TAG = 0x04
+export const CHAIN_TAG = 0x04
 
 /** The genesis predecessor. No real chain hash can collide: those are always 64 hex characters. */
 export const GENESIS_PREV_CHAIN_HASH = ""

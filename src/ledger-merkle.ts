@@ -15,9 +15,9 @@ export function sha256Hex(s: string): string {
 // (blocks second-preimage / proof malleability where a subtree root is passed off as a leaf).
 // 0x00 = leaf, 0x01 = node, 0x02 = empty root. Node children are HEX-DECODED to their raw 32 bytes
 // before hashing (NOT concatenated as hex text). Must stay byte-identical to the @intyga/db producer.
-const LEAF_TAG = 0x00
-const NODE_TAG = 0x01
-const EMPTY_TAG = 0x02
+export const LEAF_TAG = 0x00
+export const NODE_TAG = 0x01
+export const EMPTY_TAG = 0x02
 
 /** Domain-separated leaf digest: sha256(0x00 || UTF8(preimage)). */
 export function hashLeaf(data: string): string {

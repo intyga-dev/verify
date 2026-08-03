@@ -26,12 +26,18 @@ export interface InclusionProof {
   /** Producer claim: a self publication receipt exists. Commitment only — NOT independence. */
   anchored: boolean
   /**
-   * Producer claim: the producer says a §5.3 external anchor quorum (distinct non-SELF issuers >=
+   * Producer claim: the producer says a §5.3 external anchor quorum (distinct INDEPENDENT issuers >=
    * its configured requirement) exists for this checkpoint. Absent on bundles exported before the
    * field shipped. Display/triage only — independence is established by THIS verifier's own anchor
    * quorum evaluation (`anchorVerified`), never by trusting the flag.
    */
   externallyAnchored?: boolean
+  /**
+   * The quorum size the producer evaluated that claim against. Absent on bundles exported before it
+   * shipped. Without it the boolean cannot be read: a 1-of-1 deployment and a 2-of-N deployment both
+   * publish `true`. Still a producer claim — it says what the producer required, not what happened.
+   */
+  externallyAnchoredRequired?: number
 }
 
 /**

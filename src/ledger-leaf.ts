@@ -27,7 +27,7 @@ export interface AuditLeaf {
   event: string
   outcome: string
   detail: string | null
-  metadata: unknown // arbitrary JSON; hashed as JSON.stringify(metadata ?? null)
+  metadata: unknown // arbitrary JSON; hashed as jcsStringify(metadata ?? null)
   signerDid: string | null
   signerPublicKey: string | null
   signedPayload: string | null

@@ -93,12 +93,17 @@ export interface ProofBundle {
    */
   anchored?: boolean
   /**
-   * Producer claim that a §5.3 external anchor quorum (distinct non-SELF issuers >= the producer's
+   * Producer claim that a §5.3 external anchor quorum (distinct INDEPENDENT issuers >= the producer's
    * configured requirement) exists for this root. Absent on bundles exported before the field
    * shipped. Display/triage only — independence is established by THIS verifier's own quorum
    * evaluation (`anchorVerified`), never by trusting the flag.
    */
   externallyAnchored?: boolean
+  /**
+   * The quorum size the producer evaluated that claim against (DEWP §6.2). Absent on bundles exported
+   * before it shipped. Still a producer claim: it says what the producer required, not what happened.
+   */
+  externallyAnchoredRequired?: number
   /**
    * Legacy pre-§6.2 shape, where `anchor` carried the root and publication status rather than a
    * signature. Read for backward compatibility only; new exports use the fields above.
@@ -130,7 +135,11 @@ export interface VerificationProperties {
   contentVerified: boolean
   /** contentVerified AND the embedded event signature (ES256 over signedPayload) verifies offline. */
   signatureVerified: boolean
-  /** The checkpoint root was validated against an independently-supplied (external anchor) root. */
+  /**
+   * The checkpoint root was verified against an ANCHOR QUORUM under the caller's §5.3 policy — DEWP
+   * §3 Invariant 7 makes this an if-and-only-if. Supplying a trusted root out of band is weaker
+   * provenance, not this property: it is reported by `rootSource`, and leaves this false.
+   */
   anchorVerified: boolean
 }
 
@@ -369,12 +378,17 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
   // roots no third party had ever seen. Only the explicit quorum-derived `externallyAnchored` claim
   // can pass this check, and even then it is reported as a claim: `anchorVerified` is the check.
   const externallyAnchoredClaim = bundle.externallyAnchored ?? bundle.proof.externallyAnchored
+  // The quorum size behind the claim. Without it "true" is unreadable — a 1-of-1 deployment and a
+  // 2-of-N deployment publish the same boolean — so state it whenever the producer supplies it.
+  const claimedRequired = bundle.externallyAnchoredRequired ?? bundle.proof.externallyAnchoredRequired
   const anchored: CheckResult =
     externallyAnchoredClaim === true
       ? {
           pass: true,
           detail:
-            "Producer claims a §5.3 external anchor quorum for this root" +
+            `Producer claims a §5.3 external anchor quorum of ${
+              claimedRequired ?? "an unstated number of"
+            } distinct independent issuer(s) for this root` +
             `${anchorRef ? ` (${anchorRef})` : ""}. Claim only — anchorVerified is the check.`,
         }
       : externallyAnchoredClaim === false
@@ -473,7 +487,19 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
       }
     }
   } else {
-    anchorVerified = commitmentVerified && rootSource === "independent"
+    // DEWP §3 Invariant 7 / §7.1: anchorVerified holds IF AND ONLY IF the root was verified against
+    // an anchor quorum. Being handed a root out of band is not that check — no anchor signature was
+    // examined — so it cannot make this property true, and FULLY_VERIFIED must stay out of reach.
+    // `rootSource: "independent"` already reports the weaker provenance signal on its own.
+    anchorVerified = false
+    if (commitmentVerified && rootSource === "independent") {
+      notes.push(
+        "An independently supplied root was used, but no anchor policy was given, so no anchor " +
+          "signature or quorum was evaluated (DEWP §5.2/§5.3): anchorVerified stays false and " +
+          "FULLY_VERIFIED is not reachable. Supply anchors + anchorPolicy + resolveAnchorKey for a " +
+          "real quorum verdict.",
+      )
+    }
   }
   const properties: VerificationProperties = {
     commitmentVerified,

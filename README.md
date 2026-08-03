@@ -4,7 +4,7 @@
 
 When Intyga returns an approval, it hands you a **receipt**: the exact canonical payload the human's key signed, plus the signature and public key. This library lets your own code re-derive that payload from *your* parameters, check it byte-for-byte against what was signed, and verify the signature — entirely offline. You don't have to trust Intyga's word that the approval is real; you check the math yourself.
 
-- **Zero runtime dependencies** (`node:crypto` only). Read the whole thing — ~500 lines for receipt verification, under 1,000 including the Merkle inclusion-proof code.
+- **Zero runtime dependencies** (`node:crypto` only). Read the whole thing — ~1,400 lines for receipt verification, ~3,400 including the ledger, anchor-quorum and evidence-bundle code.
 - **No Intyga secret required.** Verification uses approver keys **you** resolve — never a key read out of the receipt (see [Whose key?](#whose-key-the-trust-anchor)).
 - Verifies both **WebAuthn** approvals (passkey / hardware security key — the normal path) and **raw P-256** signatures (legacy/headless signer keys), plus policy `AUTO_APPROVED` receipts.
 
@@ -68,7 +68,9 @@ do not need this library; you can just trust its answer.
 
 For quorum receipts, count is enforced for you: the signed payload carries `requirement.requiredApprovals`
 and verification counts **distinct** approvers whose signature verifies under a key you resolved. In
-`publicKeys` mode distinctness is by key, because `signerDid` is unverified there.
+`publicKeys` mode distinctness is by key, because `signerDid` is unverified there — which means the
+quorum counts credentials rather than people: one approver whose two registered credentials are both
+listed satisfies a 2-of-N alone. For `requiredApprovals` > 1 use the DID form (DIV §4.4.6).
 
 ## Expiry and replay: what this does and does not prove
 
@@ -122,6 +124,21 @@ verifyApprovalReceipt(receipt, expected, { allowAutoApproved: true }); // → { 
 
 > The canonicalization here is byte-for-byte identical to the Intyga gateway, the approval UI, and
 > `@intyga/mcp-schemas`. That identity is the whole point — don't reformat it.
+
+## DIV / DEWP conformance
+
+This is the reference verifier with the broadest surface of the five ports. Beyond the **DEWP Core
+Profile** ([`docs/DEWP.md`](../../docs/DEWP.md) §9.1) it implements single-anchor **and**
+multi-anchor quorum verification (§5.2/§5.3, including `requiredAnchors`, issuer trust and
+divergence detection), the §5.4 checkpoint continuity chain (`0x04` domain tag), proof-bundle
+parsing with the §7.1 verification levels, evidence bundles, and gapless `tenantSeq` completeness
+validation. Byte parity with the Go, Rust and Python ports is locked by the shared golden vectors
+in `packages/mcp-schemas/vectors/`.
+
+It does **not** implement NDJSON evidence streaming (§6.4), so — like every port, this one
+included — it does not claim the §9.2 **Extended Profile**. The narrower ports state their own
+limits: [`verify-go`](../verify-go/README.md), [`verify-rust`](../verify-rust/README.md),
+[`sdk-python`](../sdk-python/README.md).
 
 Requires Node ≥18 (`node:crypto`).
 

@@ -5,7 +5,7 @@ import {
   type SignedAnchor,
   verifyAnchorQuorum,
 } from "./ledger-anchor.js"
-import { type AlgorithmRegistry, AUDIT_PROFILE } from "./ledger-bundle.js"
+import { type AlgorithmRegistry, AUDIT_PROFILE, verifyEmbeddedSignature } from "./ledger-bundle.js"
 import { type AuditLeaf, leafHash } from "./ledger-leaf.js"
 import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
 
@@ -93,8 +93,10 @@ export interface EvidenceBundle {
      * they still verify only under keys the CALLER trusts, so a bundle cannot vouch for itself.
      */
     anchors?: SignedAnchor[]
-    /** Producer claim of §5.3 quorum (distinct non-SELF issuers). Display only — never trusted. */
+    /** Producer claim of §5.3 quorum (distinct INDEPENDENT issuers). Display only — never trusted. */
     externallyAnchored?: boolean
+    /** The quorum size that claim was evaluated against (§6.3). Absent on older exports. */
+    externallyAnchoredRequired?: number
   }[]
 }
 
@@ -115,6 +117,22 @@ export interface EvidenceVerification {
     anchorVerified: boolean | null
     verifiedIssuers: string[]
   }[]
+  /**
+   * DEWP §7.1 `signatureVerified`, per entry. The Extended Profile (§9.2) requires offline DIV
+   * signature verification alongside evidence-bundle verification, and only ES256 proof material is
+   * checkable from a leaf: a WEBAUTHN receipt also needs authenticatorData/clientDataJSON, which the
+   * leaf does not carry, and AUTO_APPROVED has no human signature at all (§4.6.1). Those, plus
+   * unsigned and redacted entries, are counted as not checkable rather than as failures.
+   *
+   * An invalid signature does NOT fail the entry: the signature bytes are themselves committed in
+   * the leaf, so leaf binding already proved they are the ones anchored. What it means is that the
+   * producer anchored proof material that does not verify — reported, never silently dropped.
+   */
+  signatures: {
+    verified: number
+    invalid: { seq: string }[]
+    notCheckable: number
+  }
   notes: string[]
 }
 
@@ -172,6 +190,9 @@ export function verifyEvidenceBundle(
   let commitmentOnly = 0
   /** Entries whose displayed type/outcome rest on the producer's redaction record, not on the log. */
   let redactedDisplayed = 0
+  let signaturesVerified = 0
+  let signaturesNotCheckable = 0
+  const signaturesInvalid: { seq: string }[] = []
 
   // DEWP §6.5: "a compliant verifier MUST reject any other value." A note let a container of one
   // type be fed to the verifier for another and still come back ok — the caller would be reading a
@@ -309,6 +330,15 @@ export function verifyEvidenceBundle(
           reason: `entry belongs to tenant ${entry.event.canonical.tenantId}, not ${bundle.tenant.id}`,
         })
         continue
+      }
+      // §7.1 signatureVerified. Runs only once the leaf binding above passed, so the signature we
+      // check is provably the committed one rather than something the bundle attached.
+      const canonical = entry.event.canonical
+      if (canonical.sigAlg === "ES256" && canonical.signature && canonical.signerPublicKey) {
+        if (verifyEmbeddedSignature(canonical)) signaturesVerified++
+        else signaturesInvalid.push({ seq })
+      } else {
+        signaturesNotCheckable++
       }
       contentVerified++
     } else {
@@ -483,6 +513,16 @@ export function verifyEvidenceBundle(
   if (!trusted && failed.length === 0 && bundle.entries.length > 0) {
     notes.push("All entries internally consistent; supply --roots for an independent verdict.")
   }
+  if (signaturesInvalid.length > 0) {
+    notes.push(
+      `${signaturesInvalid.length} entr${signaturesInvalid.length === 1 ? "y" : "ies"} carr${
+        signaturesInvalid.length === 1 ? "ies" : "y"
+      } ES256 proof material that does NOT verify (seq ${signaturesInvalid
+        .map((s) => s.seq)
+        .join(", ")}). The signature bytes are themselves committed, so this is not bundle tampering — ` +
+        "it means the producer anchored a signature that does not check out.",
+    )
+  }
   return {
     ok,
     total: bundle.entries.length,
@@ -490,6 +530,11 @@ export function verifyEvidenceBundle(
     commitmentOnly,
     failed,
     roots,
+    signatures: {
+      verified: signaturesVerified,
+      invalid: signaturesInvalid,
+      notCheckable: signaturesNotCheckable,
+    },
     notes,
   }
 }

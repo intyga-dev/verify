@@ -1106,7 +1106,11 @@ export function verifyApprovalReceipt(
       reason: `quorum not met: ${verifiedSigners.size} of ${required} required approver signatures verified${detail}`,
     }
   }
-  return { ok: true, signers: [...verifiedSigners] }
+  // Sorted, not insertion order: verify-go, verify-rust and sdk-python all return this sorted, and
+  // Go's type even documents itself as mirroring this field. It is a RESULT, never signed bytes, so
+  // ordering cannot affect a verdict — but a caller that logs or diffs it should not see four
+  // different answers depending on which SDK produced them.
+  return { ok: true, signers: [...verifiedSigners].sort() }
 }
 
 /** A delegation whose own signature, quorum and window have been verified by `verifyDelegation`. */
@@ -1332,7 +1336,7 @@ export function verifyDelegation(
       actionType: expected.actionType,
       params: expected.params,
       nonce,
-      signers: [...verifiedSigners],
+      signers: [...verifiedSigners].sort(), // sorted, as in the quorum path above
       expiresAt,
     },
   }

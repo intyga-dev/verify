@@ -6,7 +6,7 @@ import { parseRekorEvidence, verifyRekorAnchor } from "./ledger-rekor.js"
 // digest (0x03 tag), verifies an anchor's signature, and evaluates a multi-anchor QUORUM so a single
 // compromised anchor provider cannot forge non-repudiation. Zero deps beyond node:crypto.
 
-const ANCHOR_TAG = 0x03
+export const ANCHOR_TAG = 0x03
 
 /** A signed commitment to a daily checkpoint root, published to an independent public anchor. */
 export interface SignedAnchor {

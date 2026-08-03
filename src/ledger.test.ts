@@ -2,13 +2,50 @@ import assert from "node:assert/strict"
 import crypto from "node:crypto"
 import fs from "node:fs"
 import { test } from "node:test"
+import { ANCHOR_TAG, type AnchorPolicy, type SignedAnchor, signAnchor } from "./ledger-anchor.js"
+import { CHAIN_TAG } from "./ledger-chain.js"
 import { type ProofBundle, verifyBundle } from "./ledger-bundle.js"
-import { type AuditLeaf, leafHash } from "./ledger-leaf.js"
-import { hashLeaf, merkleProof, merkleRoot, type ProofStep, verifyMerkleProof } from "./ledger-merkle.js"
+import { type AuditLeaf, canonicalPreimage, leafHash } from "./ledger-leaf.js"
+import {
+  EMPTY_TAG,
+  emptyRoot,
+  hashLeaf,
+  hashPair,
+  LEAF_TAG,
+  merkleProof,
+  merkleRoot,
+  NODE_TAG,
+  type ProofStep,
+  sha256Hex,
+  verifyMerkleProof,
+} from "./ledger-merkle.js"
 import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
 
 // Build a synthetic two-tier tree (events → blocks → day) the same way the producer does, so these
 // vectors are self-consistent by construction and lock the hashing contract in place.
+
+// DEWP §3 Invariant 7 makes `anchorVerified` an if-and-only-if on the anchor quorum, so a test that
+// wants FULLY_VERIFIED has to supply a real one: a signed anchor over the same daily root plus the
+// policy and key resolver the caller would configure.
+const ANCHOR_ISSUER = "https://anchors.example"
+function quorumFor(dailyRoot: string): {
+  anchors: SignedAnchor[]
+  anchorPolicy: AnchorPolicy
+  resolveAnchorKey: () => crypto.KeyObject
+} {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  const unsigned = {
+    dailyRoot,
+    timestamp: "2026-07-15T23:59:00.000Z",
+    issuer: ANCHOR_ISSUER,
+    algorithm: "ES256" as const,
+  }
+  return {
+    anchors: [{ ...unsigned, keyId: "k1", signature: signAnchor(unsigned, privateKey) }],
+    anchorPolicy: { requiredAnchors: 1, trustedIssuers: [ANCHOR_ISSUER], quorum: "N_OF_M" },
+    resolveAnchorKey: () => publicKey,
+  }
+}
 
 function makeLeaf(seq: number): AuditLeaf {
   return {
@@ -113,10 +150,10 @@ test("verifyBundle: independent root + canonical leaf => ok", () => {
     anchored: true,
   }
 
-  const good = verifyBundle(bundle, { trustedRoot: dailyRoot })
+  const good = verifyBundle(bundle, { trustedRoot: dailyRoot, ...quorumFor(dailyRoot) })
   assert.equal(good.ok, true)
   assert.equal(good.checks.leafBinding.pass, true)
-  // DEWP §7.1 property model: an UNSIGNED, content-verified, independently-anchored event is
+  // DEWP §7.1 property model: an UNSIGNED, content-verified, quorum-anchored event is
   // FULLY_VERIFIED (there is no signature to require).
   assert.deepEqual(good.properties, {
     commitmentVerified: true,
@@ -125,6 +162,18 @@ test("verifyBundle: independent root + canonical leaf => ok", () => {
     anchorVerified: true,
   })
   assert.equal(good.verificationLevel, "FULLY_VERIFIED")
+
+  // §3 Invariant 7 is an if-and-only-if: handing the verifier a root out of band is provenance, not
+  // an anchor check. It still verifies the commitment, but must not claim anchorVerified.
+  const rootOnly = verifyBundle(bundle, { trustedRoot: dailyRoot })
+  assert.equal(rootOnly.ok, true)
+  assert.equal(rootOnly.rootSource, "independent")
+  assert.equal(rootOnly.properties.anchorVerified, false, "no quorum was evaluated")
+  assert.notEqual(rootOnly.verificationLevel, "FULLY_VERIFIED")
+  assert.ok(
+    rootOnly.notes.some((n) => /no anchor policy was given/.test(n)),
+    `expected the weaker-signal note, got: ${rootOnly.notes.join("; ")}`,
+  )
 
   // Same bundle without an independent root: internally consistent but NOT a trustworthy verdict.
   const weak = verifyBundle(bundle)
@@ -193,7 +242,7 @@ test("verifyBundle: a signed event verifies its embedded ES256 signature => SIGN
     anchored: true,
   }
 
-  const res = verifyBundle(bundle, { trustedRoot: dailyRoot })
+  const res = verifyBundle(bundle, { trustedRoot: dailyRoot, ...quorumFor(dailyRoot) })
   assert.deepEqual(res.properties, {
     commitmentVerified: true,
     contentVerified: true,
@@ -201,6 +250,12 @@ test("verifyBundle: a signed event verifies its embedded ES256 signature => SIGN
     anchorVerified: true,
   })
   assert.equal(res.verificationLevel, "FULLY_VERIFIED")
+
+  // Without an evaluated quorum the signature still verifies, but the summary stops one level short.
+  const noQuorum = verifyBundle(bundle, { trustedRoot: dailyRoot })
+  assert.equal(noQuorum.properties.signatureVerified, true)
+  assert.equal(noQuorum.properties.anchorVerified, false)
+  assert.equal(noQuorum.verificationLevel, "SIGNATURE_VERIFIED")
 
   // Tampering with the signed payload (but keeping a valid tree position) drops signatureVerified.
   const tampered: ProofBundle = {
@@ -483,6 +538,13 @@ test("verifyBundle: a genuinely redacted entry stays ok at COMMITMENT_VERIFIED",
 const LEDGER_VECTORS = JSON.parse(
   fs.readFileSync(new URL("../../mcp-schemas/vectors/ledger-vectors.json", import.meta.url), "utf8"),
 ) as {
+  domainTags: Record<string, string>
+  sha256Hex: { input: string; expected: string }[]
+  hashLeaf: { input: string; expected: string }[]
+  hashPair: { left: string; right: string; expected: string }[]
+  emptyRoot: string
+  merkleRoots: { name: string; leaves: string[]; expected: string }[]
+  leafPreimage: { name: string; row: AuditLeaf; canonical: string; leafHash: string }[]
   inclusion: InclusionProof & { dailyRoot: string }
   inclusionNegative: {
     name: string
@@ -493,6 +555,45 @@ const LEDGER_VECTORS = JSON.parse(
     expected: boolean
   }[]
 }
+
+// `leafPreimage` is the section with the widest blast radius and was the last one no TypeScript
+// test read. The vectors are GENERATED from this very builder (scripts/generate-ledger-vectors.ts
+// imports canonicalPreimage/leafHash from ledger-leaf.ts), so an edit here plus the documented
+// regeneration turns Go, Rust and Python green again against the new bytes — while every leafHash
+// already committed to the ledger becomes unreproducible. Asserting the committed bytes here is
+// what makes that edit fail instead of pass.
+test("golden vectors: the leaf preimage and hash match the committed bytes", () => {
+  for (const c of LEDGER_VECTORS.leafPreimage) {
+    assert.equal(canonicalPreimage(c.row), c.canonical, `${c.name}: canonical preimage drifted`)
+    assert.equal(leafHash(c.row), c.leafHash, `${c.name}: leaf hash drifted`)
+  }
+})
+
+test("golden vectors: the primitive hashes and domain tags match", () => {
+  // Asserted against the implementation's own constants, not a literal copy in this test — so a
+  // tag edit in the implementation fails here directly instead of only through derived hashes.
+  const hex = (tag: number) => `0x${tag.toString(16).padStart(2, "0")}`
+  assert.deepEqual(
+    LEDGER_VECTORS.domainTags,
+    {
+      leaf: hex(LEAF_TAG),
+      node: hex(NODE_TAG),
+      empty: hex(EMPTY_TAG),
+      anchor: hex(ANCHOR_TAG),
+      chain: hex(CHAIN_TAG),
+    },
+    "all five DEWP §2 domain separation bytes",
+  )
+  for (const c of LEDGER_VECTORS.sha256Hex) assert.equal(sha256Hex(c.input), c.expected, c.input)
+  for (const c of LEDGER_VECTORS.hashLeaf) assert.equal(hashLeaf(c.input), c.expected, c.input)
+  for (const c of LEDGER_VECTORS.hashPair) {
+    assert.equal(hashPair(c.left, c.right), c.expected, `${c.left.slice(0, 8)}+${c.right.slice(0, 8)}`)
+  }
+  assert.equal(emptyRoot(), LEDGER_VECTORS.emptyRoot)
+  for (const c of LEDGER_VECTORS.merkleRoots) {
+    assert.equal(merkleRoot(c.leaves), c.expected, c.name)
+  }
+})
 
 test("golden vectors: the shared inclusion proof verifies, positions and all", () => {
   const v = LEDGER_VECTORS.inclusion
@@ -533,7 +634,9 @@ test("verifyBundle: a supplied anchor policy is evaluated even when the bundle c
     r.notes.some((n) => /anchor quorum not met \(0\/1\)/.test(n)),
     `expected the 0/N verdict to be stated, got: ${r.notes.join("; ")}`,
   )
-  // Without a policy the weaker independent-root signal still applies, unchanged.
+  // And with no policy at all there is no quorum verdict to report either way: a root handed over
+  // out of band is provenance (`rootSource`), never the §5.3 check.
   const weak = verifyBundle(bundle, { trustedRoot: dailyRoot })
-  assert.equal(weak.properties.anchorVerified, true)
+  assert.equal(weak.properties.anchorVerified, false)
+  assert.equal(weak.rootSource, "independent")
 })

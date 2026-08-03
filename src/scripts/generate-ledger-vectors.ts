@@ -6,7 +6,7 @@ import crypto from "node:crypto"
 import fs from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { anchorDigestHex, signAnchor } from "../ledger-anchor.js"
+import { anchorDigest, anchorDigestHex, signAnchor } from "../ledger-anchor.js"
 import { type AuditLeaf, canonicalPreimage, leafHash } from "../ledger-leaf.js"
 import { hashLeaf, hashPair, merkleProof, merkleRoot, sha256Hex } from "../ledger-merkle.js"
 
@@ -37,6 +37,23 @@ function makeLeaf(seq: number): AuditLeaf {
 const metadataOrderLeaf: AuditLeaf = {
   ...makeLeaf(9),
   metadata: { "�": "replacement", "😀": "emoji", z: { b: 2, a: 1 }, i: 3 },
+}
+
+// The edges of the DEWP §4.3.1 portable range, which the producer refuses to cross. Every value here
+// is inside it and exactly representable, so all four ports MUST agree byte-for-byte: 2^53-1 either
+// sign, one decade under the 1e16 bound, exactly 1e-4 (the low bound for non-integers), a whole-valued
+// float that folds to integer text as JSON.stringify does, and zero. Note 9999999999999999 does NOT
+// belong here — it is already 1e16 by the time any implementation sees it, and is refused.
+const portableBoundsLeaf: AuditLeaf = {
+  ...makeLeaf(7),
+  metadata: {
+    safeInt: 9007199254740991,
+    negSafeInt: -9007199254740991,
+    e15: 1000000000000000,
+    smallFloat: 0.0001,
+    wholeFloat: 100.0,
+    zero: 0,
+  },
 }
 
 // ── Merkle primitives ────────────────────────────────────────────────────────
@@ -169,6 +186,24 @@ const signedAnchor = {
       expectOk: true,
     },
     {
+      // DEWP §5.2: verifiers MUST accept raw IEEE-P1363 as well as DER. An independent anchor issuer
+      // signing with WebCrypto can only emit P1363, and this port emitted only DER — so nothing
+      // pinned the acceptance and verify-go silently rejected such anchors. Same key, same digest,
+      // same signature value: only the encoding differs.
+      name: "es256-raw-p1363-anchor-signature-verifies",
+      anchor: {
+        ...signedAnchorObject,
+        signature: crypto
+          .sign("sha256", anchorDigest(anchorInput), {
+            key: anchorKeyPair.privateKey,
+            dsaEncoding: "ieee-p1363",
+          })
+          .toString("base64"),
+      },
+      digestHex: anchorDigestHex(anchorInput),
+      expectOk: true,
+    },
+    {
       name: "same-signature-different-root-fails",
       anchor: { ...signedAnchorObject, dailyRoot: "f".repeat(64) },
       expectOk: false,
@@ -178,8 +213,11 @@ const signedAnchor = {
 
 const vectors = {
   generated: new Date().toISOString(),
-  note: "Cross-language DEWP ledger vectors (docs/DEWP.md). Consumed by the Go/Rust/Python ledger verifiers. Regenerate ONLY on a deliberate format change.",
-  domainTags: { leaf: "0x00", node: "0x01", empty: "0x02", anchor: "0x03" },
+  note: "Cross-language DEWP ledger vectors (docs/DEWP.md). Consumed by ALL FOUR ledger verifiers: TS (@intyga/verify), Go, Rust, and Python. Regenerate ONLY on a deliberate format change.",
+  // All five tags DEWP §2 enumerates. `chain` (0x04, §5.4) has no vector of its own — the checkpoint
+  // chain is TS-only and the Core-Profile ports disclaim it — but listing it keeps this registry
+  // from silently describing a four-tag protocol.
+  domainTags: { leaf: "0x00", node: "0x01", empty: "0x02", anchor: "0x03", chain: "0x04" },
   hashLeaf: [
     { input: "A", expected: A },
     { input: "hello world", expected: hashLeaf("hello world") },
@@ -211,6 +249,12 @@ const vectors = {
       row: metadataOrderLeaf,
       canonical: canonicalPreimage(metadataOrderLeaf),
       leafHash: leafHash(metadataOrderLeaf),
+    },
+    {
+      name: "metadata-portable-number-bounds",
+      row: portableBoundsLeaf,
+      canonical: canonicalPreimage(portableBoundsLeaf),
+      leafHash: leafHash(portableBoundsLeaf),
     },
   ],
   inclusion,

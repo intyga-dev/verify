@@ -504,3 +504,109 @@ test("evidence: a producer stripping checkpoint anchors cannot bypass a supplied
     `expected the 0/N verdict to be stated, got: ${res.notes.join("; ")}`,
   )
 })
+
+// DEWP §9.2 Extended Profile requires offline DIV signature verification alongside evidence-bundle
+// verification. This path checked commitment, content, display and anchors but never looked at the
+// signature material the entries carry, so an auditor running a date-range export learned nothing
+// about the very proofs the product sells.
+
+/** Build a one-entry bundle whose leaf carries real (or deliberately broken) ES256 material. */
+function signedEntryBundle(opts: { breakSignature?: boolean } = {}): {
+  bundle: EvidenceBundle
+  dailyRoot: string
+} {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" })
+  const signedPayload = JSON.stringify({ type: "div-intent-verification", v: 1 })
+  const signature = crypto.sign("sha256", Buffer.from(signedPayload, "utf8"), privateKey)
+  // Flip one byte of the DER signature: still committed in the leaf, no longer a valid signature.
+  if (opts.breakSignature) signature[signature.length - 1] ^= 0xff
+
+  const leaf: AuditLeaf = {
+    ...makeLeaf(1, 1),
+    signerDid: "did:example:human:alice",
+    signerPublicKey: publicKey.export({ format: "der", type: "spki" }).toString("base64"),
+    signedPayload,
+    signature: signature.toString("base64"),
+    sigAlg: "ES256",
+  }
+  const lh = leafHash(leaf)
+  const blockRoot = merkleRoot([lh])
+  const dailyLeaves = [hashLeaf(blockRoot)]
+  const dailyRoot = merkleRoot(dailyLeaves)
+
+  return {
+    dailyRoot,
+    bundle: {
+      kind: EVIDENCE_BUNDLE_KIND,
+      version: 1,
+      exportedAt: "2026-07-15T00:00:00.000Z",
+      tenant: { id: "tenant-1", name: "Test Tenant" },
+      range: { from: "2026-07-15T00:00:00.000Z", to: "2026-07-15T23:59:59.000Z" },
+      checkpoints: [{ id: "cp-1", root: dailyRoot, anchorRef: "anchor://test/1" }],
+      entries: [
+        {
+          event: {
+            seq: "1",
+            createdAt: leaf.createdAt,
+            type: leaf.event,
+            outcome: leaf.outcome,
+            tenantSeq: "1",
+            canonical: leaf,
+          },
+          proof: {
+            seq: "1",
+            leaf: lh,
+            blockIndex: "0",
+            blockRoot,
+            blockProof: merkleProof([lh], 0),
+            leafIndex: 0,
+            blockLeafCount: 1,
+            checkpointId: "cp-1",
+            checkpointRoot: dailyRoot,
+            checkpointProof: merkleProof(dailyLeaves, 0),
+            checkpointLeafIndex: 0,
+            checkpointLeafCount: 1,
+            anchorRef: "anchor://test/1",
+            anchored: true,
+          },
+        },
+      ],
+    } as EvidenceBundle,
+  }
+}
+
+test("evidence: a valid embedded ES256 signature is verified, not merely carried", () => {
+  const { bundle, dailyRoot } = signedEntryBundle()
+  const res = verifyEvidenceBundle(bundle, { trustedRoots: [dailyRoot] })
+  assert.equal(res.signatures.verified, 1)
+  assert.equal(res.signatures.invalid.length, 0)
+  assert.equal(res.signatures.notCheckable, 0)
+  assert.equal(res.ok, true)
+})
+
+test("evidence: committed proof material that does not verify is reported, not ignored", () => {
+  const { bundle, dailyRoot } = signedEntryBundle({ breakSignature: true })
+  const res = verifyEvidenceBundle(bundle, { trustedRoots: [dailyRoot] })
+  assert.equal(res.signatures.verified, 0)
+  assert.deepEqual(
+    res.signatures.invalid.map((s) => s.seq),
+    ["1"],
+  )
+  // The signature bytes are themselves committed, so leaf binding still passes and the entry is
+  // still content-verified: this is the producer having anchored a bad signature, not tampering.
+  assert.equal(res.contentVerified, 1)
+  assert.equal(res.failed.length, 0)
+  assert.ok(
+    res.notes.some((n) => /does NOT verify/.test(n)),
+    `expected the invalid-signature note, got: ${res.notes.join("; ")}`,
+  )
+})
+
+test("evidence: unsigned entries count as not offline-checkable, never as failures", () => {
+  const { bundle, dailyRoot } = buildBundle()
+  const res = verifyEvidenceBundle(bundle, { trustedRoots: [dailyRoot] })
+  assert.equal(res.signatures.verified, 0)
+  assert.equal(res.signatures.invalid.length, 0)
+  assert.equal(res.signatures.notCheckable, res.contentVerified)
+  assert.equal(res.ok, true)
+})
