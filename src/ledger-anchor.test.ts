@@ -195,8 +195,6 @@ test("shared signedAnchor vectors verify (raw-digest signing, cross-language)", 
       path.join(
         path.dirname(fileURLToPath(import.meta.url)),
         "..",
-        "..",
-        "mcp-schemas",
         "vectors",
         "ledger-vectors.json",
       ),

@@ -536,7 +536,7 @@ test("verifyBundle: a genuinely redacted entry stays ok at COMMITMENT_VERIFIED",
 // it. Reading them here closes the loop: one file, four languages, one answer.
 
 const LEDGER_VECTORS = JSON.parse(
-  fs.readFileSync(new URL("../../mcp-schemas/vectors/ledger-vectors.json", import.meta.url), "utf8"),
+  fs.readFileSync(new URL("../vectors/ledger-vectors.json", import.meta.url), "utf8"),
 ) as {
   domainTags: Record<string, string>
   sha256Hex: { input: string; expected: string }[]
