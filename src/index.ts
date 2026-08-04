@@ -322,7 +322,7 @@ export interface ApprovalRequirementAttestation {
 }
 
 /**
- * Canonical DIV Intent Payload (docs/DIV.md v2) — byte-identical to
+ * Canonical DIV Intent Payload (docs/DIV.md v1) — byte-identical to
  * mcp-schemas.canonicalIntentPayload. Strict RFC 8785 JCS: the whole object is serialized with every
  * key sorted recursively by UTF-16 code unit via `stableStringify`. Do NOT hand-order keys.
  */
