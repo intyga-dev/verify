@@ -21,6 +21,7 @@ const DEFAULT_REQUIREMENT = {
   requireHardwareKey: false,
   allowedAaguids: [] as string[],
   requesterCannotApprove: false,
+  signerClass: "human",
 }
 
 /**
@@ -111,6 +112,57 @@ test("verifies a genuine ES256 approval receipt", () => {
   const { receipt } = es256Receipt({
     actionDescription: "Wipe production database",
     ...ACTION,
+  })
+  assert.equal(verifyApprovalReceipt(receipt, EXPECTED).ok, true)
+})
+
+// ── signerClass registry (DIV §4.3.2 / §5-step-3a) ──────────────────────────
+// The registry rule is what keeps "human-approved" checkable as signer classes multiply: a payload
+// whose class this verifier does not know must NEVER verify as if it were human-approved.
+
+test("signerClass: a payload with no signerClass is refused", () => {
+  // A pre-signerClass payload, as a stale producer would emit it. The builder itself now refuses
+  // to omit the field, so strip it from the canonical string and re-sign — the signature is
+  // genuine, which pins that the refusal is the registry rule, not a broken signature.
+  const { receipt } = es256Receipt({ actionDescription: "Wipe production database", ...ACTION })
+  const stale = receipt.canonicalPayload.replace(',"signerClass":"human"', "")
+  assert.notEqual(stale, receipt.canonicalPayload) // the strip actually happened
+  const staleSignature = crypto
+    .sign("sha256", Buffer.from(stale, "utf8"), { key: APPROVER.privateKey, dsaEncoding: "ieee-p1363" })
+    .toString("base64")
+  const r = verifyApprovalReceipt(
+    {
+      ...receipt,
+      canonicalPayload: stale,
+      signature: staleSignature,
+      verificationCode: verificationCode(stale),
+    },
+    EXPECTED,
+  )
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /missing signerClass/)
+})
+
+test("signerClass: an unrecognized class is refused, not treated as human", () => {
+  const { receipt } = es256Receipt({
+    actionDescription: "Wipe production database",
+    ...ACTION,
+    requirement: { ...DEFAULT_REQUIREMENT, signerClass: "delegated-agent" },
+  })
+  const r = verifyApprovalReceipt(receipt, EXPECTED)
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /does not recognize/)
+  assert.match(r.reason!, /delegated-agent/)
+})
+
+test('signerClass: "human" verifies, and an ES256 witness is not rejected under it', () => {
+  // The class does NOT gate witness kind: humans legitimately sign with bare keys (offline
+  // break-glass), so this ES256 receipt must pass. Cryptographic ceremony proof is
+  // requireHardwareKey's job, not signerClass's.
+  const { receipt } = es256Receipt({
+    actionDescription: "Wipe production database",
+    ...ACTION,
+    requirement: { ...DEFAULT_REQUIREMENT, signerClass: "human" },
   })
   assert.equal(verifyApprovalReceipt(receipt, EXPECTED).ok, true)
 })

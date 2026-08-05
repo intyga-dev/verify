@@ -59,12 +59,14 @@ function requirement(over: Partial<Record<string, unknown>> = {}) {
     requireHardwareKey: false,
     allowedAaguids: [] as string[],
     requesterCannotApprove: false,
+    signerClass: "human",
     ...over,
   } as {
     requiredApprovals: number
     requireHardwareKey: boolean
     allowedAaguids: string[]
     requesterCannotApprove: boolean
+    signerClass: string
   }
 }
 

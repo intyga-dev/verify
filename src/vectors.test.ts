@@ -7,6 +7,7 @@ import { describe, it } from "node:test"
 import {
   type ApprovalReceipt,
   type ApproverTrustAnchor,
+  canonicalAgentAuthorityPayload,
   canonicalDelegationPayload,
   canonicalIntentPayload,
   canonicalOfflineIntentPayload,
@@ -41,12 +42,15 @@ interface PayloadInput {
     requireHardwareKey: boolean
     allowedAaguids: string[]
     requesterCannotApprove: boolean
+    signerClass: string
   }
   expiresAt: string
   challengedAt?: string
   delegatedTo?: string[]
   delegatedQuorum?: number
   sealedAt?: string
+  agentDid?: string
+  actionPatterns?: string[]
 }
 interface ReceiptCase {
   name: string
@@ -62,6 +66,7 @@ const vectors = JSON.parse(fs.readFileSync(vectorsPath, "utf8")) as {
   intentPayloads: { input: PayloadInput; expected: string }[]
   offlineIntentPayloads: { input: PayloadInput; expected: string }[]
   delegationPayloads: { input: PayloadInput; expected: string }[]
+  agentAuthorityPayloads: { input: PayloadInput; expected: string }[]
   digests: { canonical: string; digestHex: string; verificationCode: string }[]
   signerKey: { spkiB64: string }
   receipts: ReceiptCase[]
@@ -157,6 +162,23 @@ describe("shared canonical vectors (committed artifact, same file the other port
           requirement: input.requirement,
           delegatedTo: input.delegatedTo,
           delegatedQuorum: input.delegatedQuorum,
+          nonce: input.nonce,
+          sealedAt: input.sealedAt,
+          expiresAt: input.expiresAt,
+        }),
+        expected,
+      )
+    }
+    for (const { input, expected } of vectors.agentAuthorityPayloads) {
+      assert.ok(input.agentDid && input.actionPatterns && input.sealedAt)
+      assert.equal(
+        canonicalAgentAuthorityPayload({
+          target: input.target,
+          actionPatterns: input.actionPatterns,
+          display: input.actionDescription,
+          agent: { did: input.agentDid },
+          requester: input.requester,
+          requirement: input.requirement,
           nonce: input.nonce,
           sealedAt: input.sealedAt,
           expiresAt: input.expiresAt,

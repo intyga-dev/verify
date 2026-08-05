@@ -269,6 +269,13 @@ export const DIV_OFFLINE_INTENT_TYPE = "div-offline-intent"
 export const DIV_DELEGATION_TYPE = "div-delegation"
 
 /**
+ * Agent authority (DIV §5b): a quorum-signed statement of STANDING SCOPE for one agent. Authorizes
+ * no action on its own; `verifyApprovalReceipt` refuses it outright, and `verifyAgentAuthority` is
+ * the only door. Mirrors mcp-schemas.
+ */
+export const DIV_AGENT_AUTHORITY_TYPE = "div-agent-authority"
+
+/**
  * Hard ceiling on an offline proof's validity window, enforced at verification and not only at mint.
  * An offline proof is created and redeemed within one incident, so the window is minutes — it exists
  * to bound a proof whose `expiresAt` was minted over-long, which is otherwise indistinguishable at
@@ -313,12 +320,53 @@ export const MAX_DELEGATION_WINDOW_HOURS = 72
  *    present at REGISTRATION, not in an assertion. Only the gateway (which stored it at enrollment)
  *    can enforce this. It is carried here so the approver signs the policy they were told applied,
  *    not so a relying party can re-derive it.
+ *  - `signerClass` — PARTIALLY checkable, and differently per witness kind. For a WEBAUTHN witness
+ *    the UV flag (already required by `verifyWebAuthnSignature`) is cryptographic evidence a
+ *    user-verification ceremony — a human gesture — happened at signing. An ES256 witness carries no
+ *    signer-class evidence at all: there the class rests on the issuing deployment's signing-time
+ *    enforcement, or, for an offline proof, on the delegation ceremony that named the operators.
+ *    The verifier's own obligation is narrower and absolute: REFUSE any value it does not
+ *    recognize (only "human" is defined today), so a future signer class can never verify as
+ *    human-approved by default. It deliberately does NOT reject ES256 witnesses under
+ *    `signerClass: "human"` — humans legitimately sign with raw P-256 keys (offline break-glass);
+ *    a deployment wanting cryptographic proof of the ceremony pins `requireHardwareKey`.
  */
 export interface ApprovalRequirementAttestation {
   requiredApprovals: number
   requireHardwareKey: boolean
   allowedAaguids: string[]
   requesterCannotApprove: boolean
+  /** Required signer class — `"human"` is the only value defined today. Unrecognized values are refused. */
+  signerClass: string
+}
+
+/**
+ * The one signer class defined by DIV today (docs/DIV.md §4.3.2). Mirrors mcp-schemas, like
+ * DIV_VERSION — this package deliberately imports nothing from it.
+ */
+export const SIGNER_CLASS_HUMAN = "human"
+
+/** The signer classes this verifier knows how to reason about (DIV §4.3.2). Mirrors mcp-schemas. */
+const KNOWN_SIGNER_CLASSES = new Set([SIGNER_CLASS_HUMAN])
+
+/**
+ * Extract and validate `requirement.signerClass` from a parsed signed requirement. FAIL CLOSED both
+ * ways: a payload with no class predates (or dropped) the field and cannot be verified by this
+ * version, and an unrecognized class must never verify as if it were human-approved — that is the
+ * entire point of putting the class in the signed bytes.
+ */
+function parseSignerClass(
+  requirement: Partial<ApprovalRequirementAttestation>,
+): { ok: true; signerClass: string } | { ok: false; reason: string } {
+  const sc = requirement.signerClass
+  if (typeof sc !== "string" || sc.length === 0)
+    return { ok: false, reason: "the signed requirement is missing signerClass (DIV §4.3.2)" }
+  if (!KNOWN_SIGNER_CLASSES.has(sc))
+    return {
+      ok: false,
+      reason: `the signed requirement declares signerClass "${sc}", which this verifier does not recognize — refusing rather than treating it as human-approved (DIV §4.3.2)`,
+    }
+  return { ok: true, signerClass: sc }
 }
 
 /**
@@ -370,6 +418,7 @@ function commonSignedFields(requester: RequesterIdentity, requirement: ApprovalR
       // produce different bytes depending on how the rule happened to be written.
       allowedAaguids: [...requirement.allowedAaguids].sort(),
       requesterCannotApprove: requirement.requesterCannotApprove,
+      signerClass: requirement.signerClass,
     },
   }
 }
@@ -444,6 +493,41 @@ export function canonicalDelegationPayload(input: {
     ...commonSignedFields(input.requester, input.requirement),
     delegatedTo: [...input.delegatedTo].sort(),
     delegatedQuorum: input.delegatedQuorum,
+    nonce: input.nonce,
+    sealedAt: input.sealedAt,
+    expiresAt: input.expiresAt,
+  })
+}
+
+/**
+ * Canonical AGENT AUTHORITY payload (DIV §5b) — byte-identical to
+ * mcp-schemas.canonicalAgentAuthorityPayload; parity is enforced by `canonical-parity.test.ts`.
+ *
+ * Not a delegation: `div-delegation` deliberately covers exactly one action, forbids wildcards and
+ * caps its window at 72 hours, because it pre-authorizes WHO MAY APPROVE at incident time. An
+ * authority is governance enforced online — it may carry a scope (patterns) and a long validity
+ * precisely because it authorizes nothing offline. `actionPatterns` is sorted because it is a SET,
+ * exactly as `allowedAaguids` is.
+ */
+export function canonicalAgentAuthorityPayload(input: {
+  target: string
+  actionPatterns: string[]
+  display: string
+  agent: { did: string }
+  requester: RequesterIdentity
+  requirement: ApprovalRequirementAttestation
+  nonce: string
+  sealedAt: string
+  expiresAt: string
+}): string {
+  return stableStringify({
+    v: DIV_VERSION,
+    type: DIV_AGENT_AUTHORITY_TYPE,
+    target: input.target,
+    actionPatterns: [...input.actionPatterns].sort(),
+    display: input.display,
+    agent: { did: input.agent.did },
+    ...commonSignedFields(input.requester, input.requirement),
     nonce: input.nonce,
     sealedAt: input.sealedAt,
     expiresAt: input.expiresAt,
@@ -840,6 +924,14 @@ export function verifyApprovalReceipt(
       reason:
         "this is a delegation, which authorizes no action on its own — verify it with verifyDelegation and pass the result as { delegation }, together with an offline approval signed by the delegated operators",
     }
+  // Same structural rule as the delegation branch above: an authority is governance evidence, and
+  // the only way "it authorizes nothing" stays true is that this function can never say ok to one.
+  if (payloadType === DIV_AGENT_AUTHORITY_TYPE)
+    return {
+      ok: false,
+      reason:
+        "this is an agent authority, which authorizes no action on its own — verify it with verifyAgentAuthority; execution still requires an approval receipt",
+    }
   const offline = payloadType === DIV_OFFLINE_INTENT_TYPE
   if (!offline && payloadType !== DIV_INTENT_TYPE)
     return { ok: false, reason: "payload is not a div-intent-verification" }
@@ -890,6 +982,8 @@ export function verifyApprovalReceipt(
   )
   if (!requirement || typeof requirement.requiredApprovals !== "number")
     return { ok: false, reason: "receipt payload is missing the signed approval requirement" }
+  const signerClass = parseSignerClass(requirement)
+  if (!signerClass.ok) return { ok: false, reason: signerClass.reason }
 
   // Offline proofs carry `challengedAt` so the validity WINDOW can be bounded here, not merely at
   // mint. A proof whose window exceeds the cap is refused even though its signature is perfectly
@@ -973,6 +1067,7 @@ export function verifyApprovalReceipt(
       requireHardwareKey: requirement.requireHardwareKey === true,
       allowedAaguids: Array.isArray(requirement.allowedAaguids) ? requirement.allowedAaguids : [],
       requesterCannotApprove: requirement.requesterCannotApprove === true,
+      signerClass: signerClass.signerClass,
     },
     nonce: parseNonce(receipt.canonicalPayload),
     expiresAt,
@@ -1207,6 +1302,8 @@ export function verifyDelegation(
   )
   if (!requirement || typeof requirement.requiredApprovals !== "number")
     return { ok: false, reason: "delegation payload is missing the signed approval requirement" }
+  const signerClass = parseSignerClass(requirement)
+  if (!signerClass.ok) return { ok: false, reason: signerClass.reason }
   if (typeof expected.target !== "string" || expected.target.length === 0)
     return {
       ok: false,
@@ -1233,6 +1330,7 @@ export function verifyDelegation(
         requireHardwareKey: requirement.requireHardwareKey === true,
         allowedAaguids: Array.isArray(requirement.allowedAaguids) ? requirement.allowedAaguids : [],
         requesterCannotApprove: requirement.requesterCannotApprove === true,
+        signerClass: signerClass.signerClass,
       },
       delegatedTo: delegatedTo as string[],
       delegatedQuorum,
@@ -1337,6 +1435,218 @@ export function verifyDelegation(
       params: expected.params,
       nonce,
       signers: [...verifiedSigners].sort(), // sorted, as in the quorum path above
+      expiresAt,
+    },
+  }
+}
+
+/** An agent authority whose sealing signatures, quorum and window verified (`verifyAgentAuthority`). */
+export interface VerifiedAgentAuthority {
+  /** The agent the authority is ABOUT — from the signed bytes, asserted by the caller. */
+  agentDid: string
+  target: string
+  /** The signed scope, deduplicated. Substring patterns over actionType+description; "*" = all. */
+  actionPatterns: string[]
+  /** The authority's OWN nonce — for the audit trail, never for authorization. */
+  nonce: string
+  /** Who sealed it. */
+  signers: string[]
+  sealedAt: string
+  expiresAt: string
+}
+
+/**
+ * Verify an AGENT AUTHORITY (DIV §5b) — a statement, sealed by a human quorum, of the standing scope
+ * one agent may operate under.
+ *
+ * Deliberately a SEPARATE function from `verifyApprovalReceipt`, which refuses this payload type
+ * outright — the same structural rule as delegations. What you get back is governance EVIDENCE:
+ * "these named humans granted this agent this scope, and the grant was live at `asOf`". It is never
+ * an approval; executing an action still requires an ordinary receipt.
+ *
+ * Two things the caller asserts and never reads from the artifact (DIV Invariant 3):
+ * `expected.approvers` (the sealing quorum's keys, from your own trust policy) and
+ * `expected.target` / `expected.agentDid` (what YOU are checking authority over). Revocation is
+ * authoritative online only — an offline verifier sees validity, not revocation; treat a seal like
+ * a certificate, not a bearer token.
+ */
+export function verifyAgentAuthority(
+  receipt: ApprovalReceipt,
+  expected: {
+    /** The sealing approvers entitled to grant. Resolved from your own trust policy. */
+    approvers: ApproverTrustAnchor
+    /** YOUR target identifier, asserted independently of the artifact (DIV Target Isolation). */
+    target: string
+    /** The agent whose authority you are checking, asserted independently of the artifact. */
+    agentDid: string
+  },
+  opts: VerifyReceiptOptions = {},
+): { ok: boolean; reason?: string; authority?: VerifiedAgentAuthority } {
+  const version = parseVersion(receipt.canonicalPayload)
+  if (version !== DIV_VERSION)
+    return { ok: false, reason: `unsupported DIV payload version (${version || "unparseable"})` }
+  if (parseField(receipt.canonicalPayload, "type") !== DIV_AGENT_AUTHORITY_TYPE)
+    return { ok: false, reason: "payload is not a div-agent-authority" }
+
+  const actionPatterns = parseField<unknown>(receipt.canonicalPayload, "actionPatterns")
+  if (
+    !Array.isArray(actionPatterns) ||
+    actionPatterns.length === 0 ||
+    actionPatterns.some((p) => typeof p !== "string" || p.length === 0)
+  )
+    return { ok: false, reason: "authority is missing a valid actionPatterns set" }
+
+  const sealedAt = parseField<string>(receipt.canonicalPayload, "sealedAt")
+  const expiresAt = parseField<string>(receipt.canonicalPayload, "expiresAt")
+  if (typeof sealedAt !== "string" || sealedAt.length === 0)
+    return { ok: false, reason: "authority is missing sealedAt" }
+  if (typeof expiresAt !== "string" || expiresAt.length === 0)
+    return { ok: false, reason: "authority is missing expiresAt" }
+  const sealedMs = Date.parse(sealedAt)
+  const expiryMs = Date.parse(expiresAt)
+  if (Number.isNaN(sealedMs)) return { ok: false, reason: "sealedAt is not a valid RFC3339 timestamp" }
+  if (Number.isNaN(expiryMs)) return { ok: false, reason: "expiresAt is not a valid RFC3339 timestamp" }
+  // No 72-hour cap here, deliberately: that cap exists because a delegation pre-authorizes offline
+  // APPROVAL and cannot be revoked at an offline relying party. An authority authorizes nothing and
+  // is enforced (and revoked) online, so its window is deployment policy, not a verifier rule.
+  if (expiryMs < sealedMs) return { ok: false, reason: "authority expires before it was sealed" }
+
+  const nonce = parseNonce(receipt.canonicalPayload)
+  if (!receipt.requester) return { ok: false, reason: "authority missing requester" }
+  const requirement = parseField<Partial<ApprovalRequirementAttestation>>(
+    receipt.canonicalPayload,
+    "requirement",
+  )
+  if (!requirement || typeof requirement.requiredApprovals !== "number")
+    return { ok: false, reason: "authority payload is missing the signed approval requirement" }
+  const signerClass = parseSignerClass(requirement)
+  if (!signerClass.ok) return { ok: false, reason: signerClass.reason }
+  if (typeof expected.target !== "string" || expected.target.length === 0)
+    return {
+      ok: false,
+      reason:
+        "expected.target is required — it must be YOUR target identifier, asserted independently of the authority (DIV Target Isolation)",
+    }
+  if (typeof expected.agentDid !== "string" || expected.agentDid.length === 0)
+    return {
+      ok: false,
+      reason: "expected.agentDid is required — name the agent whose authority you are checking",
+    }
+  if (!expected.approvers)
+    return {
+      ok: false,
+      reason:
+        "expected.approvers is required — the sealing approvers MUST come from your own trust policy, never from the artifact (DIV Invariant 3)",
+    }
+
+  // Local Payload Reconstruction: the byte comparison pins target, agent DID and the pattern set at
+  // once, so the crypto below never runs against bytes the caller has not re-derived.
+  let recomputed: string
+  try {
+    recomputed = canonicalAgentAuthorityPayload({
+      target: expected.target,
+      actionPatterns: actionPatterns as string[],
+      display: receipt.actionDescription,
+      agent: { did: expected.agentDid },
+      requester: receipt.requester,
+      requirement: {
+        requiredApprovals: requirement.requiredApprovals,
+        requireHardwareKey: requirement.requireHardwareKey === true,
+        allowedAaguids: Array.isArray(requirement.allowedAaguids) ? requirement.allowedAaguids : [],
+        requesterCannotApprove: requirement.requesterCannotApprove === true,
+        signerClass: signerClass.signerClass,
+      },
+      nonce,
+      sealedAt,
+      expiresAt,
+    })
+  } catch (err) {
+    return { ok: false, reason: `authority payload is not canonicalizable: ${(err as Error).message}` }
+  }
+  if (recomputed !== receipt.canonicalPayload)
+    return { ok: false, reason: "target/agent/actionPatterns do not match what was sealed" }
+
+  if (!opts.allowExpired) {
+    const nowMs = (opts.asOf ?? new Date()).getTime()
+    const skewMs = (opts.clockSkewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS) * 1000
+    if (nowMs > expiryMs + skewMs)
+      return {
+        ok: false,
+        reason: "authority has expired (pass { allowExpired: true } for audit re-verification)",
+      }
+  }
+
+  if (receipt.sigAlg === "AUTO_APPROVED")
+    return {
+      ok: false,
+      reason: "an agent authority cannot be auto-approved — granting agent scope requires human signatures",
+    }
+  const witnesses = witnessesOf(receipt)
+  if (witnesses.length === 0) return { ok: false, reason: "authority missing signature material" }
+  if (witnesses.length > MAX_WITNESSES) {
+    return {
+      ok: false,
+      reason: `authority carries ${witnesses.length} witnesses, above the ${MAX_WITNESSES} this verifier will process`,
+    }
+  }
+
+  const verifiedSigners = new Set<string>()
+  const failures: string[] = []
+  for (const witness of witnesses) {
+    const candidates = candidateKeys(expected.approvers, witness)
+    if ("reason" in candidates) {
+      failures.push(candidates.reason)
+      continue
+    }
+    let matched: string | null = null
+    let lastReason = "signature does not verify against any trusted approver key"
+    for (const candidate of candidates.keys) {
+      const attempt = verifyWitness(witness, candidate.key, receipt.canonicalPayload, opts)
+      if (attempt.ok) {
+        matched = candidate.identity
+        break
+      }
+      lastReason = attempt.reason
+    }
+    if (matched === null) {
+      failures.push(lastReason)
+      continue
+    }
+    if (requirement.requireHardwareKey === true && witness.sigAlg !== "WEBAUTHN") {
+      failures.push(
+        `signer ${witness.signerDid} used a bare key, but the signed policy requires a hardware-backed WebAuthn credential`,
+      )
+      continue
+    }
+    if (requirement.requesterCannotApprove === true && witness.signerDid === receipt.requester.did) {
+      failures.push(`four-eyes: requester ${witness.signerDid} cannot seal their own request`)
+      continue
+    }
+    verifiedSigners.add(matched)
+  }
+
+  const required = Math.max(1, requirement.requiredApprovals)
+  if (verifiedSigners.size < required) {
+    const shown = failures.slice(0, MAX_REPORTED_FAILURES)
+    const elided = failures.length - shown.length
+    const detail = shown.length > 0 ? ` (${shown.join("; ")}${elided > 0 ? `; +${elided} more` : ""})` : ""
+    return {
+      ok: false,
+      reason: `authority sealing quorum not met: ${verifiedSigners.size} of ${required} required approver signatures verified${detail}`,
+    }
+  }
+
+  return {
+    ok: true,
+    authority: {
+      agentDid: expected.agentDid,
+      target: expected.target,
+      // Deduplicated + sorted: a duplicate pattern must not suggest a wider scope, and every port
+      // that grows this surface later should report the same order.
+      actionPatterns: [...new Set(actionPatterns as string[])].sort(),
+      nonce,
+      signers: [...verifiedSigners].sort(),
+      sealedAt,
       expiresAt,
     },
   }
