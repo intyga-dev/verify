@@ -5,7 +5,7 @@ All notable changes to `@intyga/verify` are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0]
+## [1.0.0]
 
 Initial public release.
 
