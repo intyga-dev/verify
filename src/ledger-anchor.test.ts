@@ -194,8 +194,7 @@ test("shared signedAnchor vectors verify (raw-digest signing, cross-language)", 
     fs.readFileSync(
       path.join(
         path.dirname(fileURLToPath(import.meta.url)),
-        "..",
-        "vectors",
+        "..", "vectors",
         "ledger-vectors.json",
       ),
       "utf8",
@@ -292,4 +291,37 @@ test("RFC 3161 TSA anchors are reported present-but-unverifiable, never silently
     resolve,
   )
   assert.equal(clean.note, undefined)
+})
+
+test("quorum: a WEBHOOK anchor never counts, even with a valid DEWP signature (DEWP §5.2.1)", () => {
+  // A WEBHOOK receipt is deployment-specific evidence this verifier cannot check. Before the fix,
+  // any kind other than REKOR/RFC3161 fell through to the SELF branch and counted if the signature
+  // verified — so a WEBHOOK anchor that happened to carry a valid §5.2 signature widened quorum.
+  const a = es256()
+  const webhook: SignedAnchor = { ...mkAnchor("https://a.example", a.privateKey), kind: "WEBHOOK" }
+  const resolve = () => a.publicKey
+  const policy = {
+    requiredAnchors: 1,
+    trustedIssuers: ["https://a.example"],
+    quorum: "N_OF_M" as const,
+  }
+  const res = verifyAnchorQuorum([webhook], DAILY_ROOT, policy, resolve)
+  assert.equal(res.ok, false)
+})
+
+test("quorum: an unrecognized anchor kind fails closed; an explicit SELF still counts", () => {
+  const a = es256()
+  const unknown: SignedAnchor = {
+    ...mkAnchor("https://a.example", a.privateKey),
+    kind: "vendor.custom-attestor",
+  }
+  const self: SignedAnchor = { ...mkAnchor("https://a.example", a.privateKey), kind: "SELF" }
+  const resolve = () => a.publicKey
+  const policy = {
+    requiredAnchors: 1,
+    trustedIssuers: ["https://a.example"],
+    quorum: "N_OF_M" as const,
+  }
+  assert.equal(verifyAnchorQuorum([unknown], DAILY_ROOT, policy, resolve).ok, false)
+  assert.equal(verifyAnchorQuorum([self], DAILY_ROOT, policy, resolve).ok, true)
 })

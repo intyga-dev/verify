@@ -28,6 +28,31 @@ export function hashLeaf(data: string): string {
     .digest("hex")
 }
 
+/**
+ * Exactly 64 LOWERCASE hex characters (DEWP §4.4). Verification inputs must pass this before they
+ * reach `hashPair`, because `Buffer.from(s, "hex")` is lenient in two ways that both break the
+ * proof: it accepts uppercase, and it silently stops at the first non-hex character instead of
+ * failing. So distinct proof strings collapse onto the same bytes.
+ *
+ * That is not cosmetic — it defeats the padding check in `verifyMerkleProof`. That check rejects a
+ * step whose sibling equals the running node anywhere but the unpaired end of an odd level, which is
+ * what makes a path to a never-existent index fail. The comparison is on the STRING, so uppercasing
+ * a sibling makes `selfPaired` false while `hashPair` still decodes it to the identical 32 bytes:
+ * the padding forgery recomputes the genuine root and verifies. Reproduced against the real 3-leaf
+ * tree before this gate existed. The Go, Rust, Python and Java ports already gate on this; the
+ * reference implementation did not, so it was the only port accepting the forgery.
+ */
+function isHash64(s: string): boolean {
+  if (typeof s !== "string" || s.length !== 64) return false
+  for (let i = 0; i < 64; i++) {
+    const c = s.charCodeAt(i)
+    const isDigit = c >= 0x30 && c <= 0x39
+    const isLowerAf = c >= 0x61 && c <= 0x66
+    if (!isDigit && !isLowerAf) return false
+  }
+  return true
+}
+
 // Checked indexed read. The loops below keep indices in range by construction; if that invariant
 // ever breaks, throwing beats fabricating a hash — a wrong tree must never verify.
 function at(level: string[], i: number): string {
@@ -149,6 +174,10 @@ export function verifyMerkleProof(
   // 3-argument call from an untyped consumer. Refusing here keeps this a boolean predicate for that
   // caller instead of a thrown TypeError.
   if (!bounds) return false
+  // Canonical hex FIRST: the self-pairing check below compares sibling to node as STRINGS, so an
+  // uppercased sibling slips past it while hashing to the identical bytes (see `isHash64`). Every
+  // hash that reaches `hashPair` is gated here and at each step.
+  if (!isHash64(leaf) || !isHash64(root)) return false
   const { index, leafCount } = bounds
   if (!Number.isInteger(index) || !Number.isInteger(leafCount)) return false
   if (leafCount < 1 || index < 0 || index >= leafCount) return false
@@ -166,6 +195,7 @@ export function verifyMerkleProof(
   let levelSize = leafCount
   let node = leaf
   for (const step of proof) {
+    if (!isHash64(step.siblingHash)) return false
     const expectedSide = idx % 2 === 1 ? "LEFT" : "RIGHT"
     if (step.siblingPosition !== expectedSide) return false
     const selfPaired = step.siblingHash === node

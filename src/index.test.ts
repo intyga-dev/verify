@@ -5,6 +5,8 @@ import {
   type ApprovalReceipt,
   canonicalIntentPayload,
   type RequesterIdentity,
+  SELF_CERTIFYING_DID_PREFIX,
+  selfCertifyingDid,
   verificationCode,
   verifyApprovalReceipt,
 } from "./index.ts"
@@ -760,6 +762,186 @@ test("DID-mode anchor refuses a signer outside the allowlist, and a DID whose ke
   })
   assert.equal(resolved.ok, true)
   assert.deepEqual(resolved.signers, ["did:intyga:cfo-alice"])
+})
+
+// ── Self-certifying DIDs (did:intyga:key:…) ──────────────────────────────────
+// The pinned DID commits to the key itself, so no resolveKey is needed — but ONLY for the pinned
+// DID: the allowlist still decides who may sign, and the fingerprint still decides with which key.
+
+test("self-certifying DID verifies with no resolveKey at all", () => {
+  const did = selfCertifyingDid(APPROVER_SPKI_B64)
+  assert.ok(did.startsWith(SELF_CERTIFYING_DID_PREFIX))
+  const { receipt } = es256Receipt({ actionDescription: "Wipe production database", ...ACTION })
+  receipt.signerDid = did
+
+  const r = verifyApprovalReceipt(receipt, { ...ACTION, nonce: "nonce-1", approvers: { dids: [did] } })
+  assert.equal(r.ok, true, r.ok ? undefined : r.reason)
+  assert.deepEqual(r.signers, [did])
+})
+
+test("self-certifying DID derivation is encoding-stable (padded and unpadded base64 hash the same)", () => {
+  const padded = APPROVER_SPKI_B64
+  const unpadded = APPROVER_SPKI_B64.replace(/=+$/, "")
+  assert.equal(selfCertifyingDid(padded), selfCertifyingDid(unpadded))
+})
+
+test("self-certifying DID derivation matches its pinned vector", () => {
+  // sha256("test") = 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08, base64url-encoded
+  // without padding. The gateway mints person DIDs with this exact derivation (personDidFromKey
+  // delegates here), so a change to this output orphans every key-derived identity ever enrolled.
+  assert.equal(
+    selfCertifyingDid(Buffer.from("test", "utf8").toString("base64")),
+    "did:intyga:key:n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg",
+  )
+})
+
+test("REFUSES a witness whose carried key does not hash to the pinned self-certifying DID", () => {
+  // The attacker claims the pinned identity but carries (and signs with) their own key. In plain
+  // resolveKey-less mode the carried key would be all there is — the fingerprint check is the anchor.
+  const pinnedDid = selfCertifyingDid(APPROVER_SPKI_B64)
+  const attacker = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  const canonical = divPayload({ nonce: "nonce-1", actionDescription: "Wipe production database", ...ACTION })
+  const forged: ApprovalReceipt = {
+    canonicalPayload: canonical,
+    target: TARGET,
+    actionType: ACTION.actionType,
+    actionDescription: "Wipe production database",
+    params: ACTION.params,
+    requester: REQUESTER,
+    signerDid: pinnedDid,
+    signerPublicKey: attacker.publicKey.export({ format: "der", type: "spki" }).toString("base64"),
+    signature: crypto
+      .sign("sha256", Buffer.from(canonical, "utf8"), { key: attacker.privateKey, dsaEncoding: "ieee-p1363" })
+      .toString("base64"),
+    sigAlg: "ES256",
+    verificationCode: verificationCode(canonical),
+  }
+  const r = verifyApprovalReceipt(forged, { ...ACTION, nonce: "nonce-1", approvers: { dids: [pinnedDid] } })
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /does not hash to the pinned self-certifying DID/)
+})
+
+test("REFUSES an attacker's own self-certifying DID — the allowlist still decides who may sign", () => {
+  // Internally flawless: the attacker's DID genuinely commits to the attacker's key and the
+  // signature verifies against it. It is simply not a pinned identity.
+  const attacker = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  const attackerSpki = attacker.publicKey.export({ format: "der", type: "spki" }).toString("base64")
+  const canonical = divPayload({ nonce: "nonce-1", actionDescription: "Wipe production database", ...ACTION })
+  const forged: ApprovalReceipt = {
+    canonicalPayload: canonical,
+    target: TARGET,
+    actionType: ACTION.actionType,
+    actionDescription: "Wipe production database",
+    params: ACTION.params,
+    requester: REQUESTER,
+    signerDid: selfCertifyingDid(attackerSpki),
+    signerPublicKey: attackerSpki,
+    signature: crypto
+      .sign("sha256", Buffer.from(canonical, "utf8"), { key: attacker.privateKey, dsaEncoding: "ieee-p1363" })
+      .toString("base64"),
+    sigAlg: "ES256",
+    verificationCode: verificationCode(canonical),
+  }
+  const r = verifyApprovalReceipt(forged, {
+    ...ACTION,
+    nonce: "nonce-1",
+    approvers: { dids: [selfCertifyingDid(APPROVER_SPKI_B64)] },
+  })
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /not an authorized approver/)
+})
+
+test("a resolver naming keys for a self-certifying DID WIDENS it: the second credential verifies", () => {
+  // Self-serve identities mint the DID from the FIRST enrolled credential and keep it as later
+  // passkeys are added to the same person. A receipt signed with the second credential must verify
+  // when the anchor maps the DID to all of the person's keys — this is the case the Core Profile
+  // ports already accept, and a commitment-overrides-resolver rule regressed it.
+  const keyDid = selfCertifyingDid(APPROVER_SPKI_B64)
+  const second = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  const secondSpki = second.publicKey.export({ format: "der", type: "spki" }).toString("base64")
+  const canonical = divPayload({ nonce: "nonce-1", actionDescription: "Wipe production database", ...ACTION })
+  const receipt: ApprovalReceipt = {
+    canonicalPayload: canonical,
+    target: TARGET,
+    actionType: ACTION.actionType,
+    actionDescription: "Wipe production database",
+    params: ACTION.params,
+    requester: REQUESTER,
+    verificationCode: verificationCode(canonical),
+    signatures: [witnessFor(canonical, second, keyDid)],
+  }
+  const r = verifyApprovalReceipt(receipt, {
+    ...ACTION,
+    nonce: "nonce-1",
+    approvers: { dids: [keyDid], resolveKey: () => [APPROVER_SPKI_B64, secondSpki] },
+  })
+  assert.equal(r.ok, true, r.ok ? undefined : r.reason)
+  assert.deepEqual(r.signers, [keyDid])
+})
+
+test("a resolver naming keys for a self-certifying DID NARROWS it: the committed-but-dropped key is refused", () => {
+  // The revocation direction: the RP deliberately maps the DID to a replacement key only, dropping
+  // the compromised credential the DID itself commits to. The commitment must NOT resurrect it —
+  // otherwise a self-certifying entry could never be narrowed, only deleted person and all.
+  const keyDid = selfCertifyingDid(APPROVER_SPKI_B64)
+  const replacement = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  const replacementSpki = replacement.publicKey.export({ format: "der", type: "spki" }).toString("base64")
+  const { receipt } = es256Receipt({ actionDescription: "Wipe production database", ...ACTION })
+  receipt.signerDid = keyDid
+
+  const r = verifyApprovalReceipt(receipt, {
+    ...ACTION,
+    nonce: "nonce-1",
+    approvers: { dids: [keyDid], resolveKey: () => [replacementSpki] },
+  })
+  assert.equal(r.ok, false, "the dropped credential must not verify just because the DID commits to it")
+})
+
+test("a pinned non-self-certifying DID without resolveKey fails closed with an explicit reason", () => {
+  const { receipt } = es256Receipt({ actionDescription: "Wipe production database", ...ACTION })
+  receipt.signerDid = "did:intyga:cfo-alice"
+  const r = verifyApprovalReceipt(receipt, {
+    ...ACTION,
+    nonce: "nonce-1",
+    approvers: { dids: ["did:intyga:cfo-alice"] },
+  })
+  assert.equal(r.ok, false)
+  assert.match(r.reason!, /provides no resolveKey/)
+})
+
+test("mixed anchor: a self-certifying DID and a resolver-mapped stable DID satisfy a 2-quorum together", () => {
+  const bob = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  const keyDid = selfCertifyingDid(APPROVER_SPKI_B64)
+  const requirement = { ...DEFAULT_REQUIREMENT, requiredApprovals: 2 }
+  const canonical = divPayload({
+    nonce: "nonce-1",
+    actionDescription: "Wipe production database",
+    ...ACTION,
+    requirement,
+  })
+  const receipt: ApprovalReceipt = {
+    canonicalPayload: canonical,
+    target: TARGET,
+    actionType: ACTION.actionType,
+    actionDescription: "Wipe production database",
+    params: ACTION.params,
+    requester: REQUESTER,
+    verificationCode: verificationCode(canonical),
+    signatures: [witnessFor(canonical, APPROVER, keyDid), witnessFor(canonical, bob, "did:intyga:human-bob")],
+  }
+  const r = verifyApprovalReceipt(receipt, {
+    ...ACTION,
+    nonce: "nonce-1",
+    approvers: {
+      dids: [keyDid, "did:intyga:human-bob"],
+      resolveKey: (did: string) =>
+        did === "did:intyga:human-bob"
+          ? bob.publicKey.export({ format: "der", type: "spki" }).toString("base64")
+          : null,
+    },
+  })
+  assert.equal(r.ok, true, r.ok ? undefined : r.reason)
+  assert.deepEqual([...r.signers!].sort(), [keyDid, "did:intyga:human-bob"].sort())
 })
 
 /** Sign the same canonical payload with an extra approver keypair. */

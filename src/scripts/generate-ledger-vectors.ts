@@ -143,6 +143,35 @@ const inclusionNegative = [
     expected: false,
   },
   {
+    // The self-pairing rule above compares STRINGS while `hashPair` decodes to bytes, and hex
+    // decoding is case-insensitive in every runtime here. So uppercasing the padding sibling makes
+    // the two unequal, the self-pairing check passes, and the identical 32 bytes still recompute the
+    // genuine root: the forgery above is revived in full. Reproduced against this exact tree.
+    // DEWP §4.4's 64-character LOWERCASE hex rule is the only thing that rejects it.
+    name: "padding-forgery-revived-by-uppercased-sibling",
+    reason:
+      "uppercase hex decodes to the same 32 bytes, so the root still recomputes, but the " +
+      "self-pairing comparison is on the string and no longer matches. Only DEWP §4.4's " +
+      "64-character lowercase hex rule refuses this path into padding",
+    leaf: C,
+    proof: forgedPath.map((s, i) => (i === 0 ? { ...s, siblingHash: s.siblingHash.toUpperCase() } : s)),
+    root: paddingRoot,
+    bounds: { index: 3, leafCount: 4 },
+    expected: false,
+  },
+  {
+    name: "uppercased-root-refused",
+    reason:
+      "the path itself is honest, so this pins the ENCODING rule rather than the tree: digests are " +
+      "64-character lowercase hex (DEWP §4.4), and a verifier that case-folds its inputs to be " +
+      "lenient — the obvious way to 'fix' this case — reopens the uppercased-sibling forgery above",
+    leaf: C,
+    proof: merkleProof(paddingTree, 2),
+    root: paddingRoot.toUpperCase(),
+    bounds: { index: 2, leafCount: 3 },
+    expected: false,
+  },
+  {
     name: "honest-unpaired-tail-still-verifies",
     reason: "index 2 of 3 IS the unpaired end, so self-pairing is legitimate there",
     leaf: C,
@@ -213,7 +242,7 @@ const signedAnchor = {
 
 const vectors = {
   generated: new Date().toISOString(),
-  note: "Cross-language DEWP ledger vectors (docs/DEWP.md). Consumed by ALL FOUR ledger verifiers: TS (@intyga/verify), Go, Rust, and Python. Regenerate ONLY on a deliberate format change.",
+  note: "Cross-language DEWP ledger vectors (docs/DEWP.md). Consumed by ALL FIVE ledger verifiers: TS (@intyga/verify), Go, Rust, Java, and Python. Regenerate ONLY on a deliberate format change.",
   // All five tags DEWP §2 enumerates. `chain` (0x04, §5.4) has no vector of its own — the checkpoint
   // chain is TS-only and the Core-Profile ports disclaim it — but listing it keeps this registry
   // from silently describing a four-tag protocol.

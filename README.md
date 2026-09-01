@@ -4,7 +4,7 @@
 
 When Intyga returns an approval, it hands you a **receipt**: the exact canonical payload the human's key signed, plus the signature and public key. This library lets your own code re-derive that payload from *your* parameters, check it byte-for-byte against what was signed, and verify the signature — entirely offline. You don't have to trust Intyga's word that the approval is real; you check the math yourself.
 
-- **Zero runtime dependencies** (`node:crypto` only). Read the whole thing — ~1,400 lines for receipt verification, ~3,400 including the ledger, anchor-quorum and evidence-bundle code.
+- **Zero runtime dependencies** (`node:crypto` only). Read the whole thing — under 2,000 lines for receipt verification, under 4,000 including the ledger, anchor-quorum and evidence-bundle code.
 - **No Intyga secret required.** Verification uses approver keys **you** resolve — never a key read out of the receipt (see [Whose key?](#whose-key-the-trust-anchor)).
 - Verifies both **WebAuthn** approvals (passkey / hardware security key — the normal path) and **raw P-256** signatures (legacy/headless signer keys), plus policy `AUTO_APPROVED` receipts.
 
@@ -47,7 +47,7 @@ agent — could generate a keypair, sign a payload over the nonce you issued and
 to run, put any string in `signerDid`, and be told a human approved. Everything would check out, because
 the signature really would verify against the key in the object.
 
-So you supply the keys. Two forms:
+So you supply the keys. Three forms:
 
 ```ts
 // A pinned allowlist. Simplest, and the identity IS the key — the receipt's signerDid is not trusted.
@@ -55,7 +55,24 @@ approvers: { publicKeys: [ALICE_SPKI_B64, BOB_SPKI_B64] }
 
 // Or a DID allowlist plus your own resolver (directory lookup, enrollment record, config map).
 approvers: { dids: [...], resolveKey: (did) => myDirectory.get(did) ?? null }
+
+// Or self-certifying DIDs alone — no resolver, no key distribution at all.
+approvers: { dids: ["did:intyga:key:tSNSCM0v6Qs…"] }
 ```
+
+**Self-certifying DIDs.** A pinned DID of the form `did:intyga:key:<base64url(sha256(key bytes))>`
+is itself a commitment to the enrolled public key: the receipt carries the key, and verification
+accepts it exactly when it hashes to the pinned DID (`selfCertifyingDid()` exports the derivation).
+**Precedence: an explicit mapping always wins.** If `resolveKey` returns keys for the DID, those
+keys are the anchor and the commitment is not consulted — that is what lets you extend the identity
+to credentials enrolled after the DID was minted, and (the direction that matters for security)
+*narrow* it away from a compromised credential by re-exporting the anchor without it. The bare
+commitment applies only when the anchor names no keys, which is what makes a plain DID list a
+complete anchor with zero key distribution. Pinned DIDs that are NOT self-certifying still require
+`resolveKey`; verification fails closed with an explicit reason otherwise. Self-certifying
+validation is currently implemented in this TypeScript verifier only — the Go, Rust, Java and
+Python ports resolve every pinned DID through their key mapping (DIV §4.4.6 marks the
+identity-committing shape OPTIONAL).
 
 **Where the key must come from.** Somewhere you control and that an attacker who can forge a receipt
 cannot also change: your deployment config, your secrets manager, your own IdP/directory, or keys you
@@ -70,7 +87,10 @@ For quorum receipts, count is enforced for you: the signed payload carries `requ
 and verification counts **distinct** approvers whose signature verifies under a key you resolved. In
 `publicKeys` mode distinctness is by key, because `signerDid` is unverified there — which means the
 quorum counts credentials rather than people: one approver whose two registered credentials are both
-listed satisfies a 2-of-N alone. For `requiredApprovals` > 1 use the DID form (DIV §4.4.6).
+listed satisfies a 2-of-N alone. The same unverified `signerDid` weakens `requesterCannotApprove`:
+in `publicKeys` mode a requester holding a listed key can evade the four-eyes exclusion simply by
+naming a different `signerDid` on its witness. For `requiredApprovals` > 1 — or whenever four-eyes
+matters — use the DID form (DIV §4.4.6).
 
 ## Expiry and replay: what this does and does not prove
 
@@ -99,8 +119,15 @@ verifyApprovalReceipt(receipt, expected, {
 ```
 
 The verifier then checks the assertion is a `webauthn.get` (not a registration), that its origin matches,
-that `authenticatorData`'s rpIdHash matches your RP ID, and that the user was present **and verified**
-(biometric/PIN). Pass `requireUserVerification: false` only if you consciously accept mere possession.
+that `authenticatorData`'s rpIdHash matches your RP ID, that the assertion was **not** produced inside a
+cross-origin frame, and that the user was present **and verified** (biometric/PIN). Pass
+`requireUserVerification: false` only if you consciously accept mere possession.
+
+The cross-origin refusal is on by default and `origin` alone cannot substitute for it: inside a
+cross-origin iframe the browser reports the *frame's* origin — the RP's own — and rpIdHash matches too,
+so a third-party embedder with `publickey-credentials-get` delegated could drive the whole ceremony
+while every other check passes. If your approval UI is legitimately framed, opt in with
+`allowCrossOrigin: true`.
 
 ## Policy auto-approvals (break-glass / pre-approval windows)
 
@@ -117,8 +144,10 @@ verifyApprovalReceipt(receipt, expected, { allowAutoApproved: true }); // → { 
 `ok: true` without `allowAutoApproved` therefore always means **a real human signature verified**.
 
 ## API
-- `verifyApprovalReceipt(receipt, { approvers, target, actionType, params, nonce, requesterDid? }, { allowAutoApproved?, allowOffline?, delegation?, expectedOrigin?, expectedRpId?, requireUserVerification?, allowExpired?, asOf?, clockSkewSeconds? })` → `{ ok, reason?, autoApproved?, signers? }` — `approvers`, `target` and `nonce` are all required and asserted from your own state, never read from the receipt
-- `canonicalIntentPayload({ target, actionType, display, params, requester, requirement, nonce, expiresAt })` → the exact signed string (DIV v1). Also exported: `canonicalOfflineIntentPayload` (DIV §5a offline approval) and `canonicalDelegationPayload`. The pre-DIV `canonicalAuthorizationPayload`/`V3` builders were removed with the v2/v3 formats (ADR 005/014); `verifyApprovalReceipt` rejects anything where `v !== 1`.
+- `verifyApprovalReceipt(receipt, { approvers, target, actionType, params, nonce, requesterDid? }, { allowAutoApproved?, allowOffline?, delegation?, expectedOrigin?, expectedRpId?, requireUserVerification?, allowCrossOrigin?, allowExpired?, asOf?, clockSkewSeconds? })` → `{ ok, reason?, autoApproved?, signers? }` — `approvers`, `target` and `nonce` are all required and asserted from your own state, never read from the receipt
+- `verifyDelegation(receipt, { approvers, target, actionType, params }, opts?)` → `{ ok, reason?, delegation? }` — checks that the ORDINARY approvers signed away their entitlement (DIV §4.4.6). The result is an input to a later `verifyApprovalReceipt` via `delegation`, never a substitute for one.
+- `verifyAgentAuthority(receipt, { approvers, target, agentDid }, opts?)` → `{ ok, reason?, authority? }` — a sealed §5b scope grant, not an approval. Revocation is authoritative online only, so treat a seal like a certificate, not a bearer token.
+- `canonicalIntentPayload({ target, actionType, display, params, requester, requirement, nonce, expiresAt })` → the exact signed string (DIV v1). Also exported: `canonicalOfflineIntentPayload` (DIV §5a offline approval), `canonicalDelegationPayload` and `canonicalAgentAuthorityPayload` (DIV §5b). The pre-DIV `canonicalAuthorizationPayload`/`V3` builders were removed with the v2/v3 formats (ADR 005/014); `verifyApprovalReceipt` rejects anything where `v !== 1`.
 - `verificationCode(canonical)` → the short `XXXX-XXXX` code shown on the approval screen
 - `verifyEcdsaP256(publicKeyB64, payload, signatureB64)` → `boolean`
 
@@ -132,13 +161,15 @@ Profile** ([`docs/DEWP.md`](../../docs/DEWP.md) §9.1) it implements single-anch
 multi-anchor quorum verification (§5.2/§5.3, including `requiredAnchors`, issuer trust and
 divergence detection), the §5.4 checkpoint continuity chain (`0x04` domain tag), proof-bundle
 parsing with the §7.1 verification levels, evidence bundles, and gapless `tenantSeq` completeness
-validation. Byte parity with the Go, Rust and Python ports is locked by the shared golden vectors
+validation. On the DIV side it is also the only port that verifies **agent-authority seals**
+(`verifyAgentAuthority`, DIV §5b) in addition to `verifyApprovalReceipt` and `verifyDelegation`.
+Byte parity with the Go, Rust, Java and Python ports is locked by the shared golden vectors
 in `packages/mcp-schemas/vectors/`.
 
 It does **not** implement NDJSON evidence streaming (§6.4), so — like every port, this one
 included — it does not claim the §9.2 **Extended Profile**. The narrower ports state their own
 limits: [`verify-go`](../verify-go/README.md), [`verify-rust`](../verify-rust/README.md),
-[`sdk-python`](../sdk-python/README.md).
+[`verify-java`](../verify-java/README.md), [`sdk-python`](../sdk-python/README.md).
 
 Requires Node ≥18 (`node:crypto`).
 

@@ -11,6 +11,7 @@ import {
   canonicalDelegationPayload,
   canonicalIntentPayload,
   canonicalOfflineIntentPayload,
+  canonicalPlatformIntentPayload,
   stableStringify,
   verificationCode,
   verifyApprovalReceipt,
@@ -25,8 +26,7 @@ import {
 
 const vectorsPath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "vectors",
+  "..", "vectors",
   "canonical-vectors.json",
 )
 
@@ -67,6 +67,20 @@ const vectors = JSON.parse(fs.readFileSync(vectorsPath, "utf8")) as {
   offlineIntentPayloads: { input: PayloadInput; expected: string }[]
   delegationPayloads: { input: PayloadInput; expected: string }[]
   agentAuthorityPayloads: { input: PayloadInput; expected: string }[]
+  platformIntentPayloads: {
+    note: string
+    cases: {
+      input: {
+        payloadHash: string
+        rpId: string
+        subjectExternalId: string
+        signedAt: string
+        expiresAt: string
+        nonce: string
+      }
+      expected: string
+    }[]
+  }
   digests: { canonical: string; digestHex: string; verificationCode: string }[]
   signerKey: { spkiB64: string }
   receipts: ReceiptCase[]
@@ -77,6 +91,8 @@ const vectors = JSON.parse(fs.readFileSync(vectorsPath, "utf8")) as {
   offlineReceipts: {
     name: string
     receipt: ApprovalReceipt
+    /** Evaluation time (DIV §5a.3 rule 3). Ignoring it makes the forward-dated case pass — the point. */
+    asOf: string
     expectOkWithOptIn: boolean
     refusedWithoutOptIn?: boolean
   }[]
@@ -85,11 +101,19 @@ const vectors = JSON.parse(fs.readFileSync(vectorsPath, "utf8")) as {
     cases: {
       name: string
       receipt: ApprovalReceipt
+      asOf: string
       expectOk: boolean
       delegatedTo?: string[]
       delegatedQuorum?: number
     }[]
   }
+}
+
+/** The committed evaluation time, refused rather than defaulted: a missing one is silent drift. */
+const asOfOf = (name: string, raw: string): Date => {
+  const at = new Date(raw)
+  assert.ok(raw && !Number.isNaN(at.getTime()), `${name}: vector carries no usable asOf`)
+  return at
 }
 
 const nonceOf = (receipt: ApprovalReceipt): string =>
@@ -186,6 +210,10 @@ describe("shared canonical vectors (committed artifact, same file the other port
         expected,
       )
     }
+    // DIV §5c — TS-only until the ports implement it (see the section's note in the vectors file).
+    for (const { input, expected } of vectors.platformIntentPayloads.cases) {
+      assert.equal(canonicalPlatformIntentPayload(input), expected)
+    }
   })
 
   it("digest fixtures match (verification code + SHA-256 of the canonical bytes)", () => {
@@ -203,6 +231,17 @@ describe("shared canonical vectors (committed artifact, same file the other port
     }
   })
 
+  it("a requiredApprovals of 0 is refused on the minimum, not passed vacuously", () => {
+    // Pinning the REASON, not just the refusal: `0 >= 0` makes DIV §5 step 7 true with nothing
+    // counted, so a verifier can refuse this receipt for the right rule or for none at all.
+    const c = vectors.receipts.find((x) => x.name === "zero-required-approvals-refused")
+    assert.ok(c, "the zero-quorum vector is missing")
+    const approvers: ApproverTrustAnchor = { publicKeys: [vectors.signerKey.spkiB64] }
+    const r = verifyApprovalReceipt(c.receipt, expectationFor(c.receipt, approvers))
+    assert.equal(r.ok, false)
+    assert.match(r.reason ?? "", /requiredApprovals must be an integer of at least 1/)
+  })
+
   it("quorum receipts count distinct approver IDENTITIES, never signature entries", () => {
     const anchor = didAnchor(vectors.quorumReceipts.approvers)
     for (const c of vectors.quorumReceipts.cases) {
@@ -215,15 +254,16 @@ describe("shared canonical vectors (committed artifact, same file the other port
     }
   })
 
-  it("offline receipts pin the opt-in refusal and the 60-minute window cap", () => {
+  it("offline receipts pin the opt-in refusal, the 60-minute cap and the forward-dating rule", () => {
     const approvers: ApproverTrustAnchor = { publicKeys: [vectors.signerKey.spkiB64] }
     for (const c of vectors.offlineReceipts) {
       const expectation = expectationFor(c.receipt, approvers)
-      const withOptIn = verifyApprovalReceipt(c.receipt, expectation, { allowOffline: true })
+      const asOf = asOfOf(c.name, c.asOf)
+      const withOptIn = verifyApprovalReceipt(c.receipt, expectation, { allowOffline: true, asOf })
       assert.equal(withOptIn.ok, c.expectOkWithOptIn, `${c.name}: ${withOptIn.reason ?? "(ok)"}`)
       if (c.refusedWithoutOptIn) {
         assert.equal(
-          verifyApprovalReceipt(c.receipt, expectation).ok,
+          verifyApprovalReceipt(c.receipt, expectation, { asOf }).ok,
           false,
           `${c.name} must be refused without the offline opt-in`,
         )
@@ -231,15 +271,34 @@ describe("shared canonical vectors (committed artifact, same file the other port
     }
   })
 
-  it("delegation receipts pin sealing quorum and the 72-hour window cap", () => {
+  it("a forward-dated offline proof is refused even under the audit override", () => {
+    // `allowExpired` re-examines a proof that WAS valid and has lapsed; it says nothing about one
+    // dated in the future, so DIV §5a.3 rule 3 is deliberately outside its reach.
+    const c = vectors.offlineReceipts.find((x) => x.name === "offline-forward-dated-refused")
+    assert.ok(c, "the forward-dated offline vector is missing")
+    const approvers: ApproverTrustAnchor = { publicKeys: [vectors.signerKey.spkiB64] }
+    const r = verifyApprovalReceipt(c.receipt, expectationFor(c.receipt, approvers), {
+      allowOffline: true,
+      allowExpired: true,
+      asOf: asOfOf(c.name, c.asOf),
+    })
+    assert.equal(r.ok, false)
+    assert.match(r.reason ?? "", /challenged in the future/)
+  })
+
+  it("delegation receipts pin sealing quorum, the 72-hour cap and the forward-dating rule", () => {
     const anchor = didAnchor(vectors.delegationReceipts.approvers)
     for (const c of vectors.delegationReceipts.cases) {
-      const r = verifyDelegation(c.receipt, {
-        approvers: anchor,
-        target: c.receipt.target ?? "",
-        actionType: c.receipt.actionType ?? "",
-        params: c.receipt.params ?? {},
-      })
+      const r = verifyDelegation(
+        c.receipt,
+        {
+          approvers: anchor,
+          target: c.receipt.target ?? "",
+          actionType: c.receipt.actionType ?? "",
+          params: c.receipt.params ?? {},
+        },
+        { asOf: asOfOf(c.name, c.asOf) },
+      )
       assert.equal(r.ok, c.expectOk, `${c.name}: ${r.reason ?? "(ok)"}`)
       if (c.expectOk) {
         assert.deepEqual(r.delegation?.delegatedTo, c.delegatedTo)

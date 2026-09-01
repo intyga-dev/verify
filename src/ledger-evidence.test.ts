@@ -505,6 +505,172 @@ test("evidence: a producer stripping checkpoint anchors cannot bypass a supplied
   )
 })
 
+// ─── Caller anchors are attributed to a checkpoint before feeding divergence ──
+//
+// A date-range export routinely spans several daily checkpoints. Passing the caller's whole flat
+// anchor list to EVERY root read a genuine anchor for checkpoint A as fatal ANCHOR DIVERGENCE while
+// evaluating checkpoint B — the exact misbinding verifyAnchorQuorum's `divergenceAnchors` doc warns
+// about, destroying the availability of sound evidence rather than its soundness.
+
+/** Two single-entry daily checkpoints, as a two-day export produces them. */
+function buildTwoCheckpointBundle(): { bundle: EvidenceBundle; rootA: string; rootB: string } {
+  const day = (seq: number, cpId: string) => {
+    const leaf = makeLeaf(seq)
+    const lh = leafHash(leaf)
+    const blockRoot = merkleRoot([lh])
+    const dailyLeaves = [hashLeaf(blockRoot)]
+    const root = merkleRoot(dailyLeaves)
+    return {
+      root,
+      checkpoint: {
+        id: cpId,
+        root,
+        anchorRef: `anchor://test/${cpId}`,
+        anchoredAt: "2026-07-15T12:00:00.000Z",
+        seqStart: String(seq),
+        seqEnd: String(seq),
+      },
+      entry: {
+        event: {
+          seq: String(seq),
+          createdAt: leaf.createdAt,
+          type: leaf.event,
+          outcome: leaf.outcome,
+          tenantSeq: leaf.tenantSeq,
+          signerDid: null,
+          sigAlg: null,
+          canonical: leaf,
+        },
+        proof: {
+          seq: String(seq),
+          leaf: lh,
+          blockIndex: "0",
+          blockRoot,
+          blockProof: merkleProof([lh], 0),
+          leafIndex: 0,
+          blockLeafCount: 1,
+          checkpointId: cpId,
+          checkpointRoot: root,
+          checkpointProof: merkleProof(dailyLeaves, 0),
+          checkpointLeafIndex: 0,
+          checkpointLeafCount: 1,
+          anchorRef: `anchor://test/${cpId}`,
+          anchored: true,
+        },
+      },
+    }
+  }
+  const a = day(1, "cp-1")
+  const b = day(2, "cp-2")
+  return {
+    rootA: a.root,
+    rootB: b.root,
+    bundle: {
+      kind: EVIDENCE_BUNDLE_KIND,
+      version: 1,
+      exportedAt: "2026-07-16T00:00:00.000Z",
+      tenant: { id: "tenant-1", name: "Test Tenant" },
+      range: { from: "2026-07-15T00:00:00.000Z", to: "2026-07-16T23:59:59.000Z" },
+      checkpoints: [a.checkpoint, b.checkpoint],
+      entries: [a.entry, b.entry],
+    },
+  }
+}
+
+test("evidence: a genuine caller anchor per checkpoint verifies a multi-day bundle (flat list)", () => {
+  const { bundle, rootA, rootB } = buildTwoCheckpointBundle()
+  const iss = makeAnchorIssuer("https://anchors.example")
+  const res = verifyEvidenceBundle(bundle, {
+    trustedRoots: [rootA, rootB],
+    anchors: [iss.anchorFor(rootA), iss.anchorFor(rootB)],
+    anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "N_OF_M" },
+    resolveAnchorKey: iss.resolveKey,
+  })
+  assert.deepEqual(
+    res.failed.filter((f) => f.reason.includes("DIVERGENCE")),
+    [],
+    "an anchor for the OTHER checkpoint in the same bundle is not divergence evidence",
+  )
+  assert.deepEqual(
+    res.roots.map((r) => r.anchorVerified),
+    [true, true],
+  )
+  assert.equal(res.ok, true, res.notes.concat(res.failed.map((f) => f.reason)).join("; "))
+  // The flat list cannot say which checkpoint each anchor was fetched for; the verdict says so.
+  assert.ok(res.notes.some((n) => /flat list/.test(n)))
+})
+
+test("evidence: caller anchors keyed by checkpoint verify a multi-day bundle with no note", () => {
+  const { bundle, rootA, rootB } = buildTwoCheckpointBundle()
+  const iss = makeAnchorIssuer("https://anchors.example")
+  const res = verifyEvidenceBundle(bundle, {
+    trustedRoots: [rootA, rootB],
+    anchors: { "cp-1": [iss.anchorFor(rootA)], [rootB]: [iss.anchorFor(rootB)] },
+    anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "N_OF_M" },
+    resolveAnchorKey: iss.resolveKey,
+  })
+  assert.equal(res.ok, true, res.notes.concat(res.failed.map((f) => f.reason)).join("; "))
+  assert.deepEqual(
+    res.roots.map((r) => r.anchorVerified),
+    [true, true],
+  )
+  // Either key works: checkpoint id for the first, the checkpoint's root for the second.
+  assert.ok(!res.notes.some((n) => /flat list|does not contain/.test(n)), res.notes.join("; "))
+})
+
+test("evidence: a keyed anchor naming a different root for ITS checkpoint is still fatal", () => {
+  // The tamper signal the mechanism exists for: the issuer's anchor for cp-1 says some other root.
+  // It must fail cp-1 specifically, while cp-2's genuine anchor still reaches quorum.
+  const { bundle, rootA, rootB } = buildTwoCheckpointBundle()
+  const iss = makeAnchorIssuer("https://anchors.example")
+  const res = verifyEvidenceBundle(bundle, {
+    trustedRoots: [rootA, rootB],
+    anchors: { "cp-1": [iss.anchorFor("a".repeat(64))], "cp-2": [iss.anchorFor(rootB)] },
+    anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "N_OF_M" },
+    resolveAnchorKey: iss.resolveKey,
+  })
+  assert.equal(res.ok, false)
+  const divergent = res.failed.filter((f) => f.reason.includes("DIVERGENCE"))
+  assert.equal(divergent.length, 1, `expected cp-1 alone to diverge, got ${JSON.stringify(res.failed)}`)
+  assert.ok(divergent[0]?.reason.includes(rootA.slice(0, 16)))
+  assert.equal(res.roots.find((r) => r.root === rootB)?.anchorVerified, true)
+})
+
+test("evidence: on a single-checkpoint bundle a caller anchor over a foreign root still diverges", () => {
+  // Unchanged behaviour: with one checkpoint there is nothing else the anchor could belong to.
+  const { bundle, dailyRoot } = buildBundle()
+  const iss = makeAnchorIssuer("https://anchors.example")
+  const res = verifyEvidenceBundle(bundle, {
+    trustedRoots: [dailyRoot],
+    anchors: [iss.anchorFor("b".repeat(64))],
+    anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "N_OF_M" },
+    resolveAnchorKey: iss.resolveKey,
+  })
+  assert.equal(res.ok, false)
+  assert.ok(
+    res.failed.some((f) => f.reason.includes("DIVERGENCE")),
+    `expected divergence, got ${JSON.stringify(res.failed)}`,
+  )
+})
+
+test("evidence: anchors keyed to a checkpoint the bundle does not contain are flagged", () => {
+  const { bundle, rootA, rootB } = buildTwoCheckpointBundle()
+  const iss = makeAnchorIssuer("https://anchors.example")
+  const res = verifyEvidenceBundle(bundle, {
+    trustedRoots: [rootA, rootB],
+    anchors: { "cp-1": [iss.anchorFor(rootA)], "cp-RENAMED": [iss.anchorFor(rootB)] },
+    anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "N_OF_M" },
+    resolveAnchorKey: iss.resolveKey,
+  })
+  // It still counts toward the quorum of the root it actually signs — the key only governs whether
+  // it may be read as divergence — but the mismatch is reported rather than silently absorbed.
+  assert.equal(res.ok, true, res.notes.concat(res.failed.map((f) => f.reason)).join("; "))
+  assert.ok(
+    res.notes.some((n) => /does not contain/.test(n)),
+    `expected the unattributed-key note, got: ${res.notes.join("; ")}`,
+  )
+})
+
 // DEWP §9.2 Extended Profile requires offline DIV signature verification alongside evidence-bundle
 // verification. This path checked commitment, content, display and anchors but never looked at the
 // signature material the entries carry, so an auditor running a date-range export learned nothing

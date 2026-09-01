@@ -16,7 +16,11 @@ export interface SignedAnchor {
   algorithm: "ES256" | "Ed25519" | "RSA-PSS"
   keyId: string
   signature: string // base64, over the raw 32-byte anchorDigest. EMPTY for external anchors.
-  /** SELF | REKOR | RFC3161 | WEBHOOK. Decides WHICH verification applies; absent ⇒ treated as DEWP. */
+  /**
+   * SELF | REKOR | RFC3161 | WEBHOOK. Decides WHICH verification applies; absent ⇒ treated as
+   * DEWP-signed (SELF). WEBHOOK and unrecognized kinds never count toward quorum (DEWP §5.2.1) —
+   * this verifier has no evidence verifier for them.
+   */
   kind?: string
   /** The external log's own attestation, base64 (Rekor: entry + SET + inclusion proof). */
   evidence?: string | null
@@ -217,6 +221,11 @@ export function verifyAnchorQuorum(
       rfc3161Present++
       continue
     }
+    // DEWP §5.2.1: a WEBHOOK receipt is deployment-specific and MUST NOT count toward quorum
+    // unless the deployment has an explicit verifier for its evidence — this verifier has none.
+    // Unrecognized kinds fail closed the same way: only an absent kind (the legacy DEWP-signed
+    // form) or an explicit SELF takes the signature branch below.
+    if (a.kind != null && a.kind !== "SELF") continue
     const key = resolveKey(a)
     if (key && verifyAnchorSignature(a, key)) verifiedIssuers.add(a.issuer)
   }

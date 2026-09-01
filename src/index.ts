@@ -276,6 +276,13 @@ export const DIV_DELEGATION_TYPE = "div-delegation"
 export const DIV_AGENT_AUTHORITY_TYPE = "div-agent-authority"
 
 /**
+ * Platform hash-only intent (DIV §5c): an integrating platform's subject signs the DIGEST of the
+ * platform's own canonical payload. `verifyApprovalReceipt` refuses it outright;
+ * `verifyPlatformReceipt` is the only door. Mirrors mcp-schemas.
+ */
+export const DIV_PLATFORM_INTENT_TYPE = "div-platform-intent"
+
+/**
  * Hard ceiling on an offline proof's validity window, enforced at verification and not only at mint.
  * An offline proof is created and redeemed within one incident, so the window is minutes — it exists
  * to bound a proof whose `expiresAt` was minted over-long, which is otherwise indistinguishable at
@@ -534,6 +541,33 @@ export function canonicalAgentAuthorityPayload(input: {
   })
 }
 
+/**
+ * Canonical PLATFORM HASH-ONLY INTENT payload (DIV §5c.2) — byte-parity with mcp-schemas' copy is
+ * enforced by canonical-parity.test.ts. This mirror REPRODUCES bytes and does not validate the
+ * digest grammar (producers normalize, verifiers reproduce); `verifyPlatformReceipt` enforces the
+ * lowercase-hex rule on the RELYING PARTY's expected value instead.
+ */
+export function canonicalPlatformIntentPayload(input: {
+  payloadHash: string
+  rpId: string
+  subjectExternalId: string
+  signedAt: string
+  expiresAt: string
+  nonce: string
+}): string {
+  return stableStringify({
+    v: DIV_VERSION,
+    type: DIV_PLATFORM_INTENT_TYPE,
+    hashAlg: "SHA-256",
+    payloadHash: input.payloadHash,
+    rpId: input.rpId,
+    subject: { externalId: input.subjectExternalId },
+    signedAt: input.signedAt,
+    expiresAt: input.expiresAt,
+    nonce: input.nonce,
+  })
+}
+
 /** Short verification code (first 8 hex of SHA-256 of the canonical payload), grouped XXXX-XXXX. */
 export function verificationCode(canonical: string): string {
   const hex = crypto
@@ -600,6 +634,11 @@ function parseVersion(canonical: string): number {
 /** Default clock-skew tolerance for expiry validation (DIV §6.2 RECOMMENDED ±30s). */
 export const DEFAULT_CLOCK_SKEW_SECONDS = 30
 
+/** DIV §4.3.2: a signed quorum is an integer ≥ 1. Zero passes §5 step 7's "at least" test vacuously. */
+const isValidQuorum = (n: number): boolean => Number.isInteger(n) && n >= 1
+const INVALID_QUORUM_REASON =
+  "signed requirement.requiredApprovals must be an integer of at least 1 (DIV §4.3.2)"
+
 /**
  * The approver identities/keys YOU trust, resolved from your own key-management policy.
  *
@@ -623,14 +662,51 @@ export const DEFAULT_CLOCK_SKEW_SECONDS = 30
  * one or more registered authenticators, and any of them is legitimately theirs; returning them all
  * keeps the identity intact instead of forcing callers to flatten everything into `publicKeys` mode
  * and lose the DID binding. Every key returned for a DID counts as that ONE approver.
+ *
+ * SELF-CERTIFYING DIDs need no resolver. A pinned DID of the form `did:intyga:key:<fingerprint>`
+ * (see {@link SELF_CERTIFYING_DID_PREFIX}) is itself a commitment to the enrolled public key, so the
+ * witness-carried key can be validated against the DID by hashing — no key distribution at all.
+ * `resolveKey` is therefore optional: it is required only for pinned DIDs that are NOT
+ * self-certifying, and verification fails closed with an explicit reason when such a DID is
+ * encountered without one.
+ *
+ * PRECEDENCE: when `resolveKey` DOES return keys for a self-certifying DID, those keys are the
+ * anchor and the hash commitment is not consulted. That is what lets a deployment widen the DID to
+ * the person's later-enrolled credentials, and — the security-relevant direction — NARROW it: a
+ * compromised credential is dropped by mapping the DID to the remaining keys, which a
+ * commitment-always-wins rule would silently keep trusting.
  */
 export type ApproverTrustAnchor =
   | { publicKeys: string[]; dids?: undefined; resolveKey?: undefined }
   | {
       dids: string[]
-      resolveKey: (did: string) => string | string[] | null
+      resolveKey?: (did: string) => string | string[] | null
       publicKeys?: undefined
     }
+
+/**
+ * Prefix of a self-certifying Intyga DID: `did:intyga:key:<base64url(sha256(publicKey bytes))>`.
+ * The identifier IS a commitment to the enrolled public key (the issuing gateway's derivation), so a
+ * DID of this form can serve as a complete trust anchor entry on its own. The commitment is to the
+ * EXACT enrolled key bytes — an approver signing with a different credential (say, a browser passkey
+ * registered later) does not match it, and needs a `resolveKey` mapping under a stable DID instead.
+ */
+export const SELF_CERTIFYING_DID_PREFIX = "did:intyga:key:"
+
+/**
+ * Derive the self-certifying DID for a public key (base64; the DECODED bytes are hashed, so padded
+ * and unpadded encodings of the same key derive the same DID). Mirrors the gateway's derivation.
+ */
+export function selfCertifyingDid(publicKeyB64: string): string {
+  const digest = crypto
+    .createHash("sha256")
+    .update(Buffer.from(publicKeyB64, "base64"))
+    .digest("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "")
+  return `${SELF_CERTIFYING_DID_PREFIX}${digest}`
+}
 
 /** What you assert the receipt must say. `target`, `nonce` and `approvers` are required. */
 export interface ReceiptExpectation {
@@ -707,9 +783,15 @@ export interface VerifyReceiptOptions {
    * since expired. `asOf` overrides "now" for deterministic/replayed checks.
    */
   allowExpired?: boolean
-  /** Wall-clock instant to evaluate expiry against. Defaults to `new Date()`. */
+  /**
+   * Wall-clock instant to evaluate time against. Defaults to `new Date()`.
+   *
+   * Also the reference point for the forward-dating rule (DIV §5a.3 rule 3), which — unlike expiry —
+   * `allowExpired` does NOT waive: that option re-examines a proof that was valid and has lapsed,
+   * which says nothing about accepting one dated in the future.
+   */
   asOf?: Date
-  /** Clock-skew tolerance in seconds for expiry validation. Defaults to DEFAULT_CLOCK_SKEW_SECONDS. */
+  /** Clock-skew tolerance in seconds for expiry and forward-dating. Defaults to DEFAULT_CLOCK_SKEW_SECONDS. */
   clockSkewSeconds?: number
 }
 
@@ -721,9 +803,14 @@ const AUTH_DATA_FLAG_UV = 0x04 // User Verified
  * The keys we are willing to accept this witness under, drawn ENTIRELY from the caller's trust anchor.
  *
  * `witness.signerPublicKey` is never used as a verification key — only, in DID mode, as a claim about
- * WHICH approver is speaking, which we then answer with our own resolver. Note we do not compare the
- * presented key to the trusted one: there is nothing to gain (a mismatched key simply fails to verify)
- * and byte-equality is actively wrong for COSE, where the same P-256 key has many valid encodings.
+ * WHICH approver is speaking, which we then answer with our own resolver. The single exception is a
+ * pinned SELF-CERTIFYING DID (`did:intyga:key:…`) for which the anchor names NO keys: there the
+ * carried key is first PROVEN to be the pinned key by hashing it against the DID's fingerprint — the
+ * trust still comes from the pinned identifier, never from the receipt. An anchor that DOES name
+ * keys for the DID takes precedence over the commitment (see the precedence note below). Note we do
+ * not otherwise compare the presented key to the trusted one: there is nothing to gain (a mismatched
+ * key simply fails to verify) and byte-equality is actively wrong for COSE, where the same P-256 key
+ * has many valid encodings.
  *
  * Each candidate is tagged with the identity that key represents, so quorum counts distinct APPROVERS.
  * In `publicKeys` mode the identity is the key itself: the receipt's `signerDid` is an unverified
@@ -756,13 +843,42 @@ function candidateKeys(
   if (restrictTo && !restrictTo.includes(witness.signerDid)) {
     return { reason: `signer ${witness.signerDid} is not named in the delegation` }
   }
-  const resolved = anchor.resolveKey(witness.signerDid)
-  if (!resolved) return { reason: `no trusted key could be resolved for ${witness.signerDid}` }
+  // PRECEDENCE: the anchor's own key mapping always wins, self-certifying DID or not. The RP's
+  // explicit pin must be able to both WIDEN what a key-derived DID would accept (the person's
+  // later-enrolled credentials live under the same DID) and NARROW it (a compromised credential is
+  // dropped by re-exporting the anchor without it) — a commitment that overrode the mapping could
+  // do neither, and the four Core Profile ports resolve mapped keys the same way.
+  const resolved = anchor.resolveKey ? anchor.resolveKey(witness.signerDid) : null
   // One DID may legitimately hold several keys; all of them identify the SAME approver, so quorum
   // still counts one. Flattening them into separate identities would let one person meet an N-of-M.
-  const keys = (Array.isArray(resolved) ? resolved : [resolved]).filter((k) => Boolean(k))
-  if (keys.length === 0) return { reason: `no trusted key could be resolved for ${witness.signerDid}` }
-  return { keys: keys.map((key) => ({ key, identity: witness.signerDid })) }
+  const keys = (Array.isArray(resolved) ? resolved : resolved ? [resolved] : []).filter((k) => Boolean(k))
+  if (keys.length > 0) {
+    return { keys: keys.map((key) => ({ key, identity: witness.signerDid })) }
+  }
+  // Self-certifying DID fallback: when the anchor names no keys, the pinned identifier itself is
+  // the commitment — the carried key is trustworthy exactly when it hashes to the DID. This is what
+  // makes a bare DID list a complete anchor with no key distribution at all. Strict by design: the
+  // commitment is to the exact enrolled key bytes.
+  if (witness.signerDid.startsWith(SELF_CERTIFYING_DID_PREFIX)) {
+    if (!witness.signerPublicKey) {
+      return {
+        reason: `witness carries no public key to validate against self-certifying ${witness.signerDid}`,
+      }
+    }
+    if (selfCertifyingDid(witness.signerPublicKey) !== witness.signerDid) {
+      return {
+        reason:
+          "witness public key does not hash to the pinned self-certifying DID (did:intyga:key), and the trust anchor names no keys for it",
+      }
+    }
+    return { keys: [{ key: witness.signerPublicKey, identity: witness.signerDid }] }
+  }
+  if (!anchor.resolveKey) {
+    return {
+      reason: `${witness.signerDid} is not self-certifying (${SELF_CERTIFYING_DID_PREFIX}…) and the trust anchor provides no resolveKey`,
+    }
+  }
+  return { reason: `no trusted key could be resolved for ${witness.signerDid}` }
 }
 
 /** Verify one witness signature over the canonical payload, using an already-TRUSTED key. */
@@ -932,6 +1048,14 @@ export function verifyApprovalReceipt(
       reason:
         "this is an agent authority, which authorizes no action on its own — verify it with verifyAgentAuthority; execution still requires an approval receipt",
     }
+  // A platform hash-only intent (DIV §5c) attests a DIGEST for an integrating platform's subject —
+  // different signed shape, different display authority, different trust anchor. Refused here with
+  // its own message so an integrator holding one is pointed at the right door.
+  if (payloadType === DIV_PLATFORM_INTENT_TYPE)
+    return {
+      ok: false,
+      reason: "this is a platform hash-only intent (DIV §5c) — verify it with verifyPlatformReceipt",
+    }
   const offline = payloadType === DIV_OFFLINE_INTENT_TYPE
   if (!offline && payloadType !== DIV_INTENT_TYPE)
     return { ok: false, reason: "payload is not a div-intent-verification" }
@@ -982,6 +1106,10 @@ export function verifyApprovalReceipt(
   )
   if (!requirement || typeof requirement.requiredApprovals !== "number")
     return { ok: false, reason: "receipt payload is missing the signed approval requirement" }
+  // DIV §4.3.2: an integer ≥ 1. Stated as its own refusal rather than clamped silently, because
+  // §5 step 7 rejects unless the counted identities are AT LEAST this number — 0 is satisfied by
+  // counting nothing, so an unenforced minimum attests an envelope with no valid witness signature.
+  if (!isValidQuorum(requirement.requiredApprovals)) return { ok: false, reason: INVALID_QUORUM_REASON }
   const signerClass = parseSignerClass(requirement)
   if (!signerClass.ok) return { ok: false, reason: signerClass.reason }
 
@@ -1009,6 +1137,15 @@ export function verifyApprovalReceipt(
         reason: `offline window is ${windowMinutes.toFixed(1)} minutes, over the ${MAX_OFFLINE_WINDOW_MINUTES}-minute maximum`,
       }
     if (windowMinutes < 0) return { ok: false, reason: "offline proof expires before it was challenged" }
+    // The cap above bounds the window's WIDTH; this bounds its POSITION (DIV §5a.3 rule 3). Without
+    // it a proof challenged for a date years out, with a compliant 60-minute window, verifies today
+    // and keeps verifying until that date — the pre-signed bearer capability §5a.1 rejects. NOT
+    // gated on `allowExpired`: that override re-examines a proof that WAS valid and has lapsed, and
+    // says nothing about one dated in the future.
+    const nowMs = (opts.asOf ?? new Date()).getTime()
+    const skewMs = (opts.clockSkewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS) * 1000
+    if (challengedMs > nowMs + skewMs)
+      return { ok: false, reason: "offline proof is challenged in the future (DIV §5a.3)" }
 
     // A hardware-key policy CANNOT be satisfied offline (DIV §5a.3 step 4, §5a.8). WebAuthn needs a
     // secure context and an RP ID that an offline signing surface will not match, so an offline
@@ -1188,8 +1325,9 @@ export function verifyApprovalReceipt(
 
   // Under a delegation the quorum is the DELEGATED one. It was already checked to equal the offline
   // payload's signed `requiredApprovals`, so this is the same number by a different route — stated
-  // explicitly so the substitution is visible at the point it takes effect.
-  const required = Math.max(1, delegatedQuorum ?? requirement.requiredApprovals)
+  // explicitly so the substitution is visible at the point it takes effect. Both numbers were
+  // refused above unless they are integers ≥ 1, so no floor is applied here.
+  const required = delegatedQuorum ?? requirement.requiredApprovals
   if (verifiedSigners.size < required) {
     // Report the first few reasons only. Folding every failure into one string is what turned a long
     // witness list into a megabyte of error text; the leading reasons are the diagnostic ones anyway.
@@ -1205,6 +1343,200 @@ export function verifyApprovalReceipt(
   // Go's type even documents itself as mirroring this field. It is a RESULT, never signed bytes, so
   // ordering cannot affect a verdict — but a caller that logs or diffs it should not see four
   // different answers depending on which SDK produced them.
+  return { ok: true, signers: [...verifiedSigners].sort() }
+}
+
+/** A platform hash-only receipt (DIV §5c) as issued by the gateway's platform plane. */
+export interface PlatformReceipt {
+  /** The exact bytes the subject's passkey signed (the §5c.2 payload). */
+  canonicalPayload: string
+  /** Display copies only — verification reconstructs from the RELYING PARTY's own values. */
+  payloadHash?: string | null
+  rpId?: string | null
+  subject?: { externalId?: string | null } | null
+  signedAt?: string | null
+  expiresAt?: string | null
+  nonce?: string | null
+  signatures?: ApprovalWitness[] | null
+  signerDid?: string | null
+  signerPublicKey?: string | null
+  signature?: string | null
+  sigAlg?: string | null
+  authenticatorData?: string | null
+  clientDataJSON?: string | null
+  verificationCode?: string
+}
+
+export interface PlatformReceiptExpectation {
+  /** REQUIRED. The subject keys you trust — same modes as ReceiptExpectation.approvers. */
+  approvers: ApproverTrustAnchor
+  /**
+   * REQUIRED. The SHA-256 (lowercase hex) YOU recompute from your own copy of the canonical
+   * payload — never read from the receipt. This is the §5c data-minimization anchor: the payload
+   * itself never traveled, so this digest is the entire content binding.
+   */
+  payloadHash: string
+  /** REQUIRED. YOUR registered WebAuthn RP ID — used for the signed-bytes binding AND as the
+   *  assertion's expected rpIdHash. Asserted from your own configuration, never the receipt. */
+  rpId: string
+  /** REQUIRED. The signing challenge nonce you are redeeming. */
+  nonce: string
+  /** Optionally assert WHICH of your subjects signed. */
+  subjectExternalId?: string
+}
+
+/**
+ * Verify a PLATFORM HASH-ONLY receipt (DIV §5c.3). Deliberately a separate function:
+ * `verifyApprovalReceipt` refuses the `div-platform-intent` type outright, and this function
+ * refuses every other type, so neither proof kind can ever pass through the other's door.
+ *
+ * Every witness must be a WebAuthn assertion (this plane's subjects only ever sign with enrolled
+ * passkeys on the platform's registered origin), so `opts.expectedOrigin` is REQUIRED and the RP ID
+ * expectation comes from `expected.rpId`. `AUTO_APPROVED` is refused with no override — policy
+ * pre-approval does not exist on this plane.
+ */
+export function verifyPlatformReceipt(
+  receipt: PlatformReceipt,
+  expected: PlatformReceiptExpectation,
+  opts: VerifyReceiptOptions = {},
+): { ok: boolean; reason?: string; signers?: string[] } {
+  const version = parseVersion(receipt.canonicalPayload)
+  if (version !== DIV_VERSION)
+    return { ok: false, reason: `unsupported DIV payload version (${version || "unparseable"})` }
+  const payloadType = parseField(receipt.canonicalPayload, "type")
+  if (payloadType !== DIV_PLATFORM_INTENT_TYPE) {
+    return {
+      ok: false,
+      reason:
+        payloadType === DIV_INTENT_TYPE || payloadType === DIV_OFFLINE_INTENT_TYPE
+          ? "this is an ordinary approval receipt — verify it with verifyApprovalReceipt"
+          : "payload is not a div-platform-intent",
+    }
+  }
+
+  if (parseNonce(receipt.canonicalPayload) !== expected.nonce)
+    return { ok: false, reason: "receipt is for a different challenge" }
+
+  if (!expected.approvers)
+    return {
+      ok: false,
+      reason:
+        "expected.approvers is required — the subject's key MUST come from your own trust policy, never from the receipt (DIV Invariant 3)",
+    }
+  // Refused rather than case-folded: two spellings of one digest would be two different signed byte
+  // strings (the Merkle hex-case lesson, DIV §5c.2).
+  if (typeof expected.payloadHash !== "string" || !/^[0-9a-f]{64}$/.test(expected.payloadHash))
+    return {
+      ok: false,
+      reason: "expected.payloadHash must be the 64-character lowercase hex SHA-256 you recomputed yourself",
+    }
+  if (typeof expected.rpId !== "string" || expected.rpId.length === 0)
+    return {
+      ok: false,
+      reason:
+        "expected.rpId is required — it must be YOUR registered RP ID, asserted independently of the receipt",
+    }
+  // One rpId, used twice (signed bytes + rpIdHash). A conflicting override would silently verify
+  // the assertion against a different RP than the bytes name.
+  if (opts.expectedRpId !== undefined && opts.expectedRpId !== expected.rpId)
+    return { ok: false, reason: "opts.expectedRpId conflicts with expected.rpId — pass the RP ID once" }
+  const effOpts: VerifyReceiptOptions = { ...opts, expectedRpId: expected.rpId }
+
+  const signedAt = parseField<string>(receipt.canonicalPayload, "signedAt")
+  const expiresAt = parseField<string>(receipt.canonicalPayload, "expiresAt")
+  if (typeof signedAt !== "string" || signedAt.length === 0)
+    return { ok: false, reason: "receipt missing signedAt" }
+  if (typeof expiresAt !== "string" || expiresAt.length === 0)
+    return { ok: false, reason: "receipt missing expiresAt" }
+  const subject = parseField<{ externalId?: unknown }>(receipt.canonicalPayload, "subject")
+  const subjectExternalId = subject && typeof subject.externalId === "string" ? subject.externalId : null
+  if (!subjectExternalId) return { ok: false, reason: "receipt missing subject.externalId" }
+  if (expected.subjectExternalId !== undefined && subjectExternalId !== expected.subjectExternalId)
+    return { ok: false, reason: "receipt was signed by a different subject" }
+
+  // Local Payload Reconstruction: digest, RP and nonce from YOUR state; signedAt/expiresAt/subject
+  // from the signed bytes (a forged value changes the string and fails the comparison).
+  const recomputed = canonicalPlatformIntentPayload({
+    payloadHash: expected.payloadHash,
+    rpId: expected.rpId,
+    subjectExternalId,
+    signedAt,
+    expiresAt,
+    nonce: expected.nonce,
+  })
+  if (recomputed !== receipt.canonicalPayload)
+    return { ok: false, reason: "payloadHash/rpId do not match what was signed" }
+
+  // Timestamp sanity, then expiry — fail closed (DIV §6.2), opt out only for audit re-verification.
+  const signedMs = Date.parse(signedAt)
+  const expiryMs = Date.parse(expiresAt)
+  if (Number.isNaN(signedMs)) return { ok: false, reason: "signedAt is not a valid RFC3339 timestamp" }
+  if (Number.isNaN(expiryMs)) return { ok: false, reason: "expiresAt is not a valid RFC3339 timestamp" }
+  if (expiryMs < signedMs) return { ok: false, reason: "receipt expires before it was signed" }
+  const nowMs = (opts.asOf ?? new Date()).getTime()
+  const skewMs = (opts.clockSkewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS) * 1000
+  // Position bound, like the offline rule (§5a.3 rule 3): a challenge frozen in the future was not
+  // live now, whatever its window. Not gated on allowExpired, which only re-examines lapsed proofs.
+  if (signedMs > nowMs + skewMs) return { ok: false, reason: "receipt is signed in the future (DIV §5c.3)" }
+  if (!opts.allowExpired && nowMs > expiryMs + skewMs)
+    return {
+      ok: false,
+      reason: "proof has expired (pass { allowExpired: true } for audit re-verification)",
+    }
+
+  // No override exists on purpose: there is no policy pre-approval on this plane, so an unsigned
+  // platform receipt is a contradiction, not a configuration.
+  if (receipt.sigAlg === "AUTO_APPROVED")
+    return {
+      ok: false,
+      reason: "a platform receipt cannot be auto-approved — there is no signature to verify",
+    }
+
+  const witnesses = witnessesOf(receipt as ApprovalReceipt)
+  if (witnesses.length === 0) return { ok: false, reason: "receipt missing signature material" }
+  if (witnesses.length > MAX_WITNESSES)
+    return {
+      ok: false,
+      reason: `receipt carries ${witnesses.length} witnesses, above the ${MAX_WITNESSES} this verifier will process`,
+    }
+
+  const verifiedSigners = new Set<string>()
+  const failures: string[] = []
+  for (const witness of witnesses) {
+    // §5c.3: every witness is a WebAuthn assertion. A bare-key signature has no origin/RP binding,
+    // which is the entire trust boundary of this plane — refuse it rather than verify less.
+    if (witness.sigAlg !== "WEBAUTHN") {
+      failures.push(`signer ${witness.signerDid} used a bare key; platform receipts are WebAuthn-only`)
+      continue
+    }
+    const candidates = candidateKeys(expected.approvers, witness)
+    if ("reason" in candidates) {
+      failures.push(candidates.reason)
+      continue
+    }
+    let matched: string | null = null
+    let lastReason = "signature does not verify against any trusted subject key"
+    for (const candidate of candidates.keys) {
+      const attempt = verifyWitness(witness, candidate.key, receipt.canonicalPayload, effOpts)
+      if (attempt.ok) {
+        matched = candidate.identity
+        break
+      }
+      lastReason = attempt.reason
+    }
+    if (matched === null) {
+      failures.push(lastReason)
+      continue
+    }
+    verifiedSigners.add(matched)
+  }
+
+  if (verifiedSigners.size < 1) {
+    const shown = failures.slice(0, MAX_REPORTED_FAILURES)
+    const elided = failures.length - shown.length
+    const detail = shown.length > 0 ? ` (${shown.join("; ")}${elided > 0 ? `; +${elided} more` : ""})` : ""
+    return { ok: false, reason: `no valid subject signature${detail}` }
+  }
   return { ok: true, signers: [...verifiedSigners].sort() }
 }
 
@@ -1256,6 +1588,16 @@ export function verifyDelegation(
   if (parseField(receipt.canonicalPayload, "type") !== DIV_DELEGATION_TYPE)
     return { ok: false, reason: "payload is not a div-delegation" }
 
+  // DIV §4.4.6: a Delegation REQUIRES an identity-associating anchor and MUST be refused under a
+  // key-set anchor — at seal verification too, not only when delegatedTo is enforced at use time.
+  // The sealing quorum names PEOPLE; in publicKeys mode it would count credentials instead.
+  if (expected.approvers && "publicKeys" in expected.approvers && expected.approvers.publicKeys)
+    return {
+      ok: false,
+      reason:
+        "a delegation requires a DID-mode trust anchor ({ dids, resolveKey }); a key-set anchor cannot associate identities (DIV §4.4.6)",
+    }
+
   const delegatedTo = parseField<unknown>(receipt.canonicalPayload, "delegatedTo")
   const delegatedQuorum = parseField<unknown>(receipt.canonicalPayload, "delegatedQuorum")
   if (!Array.isArray(delegatedTo) || delegatedTo.some((d) => typeof d !== "string" || d.length === 0))
@@ -1288,6 +1630,13 @@ export function verifyDelegation(
       ok: false,
       reason: `delegation window is ${windowHours.toFixed(1)} hours, over the ${MAX_DELEGATION_WINDOW_HOURS}-hour maximum`,
     }
+  // Position, not just width (DIV §5a.6 step 1, mirroring §5a.3 rule 3). A forward-dated `sealedAt`
+  // slides the 72-hour window arbitrarily far out, and §5a.8 names that cap as Delegation's ONLY
+  // mitigation. Unconditional, like the offline mirror: `allowExpired` does not reach it.
+  const nowMs = (opts.asOf ?? new Date()).getTime()
+  const skewMs = (opts.clockSkewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS) * 1000
+  if (sealedMs > nowMs + skewMs)
+    return { ok: false, reason: "delegation is sealed in the future (DIV §5a.6)" }
 
   // Reconstruct and check the signature by delegating to the ordinary verifier. Building the expected
   // bytes here and comparing them ourselves would be a second implementation of the check that already
@@ -1302,6 +1651,7 @@ export function verifyDelegation(
   )
   if (!requirement || typeof requirement.requiredApprovals !== "number")
     return { ok: false, reason: "delegation payload is missing the signed approval requirement" }
+  if (!isValidQuorum(requirement.requiredApprovals)) return { ok: false, reason: INVALID_QUORUM_REASON }
   const signerClass = parseSignerClass(requirement)
   if (!signerClass.ok) return { ok: false, reason: signerClass.reason }
   if (typeof expected.target !== "string" || expected.target.length === 0)
@@ -1347,8 +1697,6 @@ export function verifyDelegation(
   // Expiry, then the signatures and quorum. `allowExpired` is honoured for forensic re-verification,
   // exactly as on the approval path.
   if (!opts.allowExpired) {
-    const nowMs = (opts.asOf ?? new Date()).getTime()
-    const skewMs = (opts.clockSkewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS) * 1000
     if (nowMs > expiryMs + skewMs)
       return {
         ok: false,
@@ -1410,7 +1758,7 @@ export function verifyDelegation(
     verifiedSigners.add(matched)
   }
 
-  const required = Math.max(1, requirement.requiredApprovals)
+  const required = requirement.requiredApprovals
   if (verifiedSigners.size < required) {
     // Folded like the approval path: an attacker-shaped witness list must not be able to inflate the
     // reason string (the 1.16 MB error the approval path once produced).
@@ -1445,7 +1793,12 @@ export interface VerifiedAgentAuthority {
   /** The agent the authority is ABOUT — from the signed bytes, asserted by the caller. */
   agentDid: string
   target: string
-  /** The signed scope, deduplicated. Substring patterns over actionType+description; "*" = all. */
+  /**
+   * The signed scope, deduplicated. Case-insensitive substring patterns over the machine
+   * `actionType` ONLY — deliberately NOT the human-readable description, which is authored by the
+   * agent being bounded and would let an out-of-scope request cover itself by quoting a pattern
+   * (DIV §5b.2). "*" = all.
+   */
   actionPatterns: string[]
   /** The authority's OWN nonce — for the audit trail, never for authorization. */
   nonce: string
@@ -1510,6 +1863,11 @@ export function verifyAgentAuthority(
   // APPROVAL and cannot be revoked at an offline relying party. An authority authorizes nothing and
   // is enforced (and revoked) online, so its window is deployment policy, not a verifier rule.
   if (expiryMs < sealedMs) return { ok: false, reason: "authority expires before it was sealed" }
+  // The position rule still applies (DIV §5b.2): §5b.3's evidence claim is that the grant was live
+  // at the evaluation time, and a seal dated after it was not. Unconditional, as in §5a.3 rule 3.
+  const nowMs = (opts.asOf ?? new Date()).getTime()
+  const skewMs = (opts.clockSkewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS) * 1000
+  if (sealedMs > nowMs + skewMs) return { ok: false, reason: "authority is sealed in the future (DIV §5b.2)" }
 
   const nonce = parseNonce(receipt.canonicalPayload)
   if (!receipt.requester) return { ok: false, reason: "authority missing requester" }
@@ -1519,6 +1877,7 @@ export function verifyAgentAuthority(
   )
   if (!requirement || typeof requirement.requiredApprovals !== "number")
     return { ok: false, reason: "authority payload is missing the signed approval requirement" }
+  if (!isValidQuorum(requirement.requiredApprovals)) return { ok: false, reason: INVALID_QUORUM_REASON }
   const signerClass = parseSignerClass(requirement)
   if (!signerClass.ok) return { ok: false, reason: signerClass.reason }
   if (typeof expected.target !== "string" || expected.target.length === 0)
@@ -1567,8 +1926,6 @@ export function verifyAgentAuthority(
     return { ok: false, reason: "target/agent/actionPatterns do not match what was sealed" }
 
   if (!opts.allowExpired) {
-    const nowMs = (opts.asOf ?? new Date()).getTime()
-    const skewMs = (opts.clockSkewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS) * 1000
     if (nowMs > expiryMs + skewMs)
       return {
         ok: false,
@@ -1625,7 +1982,7 @@ export function verifyAgentAuthority(
     verifiedSigners.add(matched)
   }
 
-  const required = Math.max(1, requirement.requiredApprovals)
+  const required = requirement.requiredApprovals
   if (verifiedSigners.size < required) {
     const shown = failures.slice(0, MAX_REPORTED_FAILURES)
     const elided = failures.length - shown.length
@@ -1677,6 +2034,7 @@ export {
 } from "./ledger-bundle.js"
 export {
   EVIDENCE_BUNDLE_KIND,
+  type EvidenceAnchorSet,
   type EvidenceBundle,
   type EvidenceEntry,
   type EvidenceVerification,

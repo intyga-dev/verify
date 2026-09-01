@@ -429,6 +429,56 @@ test("legitimate duplicate-last padding still verifies (odd tree, last leaf)", (
   }
 })
 
+// ─── Hex case-folding revival of the padding forgery (Aug 2026 spec audit) ───
+// The padding check above compares `step.siblingHash === node` as STRINGS, but `hashPair` decodes
+// with `Buffer.from(s, "hex")`, which accepts uppercase and silently truncates at the first non-hex
+// character. Uppercasing the sibling therefore made `selfPaired` false while hashing to the SAME 32
+// bytes — the forgery recomputed the genuine root and verified. Go, Rust, Python and Java already
+// gated on canonical hex; the reference implementation was the only port that accepted it.
+
+test("padding forgery is not revived by uppercasing the sibling hash", () => {
+  const leaves = ["a", "b", "c"].map((x) => hashLeaf(x))
+  const root = merkleRoot(leaves)
+  const forged = merkleProof([...leaves, leaves[2]!], 3).map((s, i) =>
+    i === 0 ? { ...s, siblingHash: s.siblingHash.toUpperCase() } : s,
+  )
+  assert.equal(
+    verifyMerkleProof(leaves[2]!, forged, root, { index: 3, leafCount: 4 }),
+    false,
+    "an uppercased sibling must not slip past the self-pairing check",
+  )
+})
+
+test("verifyMerkleProof requires canonical 64-char lowercase hex everywhere", () => {
+  const leaves = ["a", "b", "c", "d"].map((x) => hashLeaf(x))
+  const root = merkleRoot(leaves)
+  const honest = merkleProof(leaves, 1)
+  const bounds = { index: 1, leafCount: 4 }
+  assert.equal(verifyMerkleProof(leaves[1]!, honest, root, bounds), true, "baseline honest proof")
+
+  assert.equal(verifyMerkleProof(leaves[1]!, honest, root.toUpperCase(), bounds), false, "uppercase root")
+  assert.equal(verifyMerkleProof(leaves[1]!.toUpperCase(), honest, root, bounds), false, "uppercase leaf")
+  assert.equal(
+    verifyMerkleProof(
+      leaves[1]!,
+      honest.map((s) => ({ ...s, siblingHash: s.siblingHash.toUpperCase() })),
+      root,
+      bounds,
+    ),
+    false,
+    "uppercase siblings",
+  )
+  // Truncating decode: "zz" decodes to an EMPTY buffer rather than failing, so a garbage sibling
+  // would otherwise hash as if it were absent.
+  for (const bad of ["", "zz", "abc", `${leaves[0]!}00`]) {
+    assert.equal(
+      verifyMerkleProof(leaves[1]!, [{ ...honest[0]!, siblingHash: bad }, honest[1]!], root, bounds),
+      false,
+      `malformed sibling ${JSON.stringify(bad)}`,
+    )
+  }
+})
+
 test("verifyInclusionProof refuses a proof that cannot say where its leaf sits", () => {
   const { proof, dailyRoot } = buildProof(0)
   assert.equal(verifyInclusionProof(proof, dailyRoot), true)

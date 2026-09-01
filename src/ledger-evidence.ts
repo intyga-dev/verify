@@ -136,6 +136,16 @@ export interface EvidenceVerification {
   notes: string[]
 }
 
+/**
+ * Caller-fetched anchors, either flat or attributed to the checkpoint each one vouches for.
+ *
+ * The keyed form maps a checkpoint's `id` OR its `root` (as the bundle states it) to the anchors YOU
+ * fetched for that checkpoint. Attribution is what makes a DIVERGENCE verdict meaningful on a bundle
+ * spanning more than one day: an anchor's signed preimage carries no checkpoint identity, so without
+ * it a genuine anchor for one checkpoint is indistinguishable from a conflicting one for another.
+ */
+export type EvidenceAnchorSet = SignedAnchor[] | Record<string, SignedAnchor[]>
+
 export interface EvidenceVerifyOptions {
   /** Daily roots obtained from the external anchor (root hex strings). When supplied, every entry
    * must chain to one of them for a trustworthy verdict. */
@@ -145,8 +155,11 @@ export interface EvidenceVerifyOptions {
    * quorum falls back to the anchors carried in the bundle's own `checkpoints[].anchors` — still
    * checked under YOUR keys via `resolveAnchorKey`, but see the divergence carve-out at the quorum
    * loop: only caller-fetched anchors can establish divergence.
+   *
+   * Prefer the `EvidenceAnchorSet` keyed form on a multi-checkpoint bundle (a date-range export
+   * routinely is one): a flat list cannot say which checkpoint each anchor was fetched for.
    */
-  anchors?: SignedAnchor[]
+  anchors?: EvidenceAnchorSet
   anchorPolicy?: AnchorPolicy
   resolveAnchorKey?: AnchorKeyResolver
   /** Pinned external-log keys (Rekor). Unpinned ⇒ that anchor is unverifiable ⇒ it does not count. */
@@ -243,9 +256,39 @@ export function verifyEvidenceBundle(
 
   const knownRoots = new Map<string, string | null>()
   const bundleAnchorsByRoot = new Map<string, SignedAnchor[]>()
+  /** Checkpoint id OR root → root, so the caller may key its anchors by either. */
+  const checkpointKeyToRoot = new Map<string, string>()
   for (const cp of bundle.checkpoints) {
     knownRoots.set(cp.root, cp.anchorRef)
     if (cp.anchors?.length) bundleAnchorsByRoot.set(cp.root, cp.anchors)
+    if (cp.id) checkpointKeyToRoot.set(cp.id, cp.root)
+  }
+  // Roots last: a checkpoint whose id happens to equal another checkpoint's root must not shadow it.
+  for (const cp of bundle.checkpoints) checkpointKeyToRoot.set(cp.root, cp.root)
+
+  // Caller-fetched anchors in two views: the flat union is the quorum candidate pool (as before —
+  // verifyAnchorQuorum only counts anchors whose dailyRoot IS the root under evaluation), while
+  // `callerAnchorsByRoot` records which checkpoint the caller said each one was fetched for. Only the
+  // second may feed divergence; see the quorum loop.
+  const callerAnchors: SignedAnchor[] = []
+  const callerAnchorsByRoot = new Map<string, SignedAnchor[]>()
+  const callerKeyed = Boolean(opts.anchors) && !Array.isArray(opts.anchors)
+  let unattributedKeys = false
+  if (Array.isArray(opts.anchors)) {
+    callerAnchors.push(...opts.anchors)
+  } else if (opts.anchors) {
+    for (const [key, list] of Object.entries(opts.anchors)) {
+      if (!Array.isArray(list) || list.length === 0) continue
+      callerAnchors.push(...list)
+      const root = checkpointKeyToRoot.get(key)
+      if (root === undefined) {
+        // Keyed to a checkpoint this bundle does not contain. Still a quorum candidate, but it
+        // cannot be divergence evidence for a checkpoint nobody can identify.
+        unattributedKeys = true
+        continue
+      }
+      callerAnchorsByRoot.set(root, [...(callerAnchorsByRoot.get(root) ?? []), ...list])
+    }
   }
 
   for (const entry of bundle.entries) {
@@ -462,19 +505,33 @@ export function verifyEvidenceBundle(
   // genuine anchor from another day is indistinguishable from a conflicting one, and appending a
   // real, publicly available anchor would be enough to make a valid bundle read as tampering. Only
   // anchors the caller fetched itself, per checkpoint, can establish divergence.
+  //
+  // The same misbinding applies to the caller's own anchors once a bundle spans more than one
+  // checkpoint, which a date-range export routinely does: passing the whole flat list to EVERY root
+  // read a genuine anchor for checkpoint A as divergence while evaluating checkpoint B, and turned a
+  // sound multi-day export into a tamper alarm. So caller anchors are attributed to a checkpoint
+  // first. The keyed form is exact. A flat list can only be attributed by elimination — an anchor
+  // over ANOTHER checkpoint's root in this same bundle is explainable and is therefore not
+  // divergence evidence — which keeps the single-checkpoint behaviour identical and leaves one gap
+  // stated in the note below: a producer who appends a decoy checkpoint carrying the real root can
+  // absorb the conflicting anchor that way. That downgrades the verdict from DIVERGENCE to "quorum
+  // not met" for the checkpoint it forged, never to ok.
   // Gated on the CALLER having asked (policy + resolver), never on candidates existing: a producer
   // who strips `checkpoints[].anchors` must get "quorum not met (0/N)", not a skipped check. Gating
   // on candidates was the same shape as the trap verifyBundle documents — a check the prover can
   // switch off — with the CLI then printing VERIFIED under a policy nobody evaluated.
   const canCheckAnchors = Boolean(opts.anchorPolicy && opts.resolveAnchorKey)
-  const usedBundleAnchors = canCheckAnchors && !opts.anchors?.length && bundleAnchorsByRoot.size > 0
+  const usedBundleAnchors = canCheckAnchors && callerAnchors.length === 0 && bundleAnchorsByRoot.size > 0
   const roots = [...knownRoots.entries()].map(([root, anchorRef]) => {
     if (!canCheckAnchors || !opts.anchorPolicy || !opts.resolveAnchorKey) {
       return { root, anchorRef, anchorVerified: null, verifiedIssuers: [] as string[] }
     }
-    const candidates = opts.anchors?.length ? opts.anchors : (bundleAnchorsByRoot.get(root) ?? [])
+    const candidates = callerAnchors.length ? callerAnchors : (bundleAnchorsByRoot.get(root) ?? [])
+    const divergenceAnchors = callerKeyed
+      ? (callerAnchorsByRoot.get(root) ?? [])
+      : callerAnchors.filter((a) => a.dailyRoot === root || !knownRoots.has(a.dailyRoot))
     const q = verifyAnchorQuorum(candidates, root, opts.anchorPolicy, opts.resolveAnchorKey, {
-      divergenceAnchors: opts.anchors ?? [],
+      divergenceAnchors,
       externalKeys: opts.externalKeys,
     })
     if (q.divergence) {
@@ -492,6 +549,21 @@ export function verifyEvidenceBundle(
       "Anchor quorum was evaluated over the anchors carried in the bundle's checkpoints. They verify " +
         "only under keys YOU trust, so the result is sound — but divergence detection needs anchors " +
         "you fetched per checkpoint yourself (pass `anchors`).",
+    )
+  }
+  if (canCheckAnchors && callerAnchors.length > 0 && !callerKeyed && knownRoots.size > 1) {
+    notes.push(
+      `The anchors you supplied came as one flat list while this bundle spans ${knownRoots.size} checkpoints, ` +
+        "so each one could only be attributed by its own root. Divergence is therefore reported only for " +
+        "anchors over a root this bundle does not claim at all. Key them by checkpoint id or root " +
+        "(`anchors: { [checkpointId]: [...] }`) for a per-checkpoint divergence verdict.",
+    )
+  }
+  if (unattributedKeys) {
+    notes.push(
+      "Some supplied anchors are keyed to a checkpoint id/root this bundle does not contain. They still " +
+        "count toward quorum for a root they sign, but they cannot establish divergence — check the keys " +
+        "against `checkpoints[]`, because a producer renaming a checkpoint would look exactly like this.",
     )
   }
   if (!canCheckAnchors && !(opts.anchorPolicy || opts.resolveAnchorKey)) {

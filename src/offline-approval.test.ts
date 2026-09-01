@@ -259,6 +259,38 @@ describe("offline approval", () => {
     assert.match(r.reason ?? "", /expires before it was challenged|expired/)
   })
 
+  it("refuses a proof CHALLENGED in the future, however compliant its window", () => {
+    // The 60-minute cap bounds the window's width, not where it sits. A year-out proof with a
+    // 10-minute window passes every other check and would keep verifying until that date —
+    // the capability at rest DIV §5a.1 rejects and §5a.8 credits the cap with preventing.
+    const nextYear = new Date(Date.now() + 365 * 24 * 3_600_000)
+    const { receipt, nonce } = offlineProof({ challengedAt: nextYear, windowMinutes: 10 })
+    const r = verifyApprovalReceipt(receipt, expectation(nonce), { allowOffline: true })
+    assert.equal(r.ok, false)
+    assert.match(r.reason ?? "", /challenged in the future/)
+    // allowExpired covers the opposite case — valid then, lapsed now — so it must not rescue this.
+    const audit = verifyApprovalReceipt(receipt, expectation(nonce), {
+      allowOffline: true,
+      allowExpired: true,
+    })
+    assert.equal(audit.ok, false)
+    assert.match(audit.reason ?? "", /challenged in the future/)
+    // Evaluated from inside the window, the same proof verifies: the rule is positional, not a ban
+    // on distant dates.
+    const inWindow = verifyApprovalReceipt(receipt, expectation(nonce), {
+      allowOffline: true,
+      asOf: new Date(nextYear.getTime() + 60_000),
+    })
+    assert.equal(inWindow.ok, true, inWindow.reason)
+  })
+
+  it("refuses a signed requiredApprovals below 1 instead of flooring it", () => {
+    const { receipt, nonce } = offlineProof({ req: requirement({ requiredApprovals: 0 }) })
+    const r = verifyApprovalReceipt(receipt, expectation(nonce), { allowOffline: true })
+    assert.equal(r.ok, false)
+    assert.match(r.reason ?? "", /requiredApprovals must be an integer of at least 1/)
+  })
+
   it("refuses a proof missing challengedAt rather than treating it as unbounded", () => {
     const { receipt, nonce, canonical } = offlineProof()
     const parsed = JSON.parse(canonical) as Record<string, unknown>
@@ -423,6 +455,29 @@ describe("delegation", () => {
     const r = verifyDelegation(receipt, delegationExpectation)
     assert.equal(r.ok, false)
     assert.match(r.reason ?? "", /over the 72-hour maximum/)
+  })
+
+  it("refuses a delegation SEALED in the future, however compliant its window", () => {
+    // §5a.8 names the 72-hour cap as Delegation's only mitigation; a sliding window is no bound.
+    const nextYear = new Date(Date.now() + 365 * 24 * 3_600_000)
+    const { receipt } = delegationProof({ sealedAt: nextYear, windowHours: 24 })
+    const r = verifyDelegation(receipt, delegationExpectation)
+    assert.equal(r.ok, false)
+    assert.match(r.reason ?? "", /sealed in the future/)
+    const audit = verifyDelegation(receipt, delegationExpectation, { allowExpired: true })
+    assert.equal(audit.ok, false)
+    assert.match(audit.reason ?? "", /sealed in the future/)
+    const inWindow = verifyDelegation(receipt, delegationExpectation, {
+      asOf: new Date(nextYear.getTime() + 60_000),
+    })
+    assert.equal(inWindow.ok, true, inWindow.reason)
+  })
+
+  it("refuses a sealing requiredApprovals below 1 instead of flooring it", () => {
+    const { receipt } = delegationProof({ req: requirement({ requiredApprovals: 0 }) })
+    const r = verifyDelegation(receipt, delegationExpectation)
+    assert.equal(r.ok, false)
+    assert.match(r.reason ?? "", /requiredApprovals must be an integer of at least 1/)
   })
 
   it("refuses a quorum larger than the pool it names", () => {
@@ -609,4 +664,19 @@ describe("delegation", () => {
     assert.match(r.reason ?? "", /\+54 more/)
     assert.ok((r.reason ?? "").length < 2_000, `reason must stay bounded, got ${r.reason?.length} chars`)
   })
+})
+
+it("verifyDelegation refuses a key-set anchor at seal verification (DIV §4.4.6)", () => {
+  // The sealing quorum names PEOPLE. Before the fix a publicKeys anchor was accepted here (only
+  // delegatedTo enforcement at USE time refused it), so seal verification counted credentials.
+  const r = verifyDelegation(
+    {
+      canonicalPayload: JSON.stringify({ v: 1, type: "div-delegation" }),
+      actionDescription: "irrelevant",
+      params: {},
+    },
+    { approvers: { publicKeys: ["a-listed-key"] }, target: "t", actionType: "x", params: {} },
+  )
+  assert.equal(r.ok, false)
+  assert.match(r.reason ?? "", /§4\.4\.6/)
 })

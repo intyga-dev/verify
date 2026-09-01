@@ -156,6 +156,30 @@ describe("verifyAgentAuthority", () => {
     assert.match(r.reason!, /expires before it was sealed/)
   })
 
+  it("refuses a seal dated after the evaluation time, audit override or not", () => {
+    // DIV §5b.2/§5b.3: the evidence claim is that the grant was LIVE at the evaluation time, so a
+    // seal that has not happened yet cannot support it. `allowExpired` covers the opposite case —
+    // something that was valid and lapsed — and deliberately does not reach this.
+    const future = sealedAuthority({
+      sealedAt: "2999-06-01T00:00:00.000Z",
+      // Ordered AFTER sealedAt, so the inverted-window rule cannot be what refuses this.
+      expiresAt: "2999-07-01T00:00:00.000Z",
+    })
+    const r = verifyAgentAuthority(future, EXPECTED, { allowExpired: true })
+    assert.equal(r.ok, false)
+    assert.match(r.reason!, /sealed in the future/)
+  })
+
+  it("refuses a sealing requirement whose requiredApprovals is below 1", () => {
+    // 0 satisfies "at least requiredApprovals" with nothing counted (DIV §4.3.2 / §5 step 7).
+    const r = verifyAgentAuthority(
+      sealedAuthority({ requirement: requirement({ requiredApprovals: 0 }) }),
+      EXPECTED,
+    )
+    assert.equal(r.ok, false)
+    assert.match(r.reason!, /requiredApprovals must be an integer of at least 1/)
+  })
+
   it("applies the signerClass registry: an unknown class in the sealing requirement is refused", () => {
     const r = verifyAgentAuthority(
       sealedAuthority({ requirement: requirement({ signerClass: "delegated-agent" }) }),
