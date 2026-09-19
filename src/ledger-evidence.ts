@@ -580,7 +580,7 @@ export function verifyEvidenceBundle(
   }
   // When a policy WAS supplied, every root must reach quorum; a bundle resting on an unanchored root
   // is not independently attested no matter how well its proofs verify.
-  const allAnchored = !canCheckAnchors || roots.every((r) => r.anchorVerified === true)
+  const allAnchored = !opts.anchorPolicy || (canCheckAnchors && roots.every((r) => r.anchorVerified === true))
   const ok = failed.length === 0 && bundle.entries.length > 0 && !!trusted && allAnchored
   if (!trusted && failed.length === 0 && bundle.entries.length > 0) {
     notes.push("All entries internally consistent; supply --roots for an independent verdict.")

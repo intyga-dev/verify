@@ -119,6 +119,7 @@ export function verifyRootsChain(entries: RootsChainEntry[]): ChainVerification 
 
   let verifiedCount = 0
   let prev: RootsChainEntry | undefined
+  let prevEnd: bigint | undefined
 
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i]
@@ -150,31 +151,34 @@ export function verifyRootsChain(entries: RootsChainEntry[]): ChainVerification 
       )
     }
 
-    if (prev !== undefined) {
-      let prevEnd: bigint
-      let thisStart: bigint
-      let thisEnd: bigint
-      try {
-        prevEnd = BigInt(prev.seqEnd)
-        thisStart = BigInt(e.seqStart)
-        thisEnd = BigInt(e.seqEnd)
-      } catch {
-        return fail(i, `non-integer seq range at index ${i}`, verifiedCount)
-      }
-      if (thisStart <= prevEnd) {
-        return fail(
-          i,
-          `seq ranges overlap or regress: entry starts at ${thisStart} but predecessor ended at ${prevEnd}`,
-          verifiedCount,
-        )
-      }
-      if (thisEnd < thisStart) {
-        return fail(i, `seq range inverted: seqStart=${thisStart} > seqEnd=${thisEnd}`, verifiedCount)
-      }
+    // The entry's OWN range is checked unconditionally. A non-integer or self-inverted range is
+    // malformed wherever it sits, and gating this on having a predecessor let the FIRST entry
+    // through unvalidated — so a single-entry roots file (a new tenant, or the first day after a
+    // truncation) was never range-checked at all. Only the overlap check is relational, because
+    // only it needs a predecessor. Go and Rust always did it this way; TS, Java and Python did not,
+    // which meant the same roots.jsonl verified clean in three ports and was refused by two.
+    let thisStart: bigint
+    let thisEnd: bigint
+    try {
+      thisStart = BigInt(e.seqStart)
+      thisEnd = BigInt(e.seqEnd)
+    } catch {
+      return fail(i, `non-integer seq range at index ${i}`, verifiedCount)
+    }
+    if (thisEnd < thisStart) {
+      return fail(i, `seq range inverted: seqStart=${thisStart} > seqEnd=${thisEnd}`, verifiedCount)
+    }
+    if (prevEnd !== undefined && thisStart <= prevEnd) {
+      return fail(
+        i,
+        `seq ranges overlap or regress: entry starts at ${thisStart} but predecessor ended at ${prevEnd}`,
+        verifiedCount,
+      )
     }
 
     verifiedCount++
     prev = e
+    prevEnd = thisEnd
   }
 
   return { ok: true, verifiedCount, brokenAt: -1, unchained: false }

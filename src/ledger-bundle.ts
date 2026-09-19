@@ -492,7 +492,9 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     // examined — so it cannot make this property true, and FULLY_VERIFIED must stay out of reach.
     // `rootSource: "independent"` already reports the weaker provenance signal on its own.
     anchorVerified = false
-    if (commitmentVerified && rootSource === "independent") {
+    if (opts.anchorPolicy) {
+      notes.push("Anchor quorum could not be evaluated: a daily root and resolveAnchorKey are required.")
+    } else if (commitmentVerified && rootSource === "independent") {
       notes.push(
         "An independently supplied root was used, but no anchor policy was given, so no anchor " +
           "signature or quorum was evaluated (DEWP §5.2/§5.3): anchorVerified stays false and " +
@@ -513,7 +515,8 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
   const verificationLevel = kindRejected ? "INVALID" : deriveVerificationLevel(properties, hasSigner)
 
   return {
-    ok,
+    // A configured policy is an applicable check even when its anchors or resolver are missing.
+    ok: ok && (!opts.anchorPolicy || anchorVerified),
     dailyRoot,
     rootSource,
     properties,

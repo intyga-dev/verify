@@ -505,6 +505,25 @@ test("evidence: a producer stripping checkpoint anchors cannot bypass a supplied
   )
 })
 
+test("evidence: an explicitly supplied anchor policy without a resolver fails the overall verdict", () => {
+  const { bundle, dailyRoot } = buildBundle()
+  const iss = makeAnchorIssuer("https://anchors.example")
+  bundle.checkpoints[0]!.anchors = [iss.anchorFor(dailyRoot)]
+  const res = verifyEvidenceBundle(bundle, {
+    trustedRoots: [dailyRoot],
+    anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "N_OF_M" },
+  })
+  assert.equal(res.ok, false)
+  assert.deepEqual(
+    res.roots.map((root) => root.anchorVerified),
+    [null],
+  )
+  assert.ok(
+    res.notes.some((note) => /policy incomplete|resolveAnchorKey/i.test(note)),
+    res.notes.join("; "),
+  )
+})
+
 // ─── Caller anchors are attributed to a checkpoint before feeding divergence ──
 //
 // A date-range export routinely spans several daily checkpoints. Passing the caller's whole flat

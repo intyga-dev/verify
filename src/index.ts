@@ -213,7 +213,14 @@ export function stableStringify(value: unknown): string {
   if (t !== "object") {
     throw new NonCanonicalValue(`${t} cannot be canonicalized (RFC 8785 covers JSON data only)`)
   }
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`
+  if (Array.isArray(value)) {
+    const items: string[] = []
+    for (let i = 0; i < value.length; i++) {
+      if (!Object.hasOwn(value, i)) throw new NonCanonicalValue("sparse arrays are not JSON data")
+      items.push(stableStringify(value[i]))
+    }
+    return `[${items.join(",")}]`
+  }
   // Reject Dates, Maps, Sets and class instances outright. A plain object (or a null-prototype one,
   // as produced by JSON.parse with a __proto__ key) is the only shape with an unambiguous mapping.
   const proto = Object.getPrototypeOf(value)
@@ -377,6 +384,41 @@ function parseSignerClass(
 }
 
 /**
+ * DIV §4.3.4 / §5-step-3c. `evidence` is REQUIRED in the signed bytes and MUST be `null` in v1.
+ *
+ * Read out of `canonicalPayload`, never an envelope echo — there is deliberately none (§4.4.1), and
+ * a forged value inside the signed bytes fails the byte comparison anyway.
+ *
+ * `parseField` deliberately is NOT used here: it returns `undefined` for an absent key, for a failed
+ * JSON parse, AND for a present `null`, so it cannot express the one distinction this check is made
+ * of. Collapsing "absent" into "null" turns the whole reservation into a no-op — an evidence-
+ * conditioned payload would then verify as though it were unconditioned, which is the exact outcome
+ * §4.3.4 exists to prevent.
+ */
+function parseEvidence(canonical: string): { ok: true } | { ok: false; reason: string } {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(canonical)
+  } catch {
+    return { ok: false, reason: "the signed payload is not valid JSON" }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, reason: "the signed payload is not a JSON object" }
+  }
+  if (!("evidence" in parsed)) {
+    return { ok: false, reason: "the signed payload is missing evidence (DIV §4.3.4)" }
+  }
+  if ((parsed as Record<string, unknown>).evidence !== null) {
+    return {
+      ok: false,
+      reason:
+        "the signed payload declares an evidence condition, which this verifier does not support — refusing rather than treating it as unconditioned (DIV §4.3.4)",
+    }
+  }
+  return { ok: true }
+}
+
+/**
  * Canonical DIV Intent Payload (docs/DIV.md v1) — byte-identical to
  * mcp-schemas.canonicalIntentPayload. Strict RFC 8785 JCS: the whole object is serialized with every
  * key sorted recursively by UTF-16 code unit via `stableStringify`. Do NOT hand-order keys.
@@ -398,6 +440,12 @@ export function canonicalIntentPayload(input: {
     actionType: input.actionType,
     display: input.display,
     params: input.params,
+    // DIV §4.3.4. Reserved, and REQUIRED in the bytes: `null` is the payload's explicit statement
+    // that no external-evidence condition applied, exactly as `requester.attestation`'s null is.
+    // Hardcoded rather than taken from `input` on purpose — an optional field a call site forgets is
+    // absent from Object.keys, so stableStringify never sees it and never throws, and the omission
+    // surfaces later as an unreproducible signature. Non-null values are a later spec version.
+    evidence: null,
     ...commonSignedFields(input.requester, input.requirement),
     nonce: input.nonce,
     expiresAt: input.expiresAt,
@@ -461,6 +509,12 @@ export function canonicalOfflineIntentPayload(input: {
     actionType: input.actionType,
     display: input.display,
     params: input.params,
+    // DIV §4.3.4. Reserved, and REQUIRED in the bytes: `null` is the payload's explicit statement
+    // that no external-evidence condition applied, exactly as `requester.attestation`'s null is.
+    // Hardcoded rather than taken from `input` on purpose — an optional field a call site forgets is
+    // absent from Object.keys, so stableStringify never sees it and never throws, and the omission
+    // surfaces later as an unreproducible signature. Non-null values are a later spec version.
+    evidence: null,
     ...commonSignedFields(input.requester, input.requirement),
     nonce: input.nonce,
     challengedAt: input.challengedAt,
@@ -756,7 +810,8 @@ export interface VerifyReceiptOptions {
    * Only meaningful together with `allowOffline`. This narrows rather than widens: the delegation's
    * target/actionType/params must equal what you are executing, and the offline payload's signed
    * `requiredApprovals` must equal the delegation's `delegatedQuorum`, so the operators still sign the
-   * policy their signatures are counted toward.
+   * policy their signatures are counted toward. Its expiry is rechecked at this verification's
+   * evaluation time even if the successful seal verification was cached.
    */
   delegation?: VerifiedDelegation
   /** Exact `origin` the assertion must carry, e.g. "https://app.example.com". Required for WEBAUTHN. */
@@ -888,7 +943,10 @@ function verifyWitness(
   canonicalPayload: string,
   opts: VerifyReceiptOptions,
 ): { ok: true } | { ok: false; reason: string } {
-  if (witness.sigAlg !== "WEBAUTHN") {
+  if (witness.sigAlg !== "ES256" && witness.sigAlg !== "WEBAUTHN") {
+    return { ok: false, reason: "unsupported witness signature algorithm" }
+  }
+  if (witness.sigAlg === "ES256") {
     return verifyEcdsaP256(trustedKey, canonicalPayload, witness.signature)
       ? { ok: true }
       : { ok: false, reason: "signature does not verify against the trusted signer key" }
@@ -1113,6 +1171,14 @@ export function verifyApprovalReceipt(
   const signerClass = parseSignerClass(requirement)
   if (!signerClass.ok) return { ok: false, reason: signerClass.reason }
 
+  // DIV §5-step-3c. Sits with the other signed-bytes structural gates, BEFORE Local Payload
+  // Reconstruction. A non-null evidence value would also fail the byte comparison further down, but
+  // it would surface as "target/params/actionType do not match what was approved" — a tampering
+  // message for what is really an unsupported payload shape, which sends an operator hunting a
+  // forgery that is not there.
+  const evidence = parseEvidence(receipt.canonicalPayload)
+  if (!evidence.ok) return { ok: false, reason: evidence.reason }
+
   // Offline proofs carry `challengedAt` so the validity WINDOW can be bounded here, not merely at
   // mint. A proof whose window exceeds the cap is refused even though its signature is perfectly
   // good — an offline relying party has no revocation channel, so the short window is the only one.
@@ -1165,6 +1231,18 @@ export function verifyApprovalReceipt(
   let delegatedQuorum: number | undefined
   if (opts.delegation) {
     const d = opts.delegation
+    // A successful seal check can be cached or precede a long signing ceremony. Its expiry must
+    // still hold at USE time (DIV §5a.6), under the same clock/forensic policy as this approval.
+    const delegationExpiryMs = Date.parse(d.expiresAt)
+    if (!Number.isFinite(delegationExpiryMs))
+      return { ok: false, reason: "delegation expiresAt is not a valid RFC3339 timestamp" }
+    const nowMs = (opts.asOf ?? new Date()).getTime()
+    const skewMs = (opts.clockSkewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS) * 1000
+    if (!opts.allowExpired && nowMs > delegationExpiryMs + skewMs)
+      return {
+        ok: false,
+        reason: "delegation has expired (pass { allowExpired: true } for audit re-verification)",
+      }
     // The delegation must be for the action actually being executed. `expected.*` is what the caller
     // is about to run, so comparing against it — not against the receipt — is what stops a delegation
     // for one action authorizing another.
@@ -1282,6 +1360,20 @@ export function verifyApprovalReceipt(
 
   // Count DISTINCT approvers whose signature verifies under a key we independently trust. Distinct is
   // load-bearing: without it, N copies of one approver's signature would satisfy an N-of-M quorum.
+  // A signed four-eyes rule cannot be enforced against a key-set anchor: PublicKeys mode never
+  // authenticates signerDid, so "this signer is not the requester" is unverifiable. Decided BEFORE
+  // the loop so the receipt is refused for the reason that actually applies — the caller's anchor is
+  // the wrong shape for the signed policy, which is not a quorum shortfall. It used to sit inside
+  // the loop, after a witness had matched, so a receipt where nothing matched reported "quorum not
+  // met" instead. Go, Rust, Java and Python all decide it here.
+  if (requirement.requesterCannotApprove === true && "publicKeys" in expected.approvers) {
+    return {
+      ok: false,
+      reason:
+        "requesterCannotApprove requires a DID-mode trust anchor; key-only mode cannot authenticate requester identity",
+    }
+  }
+
   const verifiedSigners = new Set<string>()
   const failures: string[] = []
   for (const witness of witnesses) {
@@ -1723,6 +1815,20 @@ export function verifyDelegation(
     }
   }
 
+  // A signed four-eyes rule cannot be enforced against a key-set anchor: PublicKeys mode never
+  // authenticates signerDid, so "this signer is not the requester" is unverifiable. Decided BEFORE
+  // the loop so the receipt is refused for the reason that actually applies — the caller's anchor is
+  // the wrong shape for the signed policy, which is not a quorum shortfall. It used to sit inside
+  // the loop, after a witness had matched, so a receipt where nothing matched reported "quorum not
+  // met" instead. Go, Rust, Java and Python all decide it here.
+  if (requirement.requesterCannotApprove === true && "publicKeys" in expected.approvers) {
+    return {
+      ok: false,
+      reason:
+        "requesterCannotApprove requires a DID-mode trust anchor; key-only mode cannot authenticate requester identity",
+    }
+  }
+
   const verifiedSigners = new Set<string>()
   const failures: string[] = []
   for (const witness of witnesses) {
@@ -1944,6 +2050,20 @@ export function verifyAgentAuthority(
     return {
       ok: false,
       reason: `authority carries ${witnesses.length} witnesses, above the ${MAX_WITNESSES} this verifier will process`,
+    }
+  }
+
+  // A signed four-eyes rule cannot be enforced against a key-set anchor: PublicKeys mode never
+  // authenticates signerDid, so "this signer is not the requester" is unverifiable. Decided BEFORE
+  // the loop so the receipt is refused for the reason that actually applies — the caller's anchor is
+  // the wrong shape for the signed policy, which is not a quorum shortfall. It used to sit inside
+  // the loop, after a witness had matched, so a receipt where nothing matched reported "quorum not
+  // met" instead. Go, Rust, Java and Python all decide it here.
+  if (requirement.requesterCannotApprove === true && "publicKeys" in expected.approvers) {
+    return {
+      ok: false,
+      reason:
+        "requesterCannotApprove requires a DID-mode trust anchor; key-only mode cannot authenticate requester identity",
     }
   }
 

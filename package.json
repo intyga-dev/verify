@@ -43,6 +43,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "generate:parity-vectors": "node --import tsx src/scripts/generate-verifier-parity-vectors.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test 'src/**/*.test.ts'",
     "test:coverage": "tsx --test --experimental-test-coverage --test-coverage-lines=94 --test-coverage-branches=80 --test-coverage-functions=98 --test-coverage-exclude='../**' --test-coverage-exclude='src/**/*.test.ts' 'src/**/*.test.ts'"

@@ -135,8 +135,8 @@ export function verifyRekorAnchor(
         })
     // Rekor's log key is ECDSA P-256; pin it rather than letting the key material choose the
     // algorithm, exactly as verifyEcdsaP256 does for approver keys.
-    if (keyObject.asymmetricKeyType !== "ec") {
-      return { ok: false, reason: "rekor public key is not an EC key" }
+    if (keyObject.asymmetricKeyType !== "ec" || keyObject.asymmetricKeyDetails?.namedCurve !== "prime256v1") {
+      return { ok: false, reason: "rekor public key is not an EC P-256 key" }
     }
     const verified = crypto.verify(
       "sha256",

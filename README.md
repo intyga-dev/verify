@@ -70,9 +70,8 @@ to credentials enrolled after the DID was minted, and (the direction that matter
 commitment applies only when the anchor names no keys, which is what makes a plain DID list a
 complete anchor with zero key distribution. Pinned DIDs that are NOT self-certifying still require
 `resolveKey`; verification fails closed with an explicit reason otherwise. Self-certifying
-validation is currently implemented in this TypeScript verifier only — the Go, Rust, Java and
-Python ports resolve every pinned DID through their key mapping (DIV §4.4.6 marks the
-identity-committing shape OPTIONAL).
+validation and explicit-mapping precedence are also implemented in the Go, Rust, Java and Python
+ports and exercised by shared verifier fixtures.
 
 **Where the key must come from.** Somewhere you control and that an attacker who can forge a receipt
 cannot also change: your deployment config, your secrets manager, your own IdP/directory, or keys you
@@ -87,10 +86,9 @@ For quorum receipts, count is enforced for you: the signed payload carries `requ
 and verification counts **distinct** approvers whose signature verifies under a key you resolved. In
 `publicKeys` mode distinctness is by key, because `signerDid` is unverified there — which means the
 quorum counts credentials rather than people: one approver whose two registered credentials are both
-listed satisfies a 2-of-N alone. The same unverified `signerDid` weakens `requesterCannotApprove`:
-in `publicKeys` mode a requester holding a listed key can evade the four-eyes exclusion simply by
-naming a different `signerDid` on its witness. For `requiredApprovals` > 1 — or whenever four-eyes
-matters — use the DID form (DIV §4.4.6).
+listed satisfies a 2-of-N alone. A signed `requesterCannotApprove` rule requires DID/identity trust; key-only
+anchors are refused because the receipt's signer label cannot establish separation of duties.
+For `requiredApprovals` > 1, use the DID form to count people (DIV §4.4.6).
 
 ## Expiry and replay: what this does and does not prove
 

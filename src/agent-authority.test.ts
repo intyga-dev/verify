@@ -11,6 +11,8 @@ import { describe, it } from "node:test"
 import {
   type ApprovalReceipt,
   canonicalAgentAuthorityPayload,
+  canonicalDelegationPayload,
+  canonicalOfflineIntentPayload,
   verificationCode,
   verifyAgentAuthority,
   verifyApprovalReceipt,
@@ -226,5 +228,94 @@ describe("an authority authorizes nothing", () => {
     })
     assert.equal(r.ok, false)
     assert.match(r.reason!, /not a div-delegation/)
+  })
+})
+
+describe("delegation expiry is checked again when a cached result is used", () => {
+  it("refuses cached delegation reuse after expiry, unless explicitly auditing", () => {
+    const sealedAt = new Date("2026-07-01T00:00:00.000Z")
+    const expiresAt = new Date("2026-07-01T00:01:00.000Z")
+    const requester = { did: OPENER.did, attestation: null }
+    const requirement = {
+      requiredApprovals: 1,
+      requireHardwareKey: false,
+      allowedAaguids: [],
+      requesterCannotApprove: false,
+      signerClass: "human",
+    }
+    const dPayload = canonicalDelegationPayload({
+      target: TARGET,
+      actionType: "payments.refund",
+      display: "Refund",
+      params: { amount: 5 },
+      requester,
+      requirement,
+      delegatedTo: [BOB.did],
+      delegatedQuorum: 1,
+      nonce: "dlg-expiry",
+      sealedAt: sealedAt.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+    })
+    const delegation = {
+      canonicalPayload: dPayload,
+      actionDescription: "Refund",
+      params: { amount: 5 },
+      requester,
+      signatures: [
+        {
+          signerDid: ALICE.did,
+          signerPublicKey: ALICE.spki,
+          signature: ALICE.sign(dPayload),
+          sigAlg: "ES256",
+        },
+      ],
+      verificationCode: verificationCode(dPayload),
+    } as ApprovalReceipt
+    const expected = {
+      target: TARGET,
+      actionType: "payments.refund",
+      params: { amount: 5 },
+      approvers: anchor(ALICE),
+    }
+    const cached = verifyDelegation(delegation, expected, {
+      asOf: new Date("2026-07-01T00:00:30Z"),
+      clockSkewSeconds: 0,
+    })
+    assert.equal(cached.ok, true, cached.reason)
+    const oPayload = canonicalOfflineIntentPayload({
+      target: TARGET,
+      actionType: "payments.refund",
+      display: "Refund",
+      params: { amount: 5 },
+      requester,
+      requirement,
+      nonce: "off-expiry",
+      challengedAt: new Date("2026-07-01T00:02:00Z").toISOString(),
+      expiresAt: new Date("2026-07-01T00:03:00Z").toISOString(),
+    })
+    const approval = {
+      canonicalPayload: oPayload,
+      actionDescription: "Refund",
+      params: { amount: 5 },
+      requester,
+      signatures: [
+        { signerDid: BOB.did, signerPublicKey: BOB.spki, signature: BOB.sign(oPayload), sigAlg: "ES256" },
+      ],
+      verificationCode: verificationCode(oPayload),
+    } as ApprovalReceipt
+    const check = (allowExpired: boolean) =>
+      verifyApprovalReceipt(
+        approval,
+        { ...expected, nonce: "off-expiry", approvers: anchor(BOB) },
+        {
+          allowOffline: true,
+          delegation: cached.delegation,
+          asOf: new Date("2026-07-01T00:02:00Z"),
+          clockSkewSeconds: 0,
+          allowExpired,
+        },
+      )
+    assert.equal(check(false).ok, false)
+    assert.equal(check(true).ok, true)
   })
 })

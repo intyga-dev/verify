@@ -680,6 +680,7 @@ test("verifyBundle: a supplied anchor policy is evaluated even when the bundle c
     resolveAnchorKey: () => null,
   })
   assert.equal(r.properties.anchorVerified, false, "no anchors can never satisfy a supplied quorum")
+  assert.equal(r.ok, false, "an unmet configured anchor quorum must fail the public verdict")
   assert.ok(
     r.notes.some((n) => /anchor quorum not met \(0\/1\)/.test(n)),
     `expected the 0/N verdict to be stated, got: ${r.notes.join("; ")}`,
@@ -689,4 +690,31 @@ test("verifyBundle: a supplied anchor policy is evaluated even when the bundle c
   const weak = verifyBundle(bundle, { trustedRoot: dailyRoot })
   assert.equal(weak.properties.anchorVerified, false)
   assert.equal(weak.rootSource, "independent")
+})
+
+test("verifyBundle: a configured anchor quorum controls the public verdict", () => {
+  const { bundle, dailyRoot } = goodBundle()
+  const valid = quorumFor(dailyRoot)
+
+  const missingResolver = verifyBundle(bundle, {
+    trustedRoot: dailyRoot,
+    anchors: valid.anchors,
+    anchorPolicy: valid.anchorPolicy,
+  })
+  assert.equal(missingResolver.properties.anchorVerified, false)
+  assert.equal(missingResolver.ok, false)
+
+  const brokenAnchor = { ...valid.anchors[0]!, signature: `${valid.anchors[0]!.signature.slice(0, -2)}AA` }
+  const invalid = verifyBundle(bundle, {
+    trustedRoot: dailyRoot,
+    anchors: [brokenAnchor],
+    anchorPolicy: valid.anchorPolicy,
+    resolveAnchorKey: valid.resolveAnchorKey,
+  })
+  assert.equal(invalid.properties.anchorVerified, false)
+  assert.equal(invalid.ok, false)
+
+  const accepted = verifyBundle(bundle, { trustedRoot: dailyRoot, ...valid })
+  assert.equal(accepted.properties.anchorVerified, true)
+  assert.equal(accepted.ok, true, accepted.notes.join("; "))
 })
