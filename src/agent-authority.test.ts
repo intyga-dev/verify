@@ -13,7 +13,9 @@ import {
   canonicalAgentAuthorityPayload,
   canonicalDelegationPayload,
   canonicalOfflineIntentPayload,
+  agentReceiptDigest,
   verificationCode,
+  verifyAgentDelegationChain,
   verifyAgentAuthority,
   verifyApprovalReceipt,
   verifyDelegation,
@@ -78,12 +80,15 @@ function sealedAuthority(over: {
   sealedAt?: string
   expiresAt?: string
   actionPatterns?: string[]
+  agentDid?: string
+  parentReceiptHash?: string | null
 }): ApprovalReceipt {
   const canonical = canonicalAgentAuthorityPayload({
     target: TARGET,
     actionPatterns: over.actionPatterns ?? PATTERNS,
     display: "Payments agent — refunds under review",
-    agent: { did: AGENT_DID },
+    agent: { did: over.agentDid ?? AGENT_DID },
+    parentReceiptHash: over.parentReceiptHash ?? null,
     requester: OPENER,
     requirement: over.requirement ?? requirement(),
     nonce: "aa_nonce-1",
@@ -107,6 +112,55 @@ function sealedAuthority(over: {
 }
 
 const EXPECTED = { target: TARGET, agentDid: AGENT_DID, approvers: anchor(ALICE, BOB) }
+
+it("binds delegated scope to a complete parent proof and refuses escalation", () => {
+  const root = sealedAuthority({ actionPatterns: ["payments."] })
+  const childDid = "did:intyga:agent:worker"
+  const child = sealedAuthority({
+    agentDid: childDid,
+    actionPatterns: ["payments.refund"],
+    parentReceiptHash: agentReceiptDigest(root),
+  })
+  const chain = [
+    { receipt: root, expected: EXPECTED },
+    { receipt: child, expected: { ...EXPECTED, agentDid: childDid } },
+  ]
+  const action = {
+    target: TARGET,
+    actionType: "payments.refund.issue",
+    agentDid: childDid,
+    delegatedBy: agentReceiptDigest(child),
+  }
+  assert.equal(verifyAgentDelegationChain(chain, action).ok, true)
+  assert.match(
+    verifyAgentDelegationChain(chain, { ...action, delegatedBy: agentReceiptDigest(root) }).reason ?? "",
+    /leaf/,
+  )
+  const escalated = sealedAuthority({
+    agentDid: childDid,
+    actionPatterns: ["payroll."],
+    parentReceiptHash: agentReceiptDigest(root),
+  })
+  assert.match(
+    verifyAgentDelegationChain([chain[0]!, { receipt: escalated, expected: chain[1]!.expected }], {
+      ...action,
+      delegatedBy: agentReceiptDigest(escalated),
+    }).reason ?? "",
+    /escalates/,
+  )
+  const falseParent = sealedAuthority({
+    agentDid: childDid,
+    actionPatterns: ["payments.refund"],
+    parentReceiptHash: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  })
+  assert.match(
+    verifyAgentDelegationChain([chain[0]!, { receipt: falseParent, expected: chain[1]!.expected }], {
+      ...action,
+      delegatedBy: agentReceiptDigest(falseParent),
+    }).reason ?? "",
+    /parent receipt/,
+  )
+})
 
 describe("verifyAgentAuthority", () => {
   it("verifies a quorum-sealed authority and reports the deduplicated sorted scope", () => {

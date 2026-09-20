@@ -240,6 +240,72 @@ export interface RequesterIdentity {
   attestation: { method: string; issuer: string; subject: string } | null
 }
 
+/** Agent-only DIV v1 claims. Configuration and execution truth are checked by the RP's PEP. */
+export interface AgentIntentContext {
+  action: {
+    reversibility: "reversible" | "irreversible"
+    amount: { amount: string; currency: string } | null
+  }
+  agent: { label: string; configDigest: string; delegatedBy: string | null }
+  session: {
+    id: string
+    seq: string
+    prev: string | null
+    aggregate: { amount: string; currency: string } | null
+  }
+  nbf: string
+}
+
+const AGENT_DIGEST = /^sha256:[0-9a-f]{64}$/
+const AGENT_DECIMAL = /^(?:0|[1-9][0-9]{0,29})(?:\.[0-9]{1,9})?$/
+const AGENT_SEQUENCE = /^[1-9][0-9]{0,17}$/
+const AGENT_CURRENCY = /^[A-Z]{3}$/
+
+export function validateAgentIntentContext(context: AgentIntentContext, expiresAt: string): void {
+  const { action, agent, session, nbf } = context
+  if (!action || !["reversible", "irreversible"].includes(action.reversibility))
+    throw new Error("invalid agent action reversibility")
+  if (!agent?.label || agent.label.length > 200 || !AGENT_DIGEST.test(agent.configDigest))
+    throw new Error("invalid agent identity or configuration digest")
+  if (agent.label.normalize("NFC") !== agent.label || session?.id?.normalize("NFC") !== session?.id)
+    throw new Error("agent labels and session identifiers must be NFC")
+  if (
+    !Object.hasOwn(agent, "delegatedBy") ||
+    (agent.delegatedBy !== null && !AGENT_DIGEST.test(agent.delegatedBy))
+  )
+    throw new Error("invalid parent authority digest")
+  if (!session?.id || !AGENT_DIGEST.test(session.id) || !AGENT_SEQUENCE.test(session.seq))
+    throw new Error("invalid agent session identity or sequence")
+  if (
+    !Object.hasOwn(session, "prev") ||
+    (session.seq === "1") !== (session.prev === null) ||
+    (session.prev !== null && !AGENT_DIGEST.test(session.prev))
+  )
+    throw new Error("invalid agent session predecessor")
+  if (!Object.hasOwn(action, "amount") || !Object.hasOwn(session, "aggregate"))
+    throw new Error("invalid agent monetary amount")
+  for (const value of [action.amount, session.aggregate]) {
+    if (value && (!AGENT_DECIMAL.test(value.amount) || !AGENT_CURRENCY.test(value.currency)))
+      throw new Error("invalid agent monetary amount")
+  }
+  if (
+    (action.amount === null) !== (session.aggregate === null) ||
+    (action.amount && session.aggregate && action.amount.currency !== session.aggregate.currency)
+  )
+    throw new Error("agent monetary amount and aggregate disagree")
+  const from = Date.parse(nbf)
+  const to = Date.parse(expiresAt)
+  if (
+    !Number.isFinite(from) ||
+    !Number.isFinite(to) ||
+    to <= from ||
+    to - from > 300_000 ||
+    new Date(from).toISOString() !== nbf ||
+    new Date(to).toISOString() !== expiresAt
+  )
+    throw new Error("agent intent must use canonical UTC times within five minutes")
+}
+
 /** DIV protocol version and type discriminator — identical to mcp-schemas. */
 export const DIV_VERSION = 1
 export const DIV_INTENT_TYPE = "div-intent-verification"
@@ -432,7 +498,9 @@ export function canonicalIntentPayload(input: {
   requirement: ApprovalRequirementAttestation
   nonce: string
   expiresAt: string
+  agentContext?: AgentIntentContext
 }): string {
+  if (input.agentContext) validateAgentIntentContext(input.agentContext, input.expiresAt)
   return stableStringify({
     v: DIV_VERSION,
     type: DIV_INTENT_TYPE,
@@ -448,7 +516,9 @@ export function canonicalIntentPayload(input: {
     evidence: null,
     ...commonSignedFields(input.requester, input.requirement),
     nonce: input.nonce,
-    expiresAt: input.expiresAt,
+    ...(input.agentContext
+      ? { ...input.agentContext, exp: input.expiresAt }
+      : { expiresAt: input.expiresAt }),
   })
 }
 
@@ -575,6 +645,7 @@ export function canonicalAgentAuthorityPayload(input: {
   actionPatterns: string[]
   display: string
   agent: { did: string }
+  parentReceiptHash?: string | null
   requester: RequesterIdentity
   requirement: ApprovalRequirementAttestation
   nonce: string
@@ -588,6 +659,7 @@ export function canonicalAgentAuthorityPayload(input: {
     actionPatterns: [...input.actionPatterns].sort(),
     display: input.display,
     agent: { did: input.agent.did },
+    parentReceiptHash: input.parentReceiptHash ?? null,
     ...commonSignedFields(input.requester, input.requirement),
     nonce: input.nonce,
     sealedAt: input.sealedAt,
@@ -784,11 +856,18 @@ export interface ReceiptExpectation {
   nonce: string
   /** Optionally assert WHICH workload the approval was granted to. */
   requesterDid?: string
+  /** Independent PEP state for an AI_AGENT receipt. Never copy this from the receipt. */
+  agentContext?: AgentIntentContext
 }
 
 /** Verification options. The WebAuthn expectations are mandatory for a WEBAUTHN receipt. */
 export interface VerifyReceiptOptions {
   allowAutoApproved?: boolean
+  /** A complete root-to-leaf, independently trusted chain is mandatory for delegated agent receipts. */
+  agentAuthorityChain?: Array<{
+    receipt: ApprovalReceipt
+    expected: { approvers: ApproverTrustAnchor; target: string; agentDid: string }
+  }>
   /**
    * Accept an OFFLINE APPROVAL (`type: "div-offline-intent"`). Defaults to FALSE — an offline proof is
    * refused on every ordinary call site, exactly like `allowAutoApproved`.
@@ -1137,9 +1216,51 @@ export function verifyApprovalReceipt(
   // are taken from the receipt and MUST byte-match the signed bytes below — a forged value changes the
   // string and fails the comparison, so trusting the receipt for them is not circular.
   if (!receipt.requester) return { ok: false, reason: "receipt missing requester" }
-  const expiresAt = parseField<string>(receipt.canonicalPayload, "expiresAt")
+  const embeddedAgent = parseField<unknown>(receipt.canonicalPayload, "agent")
+  const agentIntent = embeddedAgent !== undefined
+  if (agentIntent && !expected.agentContext)
+    return { ok: false, reason: "agent receipt requires independently asserted PEP context" }
+  if (!agentIntent && expected.agentContext)
+    return { ok: false, reason: "agent context was expected but is absent from the signed payload" }
+  const expiresAt = parseField<string>(receipt.canonicalPayload, agentIntent ? "exp" : "expiresAt")
   if (typeof expiresAt !== "string" || expiresAt.length === 0)
-    return { ok: false, reason: "receipt missing expiresAt" }
+    return { ok: false, reason: "receipt missing expiration" }
+  if (agentIntent) {
+    const context = expected.agentContext
+    if (!context) return { ok: false, reason: "agent receipt requires independently asserted PEP context" }
+    try {
+      validateAgentIntentContext(context, expiresAt)
+    } catch (error) {
+      return {
+        ok: false,
+        reason: `invalid independently asserted agent context: ${(error as Error).message}`,
+      }
+    }
+    const nowMs = (opts.asOf ?? new Date()).getTime()
+    const skewMs = (opts.clockSkewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS) * 1000
+    if (Date.parse(context.nbf) > nowMs + skewMs)
+      return { ok: false, reason: "agent approval is not valid yet" }
+    if (context.action.reversibility === "irreversible" && receipt.sigAlg === "AUTO_APPROVED")
+      return { ok: false, reason: "irreversible agent action requires a human signature" }
+    if (context.agent.delegatedBy) {
+      if (!expected.requesterDid || !opts.agentAuthorityChain)
+        return {
+          ok: false,
+          reason: "delegated agent receipt requires a trusted root-to-leaf authority chain",
+        }
+      const authority = verifyAgentDelegationChain(
+        opts.agentAuthorityChain,
+        {
+          target: expected.target,
+          actionType: expected.actionType,
+          agentDid: expected.requesterDid,
+          delegatedBy: context.agent.delegatedBy,
+        },
+        opts,
+      )
+      if (!authority.ok) return { ok: false, reason: authority.reason }
+    }
+  }
   // FAIL CLOSED on a missing target, like the nonce check above and the WebAuthn pinning below.
   // TypeScript makes `target` required, but this package is shipped to relying parties and is called
   // from plain JS too. Defaulting to the receipt's OWN target would have the receipt vouch for its own
@@ -1286,6 +1407,7 @@ export function verifyApprovalReceipt(
     },
     nonce: parseNonce(receipt.canonicalPayload),
     expiresAt,
+    ...(agentIntent ? { agentContext: expected.agentContext } : {}),
   }
 
   let recomputed: string
@@ -1906,6 +2028,7 @@ export interface VerifiedAgentAuthority {
    * (DIV §5b.2). "*" = all.
    */
   actionPatterns: string[]
+  parentReceiptHash: string | null
   /** The authority's OWN nonce — for the audit trail, never for authorization. */
   nonce: string
   /** Who sealed it. */
@@ -1948,6 +2071,12 @@ export function verifyAgentAuthority(
     return { ok: false, reason: "payload is not a div-agent-authority" }
 
   const actionPatterns = parseField<unknown>(receipt.canonicalPayload, "actionPatterns")
+  const parentReceiptHash = parseField<unknown>(receipt.canonicalPayload, "parentReceiptHash")
+  if (
+    parentReceiptHash !== null &&
+    (typeof parentReceiptHash !== "string" || !AGENT_DIGEST.test(parentReceiptHash))
+  )
+    return { ok: false, reason: "authority is missing a valid parent receipt commitment" }
   if (
     !Array.isArray(actionPatterns) ||
     actionPatterns.length === 0 ||
@@ -2013,6 +2142,7 @@ export function verifyAgentAuthority(
       actionPatterns: actionPatterns as string[],
       display: receipt.actionDescription,
       agent: { did: expected.agentDid },
+      parentReceiptHash,
       requester: receipt.requester,
       requirement: {
         requiredApprovals: requirement.requiredApprovals,
@@ -2121,12 +2251,164 @@ export function verifyAgentAuthority(
       // Deduplicated + sorted: a duplicate pattern must not suggest a wider scope, and every port
       // that grows this surface later should report the same order.
       actionPatterns: [...new Set(actionPatterns as string[])].sort(),
+      parentReceiptHash,
       nonce,
       signers: [...verifiedSigners].sort(),
       sealedAt,
       expiresAt,
     },
   }
+}
+
+/** Hash the COMPLETE proof, including every witness. Hashing only the intent would permit a
+ * never-approved pending intent to be used as a parent receipt. */
+export function agentReceiptDigest(receipt: ApprovalReceipt): string {
+  const witnesses = witnessesOf(receipt)
+    .map((w) => ({
+      signerDid: w.signerDid,
+      signerPublicKey: w.signerPublicKey,
+      signature: w.signature,
+      sigAlg: w.sigAlg ?? null,
+      authenticatorData: w.authenticatorData ?? null,
+      clientDataJSON: w.clientDataJSON ?? null,
+    }))
+    .sort((a, b) => {
+      const left = stableStringify(a)
+      const right = stableStringify(b)
+      return left < right ? -1 : left > right ? 1 : 0
+    })
+  const content = stableStringify({ canonicalPayload: receipt.canonicalPayload, witnesses })
+  return `sha256:${crypto.createHash("sha256").update("intyga-agent-receipt-v1\0").update(content).digest("hex")}`
+}
+
+/** Verify a root-to-leaf chain of human-sealed agent scopes. Each child commits the COMPLETE
+ * parent receipt. A child's substring pattern denotes a subset only when it contains one of the
+ * parent's patterns; this deliberately rejects scopes whose inclusion cannot be proved. */
+export function verifyAgentDelegationChain(
+  chain: Array<{
+    receipt: ApprovalReceipt
+    expected: { approvers: ApproverTrustAnchor; target: string; agentDid: string }
+  }>,
+  action: { target: string; actionType: string; agentDid: string; delegatedBy: string },
+  opts: VerifyReceiptOptions = {},
+): { ok: boolean; reason?: string } {
+  if (chain.length < 2 || !AGENT_DIGEST.test(action.delegatedBy))
+    return { ok: false, reason: "delegation requires a complete root-to-leaf authority chain" }
+  let parent: VerifiedAgentAuthority | null = null
+  let parentHash: string | null = null
+  for (let index = 0; index < chain.length; index++) {
+    const link = chain[index]
+    if (!link) return { ok: false, reason: "authority chain has a missing link" }
+    const proof = verifyAgentAuthority(link.receipt, link.expected, opts)
+    if (!proof.ok || !proof.authority)
+      return { ok: false, reason: `authority link ${index + 1}: ${proof.reason}` }
+    const authority = proof.authority
+    if (authority.target !== action.target) return { ok: false, reason: "delegated authority changes target" }
+    if (authority.parentReceiptHash !== parentHash)
+      return { ok: false, reason: "delegated authority has a missing or different parent receipt" }
+    if (parent) {
+      if (
+        Date.parse(authority.sealedAt) < Date.parse(parent.sealedAt) ||
+        Date.parse(authority.expiresAt) > Date.parse(parent.expiresAt)
+      )
+        return { ok: false, reason: "child authority outlives or predates its parent" }
+      const parentPatterns = parent.actionPatterns.map((pattern) => pattern.toLowerCase())
+      if (
+        authority.actionPatterns.some(
+          (child) => !parentPatterns.some((scope) => scope === "*" || child.toLowerCase().includes(scope)),
+        )
+      )
+        return { ok: false, reason: "child authority escalates the parent's action scope" }
+    }
+    parent = authority
+    parentHash = agentReceiptDigest(link.receipt)
+  }
+  if (parentHash !== action.delegatedBy || parent?.agentDid !== action.agentDid)
+    return { ok: false, reason: "action does not name its delegated agent and leaf authority receipt" }
+  if (
+    !parent.actionPatterns.some(
+      (pattern) => pattern === "*" || action.actionType.toLowerCase().includes(pattern.toLowerCase()),
+    )
+  )
+    return { ok: false, reason: "action falls outside the delegated authority" }
+  return { ok: true }
+}
+
+/** RP-side commitment to the exact model/tool/prompt configuration handed to the agent runtime.
+ * This is an RP assertion, not an integrity attestation. The PEP must recalculate it immediately
+ * before execution and refuse any mismatch with the signed intent. Raw prompt text is never logged. */
+export function agentConfigDigest(config: {
+  model: { provider: string; version: string }
+  tools: Array<{ id: string; version: string; schemaDigest: string }>
+  systemPrompt: string
+}): string {
+  if (
+    !config.model.provider ||
+    !config.model.version ||
+    config.tools.some((tool) => !tool.id || !tool.version || !AGENT_DIGEST.test(tool.schemaDigest))
+  )
+    throw new Error("agent config requires immutable model and tool identities")
+  const tools = [...config.tools].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  if (tools.some((tool, index) => index > 0 && tool.id === tools.at(index - 1)?.id))
+    throw new Error("duplicate agent tool identity")
+  const content = stableStringify({ model: config.model, tools, systemPrompt: config.systemPrompt })
+  return `sha256:${crypto.createHash("sha256").update("intyga-agent-config-v1\0").update(content).digest("hex")}`
+}
+
+/** Verify a complete ordered session bundle against a head pinned OUTSIDE the bundle. An
+ * unanchored single branch cannot prove another branch was not withheld. */
+export function verifyAgentSessionChain(
+  entries: Array<{ receipt: ApprovalReceipt; expected: ReceiptExpectation }>,
+  trustedHead: string,
+  opts: VerifyReceiptOptions = {},
+): { ok: boolean; reason?: string; aggregate?: { amount: string; currency: string } | null } {
+  if (!AGENT_DIGEST.test(trustedHead) || entries.length === 0)
+    return { ok: false, reason: "complete agent chain and independently trusted head are required" }
+  let previous: string | null = null
+  let sessionId: string | undefined
+  let currency: string | undefined
+  let sum = 0n
+  let lastAggregate: { amount: string; currency: string } | null = null
+  const seen = new Set<string>()
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index]
+    if (!entry) return { ok: false, reason: "agent chain has a missing entry" }
+    const { receipt, expected } = entry
+    const context = expected.agentContext
+    if (!context) return { ok: false, reason: "agent chain entry lacks independent PEP context" }
+    const result = verifyApprovalReceipt(receipt, expected, { ...opts, allowAutoApproved: false })
+    if (!result.ok) return { ok: false, reason: `agent chain entry ${index + 1}: ${result.reason}` }
+    const { session, action } = context
+    lastAggregate = session.aggregate
+    if (sessionId === undefined) sessionId = session.id
+    if (session.id !== sessionId) return { ok: false, reason: "agent chain changes session identity" }
+    if (BigInt(session.seq) !== BigInt(index + 1))
+      return { ok: false, reason: "agent chain has a gap, duplicate, or forked sequence" }
+    if (session.prev !== previous)
+      return { ok: false, reason: "agent chain predecessor is missing or forked" }
+    const digest = agentReceiptDigest(receipt)
+    if (seen.has(digest)) return { ok: false, reason: "agent chain repeats a receipt" }
+    seen.add(digest)
+    previous = digest
+    if (action.amount) {
+      if (currency === undefined) currency = action.amount.currency
+      if (action.amount.currency !== currency || session.aggregate?.currency !== currency)
+        return { ok: false, reason: "agent chain changes currency" }
+      sum += decimalToNanoUnits(action.amount.amount)
+      if (decimalToNanoUnits(session.aggregate.amount) !== sum)
+        return { ok: false, reason: "agent aggregate does not equal the sum of signed steps" }
+    } else if (session.aggregate !== null || currency !== undefined) {
+      return { ok: false, reason: "agent chain mixes monetary and non-monetary steps" }
+    }
+  }
+  if (previous !== trustedHead) return { ok: false, reason: "agent chain does not reach the trusted head" }
+  return { ok: true, aggregate: lastAggregate }
+}
+
+function decimalToNanoUnits(value: string): bigint {
+  const [integer, fraction = ""] = value.split(".")
+  if (!integer) throw new Error("invalid decimal amount")
+  return BigInt(integer) * 1_000_000_000n + BigInt(fraction.padEnd(9, "0") || "0")
 }
 
 // ─── Audit ledger inclusion proofs ───────────────────────────────────────────

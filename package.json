@@ -26,6 +26,11 @@
       "types": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./approval-policy": {
+      "types": "./src/approval-policy.ts",
+      "import": "./dist/approval-policy.js",
+      "default": "./dist/approval-policy.js"
     }
   },
   "files": [

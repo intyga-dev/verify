@@ -5,6 +5,16 @@ All notable changes to `@intyga/verify` are documented here. The format follows
 
 ## [Unreleased]
 
+- **Wire format: DIV v1 agent intents now sign `action`, `agent`, `session`, `nbf`, and `exp` instead of ordinary `expiresAt`; `div-agent-authority` requires `parentReceiptHash` (null for a root).** Older §5b seals lacking that key cannot verify under this pre-release profile and must be re-sealed. All canonical producers, five verifier ports and vectors must move together; the ordinary HUMAN/SERVICE intent keeps `expiresAt`.
+
+- The shared approval-policy resolver supports internal tenant policy version 3: one `*` baseline, exact case-sensitive
+  action IDs, at most one rule per ID, and an explicit unknown-action choice. This changes no
+  canonical receipt bytes or historical verification.
+
+- Add the dependency-free `@intyga/verify/approval-policy` subpath for shared approval-rule
+  conflict checks. A higher-ranked rule cannot discard another matching constraint in strict mode.
+  This adds no fields to canonical receipt payloads and does not change historical signatures.
+
 - **Wire format: the DIV Intent Payload gained a REQUIRED `evidence` field, and it must be `null`.**
   `div-intent-verification` and `div-offline-intent` now carry `"evidence":null` in the signed bytes
   (DIV §4.3.4); `div-delegation`, `div-agent-authority` and `div-platform-intent` deliberately do

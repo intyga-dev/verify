@@ -47,6 +47,7 @@ function cose(p: Pair): string {
 
 const subject = ec(),
   alice = ec(),
+  malformedAgentSigner = ec(),
   bob = ec(),
   mallory = ec()
 const anchorEc = ec(),
@@ -62,6 +63,7 @@ const keys = [
   { id: "anchor-ed25519", issuer: "https://anchor-b.example", spkiB64: spki(anchorEd) },
   { id: "anchor-rsa-pss", issuer: "https://anchor-c.example", spkiB64: spki(anchorRsa) },
   { id: "rekor", issuer: "https://rekor.sigstore.dev", spkiB64: spki(rekor) },
+  { id: "malformed-agent-signer", did: "did:intyga:alice", spkiB64: spki(malformedAgentSigner) },
 ]
 
 const AS_OF = "2026-09-01T12:00:00.000Z"
@@ -192,6 +194,84 @@ const approvalGood = approvalReceipt({
   signerDid: "did:intyga:alice",
   signer: alice,
 })
+const agentContext = {
+  action: { reversibility: "irreversible" as const, amount: { amount: "4200", currency: "USD" } },
+  agent: { label: "Payments agent", configDigest: `sha256:${"1".repeat(64)}`, delegatedBy: null },
+  session: {
+    id: "sha256:7826a1ee10082e32e0fa779f569e7f7e6fda7c6fceaea96e4570ba72599c8bc1",
+    seq: "1",
+    prev: null,
+    aggregate: { amount: "4200", currency: "USD" },
+  },
+  nbf: "2026-09-01T12:00:00.000Z",
+}
+const agentExp = "2026-09-01T12:05:00.000Z"
+const agentCanonical = canonicalIntentPayload({
+  target: approvalTarget,
+  actionType: approvalActionType,
+  display: "Wire USD 4,200",
+  params: approvalParams,
+  requester: { did: "did:intyga:agent:payments", attestation: null },
+  requirement: {
+    requiredApprovals: 1,
+    requireHardwareKey: false,
+    allowedAaguids: [],
+    requesterCannotApprove: false,
+    signerClass: "human",
+  },
+  nonce: approvalNonce,
+  expiresAt: agentExp,
+  agentContext,
+})
+const agentApproval: ApprovalReceipt = {
+  ...approvalGood,
+  canonicalPayload: agentCanonical,
+  signature: sign(alice, agentCanonical),
+  verificationCode: verificationCode(agentCanonical),
+}
+// Deliberately bypass the producer's input validation: the bytes, independently asserted context
+// and signature agree, but seq=2 with prev=null violates the agent-session invariant. Every port
+// must refuse the semantic shape before accepting the otherwise valid human signature.
+const malformedAgentContext = {
+  ...agentContext,
+  session: { ...agentContext.session, seq: "2" },
+}
+const malformedAgentCanonical = agentCanonical.replace('"seq":"1"', '"seq":"2"')
+if (malformedAgentCanonical === agentCanonical) throw new Error("agent seq fixture was not changed")
+const malformedAgentApproval: ApprovalReceipt = {
+  ...agentApproval,
+  canonicalPayload: malformedAgentCanonical,
+  signerPublicKey: spki(malformedAgentSigner),
+  signature: sign(malformedAgentSigner, malformedAgentCanonical),
+  verificationCode: verificationCode(malformedAgentCanonical),
+}
+const delegatedAgentContext = {
+  ...agentContext,
+  agent: { ...agentContext.agent, delegatedBy: `sha256:${"2".repeat(64)}` },
+}
+const delegatedAgentCanonical = canonicalIntentPayload({
+  target: approvalTarget,
+  actionType: approvalActionType,
+  display: "Wire USD 4,200",
+  params: approvalParams,
+  requester: { did: "did:intyga:agent:payments", attestation: null },
+  requirement: {
+    requiredApprovals: 1,
+    requireHardwareKey: false,
+    allowedAaguids: [],
+    requesterCannotApprove: false,
+    signerClass: "human",
+  },
+  nonce: approvalNonce,
+  expiresAt: agentExp,
+  agentContext: delegatedAgentContext,
+})
+const delegatedAgentApproval: ApprovalReceipt = {
+  ...approvalGood,
+  canonicalPayload: delegatedAgentCanonical,
+  signature: sign(alice, delegatedAgentCanonical),
+  verificationCode: verificationCode(delegatedAgentCanonical),
+}
 const requesterKeyLabelledMallory = approvalReceipt({
   requesterDid: "did:intyga:alice",
   signerDid: "did:intyga:mallory",
@@ -260,6 +340,47 @@ const approvals = {
   options: { asOf: "2026-09-01T12:01:00.000Z" },
   cases: [
     { name: "valid-es256-approval", receipt: approvalGood, ok: true, signers: [spki(alice)] },
+    {
+      name: "valid-agent-approval",
+      receipt: agentApproval,
+      expected: { agentContext },
+      ok: true,
+      signers: [spki(alice)],
+    },
+    {
+      name: "agent-sequence-without-predecessor-refused",
+      receipt: malformedAgentApproval,
+      expected: { agentContext: malformedAgentContext, approverKeyIds: ["malformed-agent-signer"] },
+      ok: false,
+      reasonIncludes: "invalid agent session predecessor",
+    },
+    {
+      name: "delegated-agent-needs-authority-chain",
+      receipt: delegatedAgentApproval,
+      expected: { agentContext: delegatedAgentContext },
+      ok: false,
+      reasonIncludes: "trusted root-to-leaf authority chain",
+    },
+    {
+      name: "agent-config-drift",
+      receipt: agentApproval,
+      expected: {
+        agentContext: {
+          ...agentContext,
+          agent: { ...agentContext.agent, configDigest: `sha256:${"2".repeat(64)}` },
+        },
+      },
+      ok: false,
+      reasonIncludes: "do not match",
+    },
+    {
+      name: "agent-expired",
+      receipt: agentApproval,
+      expected: { agentContext },
+      options: { asOf: "2026-09-01T12:10:00.000Z" },
+      ok: false,
+      reasonIncludes: "expired",
+    },
     {
       name: "valid-es256-signature-relabeled-unknown",
       receipt: { ...approvalGood, sigAlg: "UNKNOWN" },

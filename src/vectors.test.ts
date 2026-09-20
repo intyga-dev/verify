@@ -6,7 +6,10 @@ import { fileURLToPath } from "node:url"
 import { describe, it } from "node:test"
 import {
   type ApprovalReceipt,
+  type AgentIntentContext,
   type ApproverTrustAnchor,
+  agentConfigDigest,
+  agentReceiptDigest,
   canonicalAgentAuthorityPayload,
   canonicalDelegationPayload,
   canonicalIntentPayload,
@@ -51,6 +54,7 @@ interface PayloadInput {
   sealedAt?: string
   agentDid?: string
   actionPatterns?: string[]
+  parentReceiptHash?: string | null
 }
 interface ReceiptCase {
   name: string
@@ -64,6 +68,7 @@ interface ApproverEntry {
 const vectors = JSON.parse(fs.readFileSync(vectorsPath, "utf8")) as {
   stableStringify: { name: string; value: unknown; expected: string }[]
   intentPayloads: { input: PayloadInput; expected: string }[]
+  agentIntentPayloads: { input: PayloadInput & { agentContext: AgentIntentContext }; expected: string }[]
   offlineIntentPayloads: { input: PayloadInput; expected: string }[]
   delegationPayloads: { input: PayloadInput; expected: string }[]
   agentAuthorityPayloads: { input: PayloadInput; expected: string }[]
@@ -82,6 +87,10 @@ const vectors = JSON.parse(fs.readFileSync(vectorsPath, "utf8")) as {
     }[]
   }
   digests: { canonical: string; digestHex: string; verificationCode: string }[]
+  agentDigests: {
+    config: { input: Parameters<typeof agentConfigDigest>[0]; expected: string }
+    receipt: { input: ApprovalReceipt; expected: string }
+  }
   signerKey: { spkiB64: string }
   receipts: ReceiptCase[]
   quorumReceipts: {
@@ -201,11 +210,28 @@ describe("shared canonical vectors (committed artifact, same file the other port
           actionPatterns: input.actionPatterns,
           display: input.actionDescription,
           agent: { did: input.agentDid },
+          parentReceiptHash: input.parentReceiptHash,
           requester: input.requester,
           requirement: input.requirement,
           nonce: input.nonce,
           sealedAt: input.sealedAt,
           expiresAt: input.expiresAt,
+        }),
+        expected,
+      )
+    }
+    for (const { input, expected } of vectors.agentIntentPayloads) {
+      assert.equal(
+        canonicalIntentPayload({
+          target: input.target,
+          actionType: input.actionType,
+          display: input.actionDescription,
+          params: input.params,
+          requester: input.requester,
+          requirement: input.requirement,
+          nonce: input.nonce,
+          expiresAt: input.expiresAt,
+          agentContext: input.agentContext,
         }),
         expected,
       )
@@ -221,6 +247,17 @@ describe("shared canonical vectors (committed artifact, same file the other port
       assert.equal(verificationCode(d.canonical), d.verificationCode)
       assert.equal(crypto.createHash("sha256").update(d.canonical, "utf8").digest("hex"), d.digestHex)
     }
+  })
+
+  it("agent config and complete receipt digests match the pinned wire bytes", () => {
+    const { config, receipt } = vectors.agentDigests
+    assert.equal(agentConfigDigest(config.input), config.expected)
+    assert.equal(agentReceiptDigest(receipt.input), receipt.expected)
+    assert.equal(
+      agentReceiptDigest({ ...receipt.input, signatures: [...(receipt.input.signatures ?? [])].reverse() }),
+      receipt.expected,
+      "witness order must not change the digest",
+    )
   })
 
   it("golden receipts verify (or refuse) exactly as committed", () => {
