@@ -1,7 +1,7 @@
 {
   "name": "@intyga/verify",
   "version": "1.0.0",
-  "description": "Independently verify Intyga approval receipts — confirm a human cryptographically approved exactly the action about to run, with NO Intyga secret. Zero runtime dependencies; inspect it yourself.",
+  "description": "Independently verify Intyga approval receipts — confirm a human cryptographically approved exactly the action about to run, with NO Intyga secret. Zero npm runtime dependencies; optional OpenSSL 3 for timestamps.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -20,22 +20,22 @@
   ],
   "type": "module",
   "main": "./dist/index.js",
-  "types": "./src/index.ts",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./src/index.ts",
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
     "./approval-policy": {
-      "types": "./src/approval-policy.ts",
+      "types": "./dist/approval-policy.d.ts",
       "import": "./dist/approval-policy.js",
       "default": "./dist/approval-policy.js"
     }
   },
   "files": [
     "dist",
-    "src",
+    "!dist/scripts",
     "README.md",
     "LICENSE",
     "CHANGELOG.md"

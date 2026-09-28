@@ -4,7 +4,7 @@
 
 When Intyga returns an approval, it hands you a **receipt**: the exact canonical payload the human's key signed, plus the signature and public key. This library lets your own code re-derive that payload from *your* parameters, check it byte-for-byte against what was signed, and verify the signature — entirely offline. You don't have to trust Intyga's word that the approval is real; you check the math yourself.
 
-- **Zero runtime dependencies** (`node:crypto` only). Read the whole thing — under 2,000 lines for receipt verification, under 4,000 including the ledger, anchor-quorum and evidence-bundle code.
+- **Zero npm runtime dependencies.** Receipt verification uses Node cryptography. Optional RFC 3161 timestamp verification additionally requires an installed OpenSSL 3 executable.
 - **No Intyga secret required.** Verification uses approver keys **you** resolve — never a key read out of the receipt (see [Whose key?](#whose-key-the-trust-anchor)).
 - Verifies both **WebAuthn** approvals (passkey / hardware security key — the normal path) and **raw P-256** signatures (legacy/headless signer keys), plus policy `AUTO_APPROVED` receipts.
 
@@ -21,6 +21,15 @@ const check = verifyApprovalReceipt(receipt, {
     dids: ["did:intyga:cfo-alice", "did:intyga:cto-bob"],
     resolveKey: (did) => APPROVER_KEYS[did] ?? null,    // from YOUR config/directory
   },
+  // YOUR approval rule for this action — see "Whose quorum?" below. Without it you verify only the
+  // quorum the signers themselves wrote into the receipt.
+  requirement: { requiredApprovals: 2, requesterCannotApprove: true },
+}, {
+  // REQUIRED for passkey receipts (the normal flow): your approval console's exact origin and RP ID,
+  // from the trust-anchor file exported in the console (its `webauthn` block). Without them a passkey
+  // receipt is refused — see "WebAuthn receipts need an origin and an RP ID" below.
+  expectedOrigin: process.env.INTYGA_WEBAUTHN_ORIGIN!,
+  expectedRpId: process.env.INTYGA_WEBAUTHN_RP_ID!,
 });
 
 if (!check.ok) throw new Error(`Refusing to proceed: ${check.reason}`);
@@ -82,13 +91,38 @@ defeats the entire property — a compromised gateway would then supply both the
 validates it, and this library would happily agree. If you are going to trust the gateway for keys, you
 do not need this library; you can just trust its answer.
 
-For quorum receipts, count is enforced for you: the signed payload carries `requirement.requiredApprovals`
-and verification counts **distinct** approvers whose signature verifies under a key you resolved. In
-`publicKeys` mode distinctness is by key, because `signerDid` is unverified there — which means the
-quorum counts credentials rather than people: one approver whose two registered credentials are both
-listed satisfies a 2-of-N alone. A signed `requesterCannotApprove` rule requires DID/identity trust; key-only
-anchors are refused because the receipt's signer label cannot establish separation of duties.
-For `requiredApprovals` > 1, use the DID form to count people (DIV §4.4.6).
+## Whose quorum? (the requirement floor)
+
+The signed payload carries a `requirement` — `requiredApprovals`, `requesterCannotApprove`,
+`requireHardwareKey` — and verification counts **distinct** approvers whose signature verifies under a
+key you resolved against it. But that requirement is **the signers' own statement**. Its signature stops
+a third party from altering it; it does not stop the people it constrains from writing a weaker one.
+Whoever composes the bytes chooses the requirement, so one approver — including one who is also the
+requester — can compose `{ requiredApprovals: 1, requesterCannotApprove: false }` for an action your
+policy gates at 3-of-3 with four-eyes, sign it alone, and hand you a receipt that verifies. A
+compromised gateway can do the same at issuance.
+
+**Without a floor, "quorum met" means only "the quorum the signers stated was met".** If you know the
+rule — from a trust bundle, your own configuration, or anywhere you control — pass it as
+`expected.requirement`:
+
+```ts
+verifyApprovalReceipt(receipt, { ...expected, requirement: { requiredApprovals: 3, requesterCannotApprove: true } })
+// → { ok: false, reason: "signed requirement is weaker than the relying party's policy: it requires 1 approval(s), the policy 3 (DIV §5 step 3d)" }
+```
+
+A signed requirement weaker on any field — fewer approvals, no four-eyes where you require it, no
+hardware key where you require it — is refused before any signature is counted (DIV §5 step 3d). An
+equal or stricter one passes, and the signed value is then what is enforced. A malformed floor (a quorum
+below 1, say) is refused rather than treated as absent. `allowedAaguids` is not floored; express a model
+restriction as `requireHardwareKey`. The same `requirement` field exists on `verifyDelegation` (pass the
+ordinary rule the delegation was sealed against) and `verifyAgentAuthority` (your sealing policy); under
+an offline delegation, pass the ordinary rule to `verifyApprovalReceipt` too. Omitting it keeps the
+previous behaviour, for compatibility — which is exactly the weaker guarantee described above.
+
+Key-only trust is refused when the signed `requiredApprovals` exceeds 1 or `requesterCannotApprove` is
+true. Use the DID form for those policies: multiple credentials for one DID count as one person
+(DIV §5 step 3b).
 
 ## Expiry and replay: what this does and does not prove
 
@@ -118,14 +152,21 @@ verifyApprovalReceipt(receipt, expected, {
 
 The verifier then checks the assertion is a `webauthn.get` (not a registration), that its origin matches,
 that `authenticatorData`'s rpIdHash matches your RP ID, that the assertion was **not** produced inside a
-cross-origin frame, and that the user was present **and verified** (biometric/PIN). Pass
-`requireUserVerification: false` only if you consciously accept mere possession.
+cross-origin frame (`crossOrigin: true`, or a `topOrigin` that differs from `origin`), and that the user
+was present **and verified** (biometric/PIN). Pass `requireUserVerification: false` only if you
+consciously accept mere possession; `verifyPlatformReceipt` ignores it, because a platform receipt
+always requires user verification (DIV §5c.3).
 
 The cross-origin refusal is on by default and `origin` alone cannot substitute for it: inside a
 cross-origin iframe the browser reports the *frame's* origin — the RP's own — and rpIdHash matches too,
 so a third-party embedder with `publickey-credentials-get` delegated could drive the whole ceremony
 while every other check passes. If your approval UI is legitimately framed, opt in with
 `allowCrossOrigin: true`.
+
+When the signed policy sets `requireHardwareKey`, a WebAuthn witness whose signed `authenticatorData`
+has the Backup Eligible or Backup State flag set is not counted (DIV §4.4.5 rule 6): a synced passkey
+cannot satisfy a hardware-key policy, and the flags are covered by the signature. Clear flags are the
+authenticator's claim, not attestation — the authenticator model still comes only from enrollment.
 
 ## Policy auto-approvals (break-glass / pre-approval windows)
 
@@ -148,6 +189,7 @@ verifyApprovalReceipt(receipt, expected, { allowAutoApproved: true }); // → { 
 - `canonicalIntentPayload({ target, actionType, display, params, requester, requirement, nonce, expiresAt })` → the exact signed string (DIV v1). Also exported: `canonicalOfflineIntentPayload` (DIV §5a offline approval), `canonicalDelegationPayload` and `canonicalAgentAuthorityPayload` (DIV §5b). The pre-DIV `canonicalAuthorizationPayload`/`V3` builders were removed with the v2/v3 formats (ADR 005/014); `verifyApprovalReceipt` rejects anything where `v !== 1`.
 - `verificationCode(canonical)` → the short `XXXX-XXXX` code shown on the approval screen
 - `verifyEcdsaP256(publicKeyB64, payload, signatureB64)` → `boolean`
+- `verifyWebAuthnWitness({ signedPayload, publicKey, authenticatorData, clientDataJSON, signature }, { expectedOrigin, expectedRpId, requireUserVerification?, allowCrossOrigin? })` → `{ ok, reason? }` — the DIV §4.4.5 checks on ONE assertion (e.g. a single stored ledger witness), under a COSE or SPKI P-256 key you supply from your own records. It checks the signature binding only: no quorum, window, payload type or signed requirement — verify an approval with `verifyApprovalReceipt`.
 
 > The canonicalization here is byte-for-byte identical to the Intyga gateway, the approval UI, and
 > `@intyga/mcp-schemas`. That identity is the whole point — don't reformat it.
@@ -159,8 +201,8 @@ Profile** ([`docs/DEWP.md`](../../docs/DEWP.md) §9.1) it implements single-anch
 multi-anchor quorum verification (§5.2/§5.3, including `requiredAnchors`, issuer trust and
 divergence detection), the §5.4 checkpoint continuity chain (`0x04` domain tag), proof-bundle
 parsing with the §7.1 verification levels, evidence bundles, and gapless `tenantSeq` completeness
-validation. On the DIV side it is also the only port that verifies **agent-authority seals**
-(`verifyAgentAuthority`, DIV §5b) in addition to `verifyApprovalReceipt` and `verifyDelegation`.
+validation. All five ports also verify **agent-authority seals** (DIV §5b) and platform receipts
+(DIV §5c), in addition to ordinary approval and delegation receipts.
 Byte parity with the Go, Rust, Java and Python ports is locked by the shared golden vectors
 in `packages/mcp-schemas/vectors/`.
 
@@ -172,3 +214,60 @@ limits: [`verify-go`](../verify-go/README.md), [`verify-rust`](../verify-rust/RE
 Requires Node ≥18 (`node:crypto`).
 
 Apache-2.0 licensed — see [`LICENSE`](./LICENSE).
+
+## RFC 3161 timestamps
+
+All five verifier ports can count verified TSA evidence toward DEWP quorum. In Node, configure
+`externalKeys.rfc3161` by issuer when calling `verifyAnchorQuorum`, `verifyBundle`, or
+`verifyEvidenceBundle`:
+
+```ts
+const externalKeys = {
+  rekor: pinnedRekorPublicKey,
+  rekorIssuer: "https://rekor.sigstore.dev",
+  rfc3161: {
+    "https://tsa.example": {
+      caPem: trustedCaPem,
+      signerCertificateSha256: pinnedSignerCertificateSha256,
+      revocation: "crl" as const,
+      crlPem: currentOfflineCrlPem,
+    },
+  },
+}
+```
+
+An external witness (Rekor, TSA) is time-bounded against the checkpoint's claimed time, and that time
+must come from somewhere you trust (DEWP §5.3). Pass the chain-verified roots-file lines you hold as
+`trustedCheckpoints` to `verifyEvidenceBundle` (a bundle checkpoint that contradicts one fails, and
+anchors are held to your record), and the matching line as `trustedCheckpoint` to `verifyBundle`: a
+single proof carries no checkpoint, so without it Rekor/TSA anchors do not count. An evidence
+checkpoint with no `chainHash`/`anchoredAt` and no record never counts as anchored.
+
+For policies trusting multiple issuers, `rekorIssuer` explicitly binds the log key to its issuer.
+An unscoped legacy Rekor key is accepted only when the policy trusts exactly one issuer. A log
+attests arbitrary submitted digests, so its key must not credit a different issuer name.
+
+Obtain the CA and SHA-256 fingerprint of the DER TSA signer certificate independently of the bundle.
+The certificate pin is scoped to its issuer: a CA capable of issuing certificates for several TSAs
+is not itself proof of a particular TSA's identity. Rotate the pin deliberately when the TSA rotates
+its certificate. Extra intermediate certificates can be supplied in `untrustedPem`.
+
+`verifyRfc3161Anchor(anchor, trust)` also verifies individual tokens. It checks the SHA-256 imprint
+over the raw DEWP anchor digest, CMS signature, signer pin, timestamping EKU and certificate chain.
+CMS signer digests must be SHA-256, SHA-384 or SHA-512; SHA-1 and MD5 are refused.
+`verificationTime` is optional Unix seconds; it defaults to the current time rounded up by less than
+one second. The token must not claim a later time. Certificates must be valid both at that evaluation
+time and at the authenticated TSA time. `revocation: "crl"` requires valid caller-supplied offline
+CRLs for the chain; missing, stale or revoked evidence fails. `"unchecked"` is an explicit opt-out
+and makes **no revocation assertion**. No CA, CRL, OCSP or intermediate is downloaded.
+
+For historical validation, retain the certificates, applicable CRLs and the relying party's chosen
+evaluation time. A past evaluation is an explicit historical claim, not proof of current validity;
+this adapter does not implement archival evidence renewal or qualified-timestamp legal validation.
+Timestamp evidence establishes that the commitment existed by the TSA time, not when its underlying
+action occurred. The anchor's own timestamp remains producer-supplied data bound by the imprint.
+
+The adapter invokes OpenSSL 3 without a shell, with private temporary files and a five-second limit
+per command. `opensslPath` can select a caller-controlled executable. Without that runtime or the
+required trust configuration, TSA evidence is reported as unverified and never counts toward quorum.
+Applications should bound bundle sizes and run large offline audits away from request handlers.

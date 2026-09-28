@@ -9,15 +9,20 @@
 import assert from "node:assert/strict"
 import crypto from "node:crypto"
 import { test } from "node:test"
-import type { SignedAnchor } from "./ledger-anchor.js"
+import type { AnchorInput } from "./ledger-anchor.js"
 import { parseRekorEvidence, rekorPayloadHashFor, verifyRekorAnchor } from "./ledger-rekor.js"
 
-const ANCHOR: Pick<SignedAnchor, "dailyRoot" | "timestamp" | "issuer" | "algorithm"> = {
+const ANCHOR: AnchorInput = {
   dailyRoot: "e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8",
   timestamp: "2026-07-24T23:59:00.000Z",
   issuer: "https://rekor.sigstore.dev",
   algorithm: "ES256",
+  seqStart: "1",
+  seqEnd: "1",
+  chainHash: "c".repeat(64),
 }
+/** Two minutes after the anchor's claimed time: inside the default DEWP §5.3 time bound. */
+const WITNESSED = Date.parse(ANCHOR.timestamp) / 1000 + 120
 
 /** Rekor's log key. In production this is pinned from Sigstore's TUF root, never from the bundle. */
 const rekorKey = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
@@ -43,7 +48,7 @@ function rekorEntry(
 ) {
   const body = hashedRekordBody(payloadHashHex)
   const logIndex = opts.logIndex ?? 4_215_889
-  const integratedTime = opts.integratedTime ?? 1_785_000_000
+  const integratedTime = opts.integratedTime ?? WITNESSED
   const logID = "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d"
   // The SET signs the canonical JSON of exactly these four fields, keys sorted.
   const setPayload = JSON.stringify({ body, integratedTime, logID, logIndex })
@@ -228,13 +233,44 @@ test("verifyBundle threads the pinned Rekor key through to quorum", async () => 
     trustedIssuers: [ANCHOR.issuer],
     quorum: "N_OF_M" as const,
   }
+  // A single proof carries no checkpoint, so the witness time is held to the caller's own record.
+  const trustedCheckpoint = {
+    root: dailyRoot,
+    seqStart: ANCHOR.seqStart,
+    seqEnd: ANCHOR.seqEnd,
+    chainHash: ANCHOR.chainHash,
+    anchoredAt: ANCHOR.timestamp,
+  }
   const withKey = verifyBundle(bundle, {
     trustedRoot: dailyRoot,
+    trustedCheckpoint,
     anchorPolicy: policy,
     resolveAnchorKey: () => null,
     externalKeys: { rekor: rekorPubB64 },
   })
   assert.equal(withKey.properties.anchorVerified, true, `expected anchored: ${withKey.notes.join("; ")}`)
+
+  // Without that record the external witness cannot be time-bounded, so it does not count (§5.3).
+  const withoutRecord = verifyBundle(bundle, {
+    trustedRoot: dailyRoot,
+    anchorPolicy: policy,
+    resolveAnchorKey: () => null,
+    externalKeys: { rekor: rekorPubB64 },
+  })
+  assert.equal(withoutRecord.properties.anchorVerified, false)
+  assert.ok(
+    withoutRecord.notes.some((n) => /no trusted checkpoint time/.test(n)),
+    withoutRecord.notes.join("; "),
+  )
+  // And a record that dates the checkpoint differently from the anchor refuses it as another position.
+  const redated = verifyBundle(bundle, {
+    trustedCheckpoint: { ...trustedCheckpoint, anchoredAt: "2026-01-01T00:00:00.000Z" },
+    anchorPolicy: policy,
+    resolveAnchorKey: () => null,
+    externalKeys: { rekor: rekorPubB64 },
+  })
+  assert.equal(redated.properties.anchorVerified, false)
+  assert.equal(redated.rootSource, "caller-supplied")
 
   const withoutKey = verifyBundle(bundle, {
     trustedRoot: dailyRoot,

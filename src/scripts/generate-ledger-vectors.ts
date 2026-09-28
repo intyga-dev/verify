@@ -7,6 +7,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { anchorDigest, anchorDigestHex, signAnchor } from "../ledger-anchor.js"
+import { chainHash } from "../ledger-chain.js"
 import { type AuditLeaf, canonicalPreimage, leafHash } from "../ledger-leaf.js"
 import { hashLeaf, hashPair, merkleProof, merkleRoot, sha256Hex } from "../ledger-merkle.js"
 
@@ -160,6 +161,22 @@ const inclusionNegative = [
     expected: false,
   },
   {
+    // The second leniency of the same decoder: Node's `Buffer.from(s, "hex")` stops silently at the
+    // first non-hex character, so a sibling carrying a junk suffix decodes to the SAME 32 bytes while
+    // the string no longer equals the running node. The self-pairing check passes and the padding
+    // forgery recomputes the genuine root. Only the exact-64-character rule (DEWP §4.4) refuses it.
+    name: "padding-forgery-revived-by-junk-suffixed-sibling",
+    reason:
+      "a lenient hex decoder stops at the first non-hex character, so a junk suffix leaves the " +
+      "decoded bytes (and the recomputed root) unchanged while defeating the string self-pairing " +
+      "comparison. Only DEWP §4.4's exact 64-character lowercase hex rule refuses it",
+    leaf: C,
+    proof: forgedPath.map((s, i) => (i === 0 ? { ...s, siblingHash: `${s.siblingHash}zz` } : s)),
+    root: paddingRoot,
+    bounds: { index: 3, leafCount: 4 },
+    expected: false,
+  },
+  {
     name: "uppercased-root-refused",
     reason:
       "the path itself is honest, so this pins the ENCODING rule rather than the tree: digests are " +
@@ -183,11 +200,24 @@ const inclusionNegative = [
 ]
 
 // ── Anchor digest ────────────────────────────────────────────────────────────
+// The anchored preimage binds the checkpoint's POSITION as well as its root: its global seq range and
+// its §5.4 chain hash (here the genesis checkpoint over the two blocks above, seq 0..6).
+const anchorTimestamp = "2026-07-24T23:59:00.000Z"
 const anchorInput = {
   dailyRoot,
-  timestamp: "2026-07-24T23:59:00.000Z",
+  timestamp: anchorTimestamp,
   issuer: "https://transparency.example.org",
   algorithm: "ES256" as const,
+  seqStart: "0",
+  seqEnd: "6",
+  chainHash: chainHash({
+    prevChainHash: "",
+    root: dailyRoot,
+    seqStart: "0",
+    seqEnd: "6",
+    entryCount: 7,
+    anchoredAt: anchorTimestamp,
+  }),
 }
 
 // ── Signed anchor (DEWP §5.2) ────────────────────────────────────────────────
@@ -235,6 +265,18 @@ const signedAnchor = {
     {
       name: "same-signature-different-root-fails",
       anchor: { ...signedAnchorObject, dailyRoot: "f".repeat(64) },
+      expectOk: false,
+    },
+    {
+      // The position is signed: the same signature over the same root cannot be re-attributed to a
+      // different seq range, which is what binding the range into the preimage is for.
+      name: "same-signature-different-seq-range-fails",
+      anchor: { ...signedAnchorObject, seqEnd: "7" },
+      expectOk: false,
+    },
+    {
+      name: "same-signature-different-chain-hash-fails",
+      anchor: { ...signedAnchorObject, chainHash: "e".repeat(64) },
       expectOk: false,
     },
   ],

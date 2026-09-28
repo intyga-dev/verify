@@ -2,10 +2,27 @@ import assert from "node:assert/strict"
 import crypto from "node:crypto"
 import { test } from "node:test"
 import { type SignedAnchor, signAnchor } from "./ledger-anchor.js"
+import { chainHash } from "./ledger-chain.js"
 import { EVIDENCE_BUNDLE_KIND, type EvidenceBundle, verifyEvidenceBundle } from "./ledger-evidence.js"
 import { type AuditLeaf, leafHash } from "./ledger-leaf.js"
 import { hashLeaf, merkleProof, merkleRoot, emptyRoot, sha256Hex } from "./ledger-merkle.js"
 import type { InclusionProof } from "./ledger-proof.js"
+
+/**
+ * A checkpoint with its §5.4 chain fields, as the producer exports it. Anchors must bind the chain
+ * hash (§5.2), and a checkpoint without one no longer counts as anchored (§5.3), so the fixtures carry
+ * a real one; `chainByRoot` lets `makeAnchorIssuer` sign over it.
+ */
+const chainByRoot = new Map<string, string>()
+function chained<T extends { root: string; seqStart: string; seqEnd: string; anchoredAt: string }>(
+  cp: T,
+  entryCount: number,
+): T & { entryCount: number; prevChainHash: string; chainHash: string } {
+  const full = { ...cp, entryCount, prevChainHash: "" }
+  const hash = chainHash(full)
+  chainByRoot.set(cp.root, hash)
+  return { ...full, chainHash: hash }
+}
 
 function makeLeaf(seq: number, tenantSeq: number = seq): AuditLeaf {
   return {
@@ -104,14 +121,17 @@ function buildBundle(
     tenant: { id: "tenant-1", name: "Test Tenant" },
     range: { from: "2026-07-15T00:00:00.000Z", to: "2026-07-15T23:59:59.000Z" },
     checkpoints: [
-      {
-        id: "cp-1",
-        root: dailyRoot,
-        anchorRef: "anchor://test/1",
-        anchoredAt: "2026-07-15T12:00:00.000Z",
-        seqStart: "1",
-        seqEnd: "2",
-      },
+      chained(
+        {
+          id: "cp-1",
+          root: dailyRoot,
+          anchorRef: "anchor://test/1",
+          anchoredAt: "2026-07-15T12:00:00.000Z",
+          seqStart: "1",
+          seqEnd: "2",
+        },
+        2,
+      ),
     ],
     entries: [
       {
@@ -244,7 +264,7 @@ test("verifyEvidenceBundle: un-trusted run adds note and returns ok=false", () =
   const { bundle } = buildBundle()
   const res = verifyEvidenceBundle(bundle)
   assert.equal(res.ok, false)
-  assert.ok(res.notes.some((n) => n.includes("No independent roots supplied")))
+  assert.ok(res.notes.some((n) => n.includes("No roots supplied")))
   assert.ok(res.notes.some((n) => n.includes("All entries internally consistent")))
 })
 
@@ -401,8 +421,19 @@ test("evidence: an entry belonging to another tenant is not counted as this tena
 
 function makeAnchorIssuer(issuer: string) {
   const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" })
-  const anchorFor = (dailyRoot: string): SignedAnchor => {
-    const base = { dailyRoot, timestamp: "2026-07-15T23:59:00.000Z", issuer, algorithm: "ES256" as const }
+  // An anchor binds its checkpoint's position and claimed time (DEWP §5.2): the defaults match
+  // buildBundle's checkpoint (seq 1..2, anchoredAt 12:00) and its chain hash. A root no fixture
+  // checkpoint states (a divergence decoy) gets a placeholder chain hash.
+  const anchorFor = (dailyRoot: string, seqStart = "1", seqEnd = "2"): SignedAnchor => {
+    const base = {
+      dailyRoot,
+      timestamp: "2026-07-15T12:00:00.000Z",
+      issuer,
+      algorithm: "ES256" as const,
+      seqStart,
+      seqEnd,
+      chainHash: chainByRoot.get(dailyRoot) ?? "c".repeat(64),
+    }
     return { ...base, keyId: `${issuer}#key-1`, signature: signAnchor(base, privateKey) }
   }
   const resolveKey = (a: SignedAnchor) => (a.issuer === issuer ? publicKey : null)
@@ -429,6 +460,25 @@ test("evidence: bundle-carried checkpoint anchors reach quorum under the caller'
   assert.deepEqual(res.roots[0]?.verifiedIssuers, [iss.issuer])
   // The verdict says where the anchors came from, so an auditor knows divergence was not assessable.
   assert.ok(res.notes.some((n) => /carried in the bundle/.test(n)))
+})
+
+test("evidence: external-key mode does not implicitly trust an unresolved SELF anchor", () => {
+  const { bundle, dailyRoot } = buildBundle()
+  const iss = makeAnchorIssuer("https://unresolved-self.example")
+  const cp = bundle.checkpoints[0]
+  assert.ok(cp)
+  cp.anchors = [iss.anchorFor(dailyRoot)]
+
+  const res = verifyEvidenceBundle(bundle, {
+    trustedRoots: [dailyRoot],
+    anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "N_OF_M" },
+    // Configuring an external verifier enables quorum evaluation, but cannot act as a resolver for
+    // ordinary SELF signatures. The fallback resolver must remain deny-by-default.
+    externalKeys: { rfc3161: {} },
+  })
+  assert.equal(res.ok, false)
+  assert.equal(res.roots[0]?.anchorVerified, false)
+  assert.deepEqual(res.roots[0]?.verifiedIssuers, [])
 })
 
 test("evidence: without a policy, bundle-carried anchors change nothing (nobody checked)", () => {
@@ -541,14 +591,17 @@ function buildTwoCheckpointBundle(): { bundle: EvidenceBundle; rootA: string; ro
     const root = merkleRoot(dailyLeaves)
     return {
       root,
-      checkpoint: {
-        id: cpId,
-        root,
-        anchorRef: `anchor://test/${cpId}`,
-        anchoredAt: "2026-07-15T12:00:00.000Z",
-        seqStart: String(seq),
-        seqEnd: String(seq),
-      },
+      checkpoint: chained(
+        {
+          id: cpId,
+          root,
+          anchorRef: `anchor://test/${cpId}`,
+          anchoredAt: "2026-07-15T12:00:00.000Z",
+          seqStart: String(seq),
+          seqEnd: String(seq),
+        },
+        1,
+      ),
       entry: {
         event: {
           seq: String(seq),
@@ -601,7 +654,7 @@ test("evidence: a genuine caller anchor per checkpoint verifies a multi-day bund
   const iss = makeAnchorIssuer("https://anchors.example")
   const res = verifyEvidenceBundle(bundle, {
     trustedRoots: [rootA, rootB],
-    anchors: [iss.anchorFor(rootA), iss.anchorFor(rootB)],
+    anchors: [iss.anchorFor(rootA, "1", "1"), iss.anchorFor(rootB, "2", "2")],
     anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "N_OF_M" },
     resolveAnchorKey: iss.resolveKey,
   })
@@ -624,7 +677,7 @@ test("evidence: caller anchors keyed by checkpoint verify a multi-day bundle wit
   const iss = makeAnchorIssuer("https://anchors.example")
   const res = verifyEvidenceBundle(bundle, {
     trustedRoots: [rootA, rootB],
-    anchors: { "cp-1": [iss.anchorFor(rootA)], [rootB]: [iss.anchorFor(rootB)] },
+    anchors: { "cp-1": [iss.anchorFor(rootA, "1", "1")], [rootB]: [iss.anchorFor(rootB, "2", "2")] },
     anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "N_OF_M" },
     resolveAnchorKey: iss.resolveKey,
   })
@@ -644,7 +697,7 @@ test("evidence: a keyed anchor naming a different root for ITS checkpoint is sti
   const iss = makeAnchorIssuer("https://anchors.example")
   const res = verifyEvidenceBundle(bundle, {
     trustedRoots: [rootA, rootB],
-    anchors: { "cp-1": [iss.anchorFor("a".repeat(64))], "cp-2": [iss.anchorFor(rootB)] },
+    anchors: { "cp-1": [iss.anchorFor("a".repeat(64), "1", "1")], "cp-2": [iss.anchorFor(rootB, "2", "2")] },
     anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "N_OF_M" },
     resolveAnchorKey: iss.resolveKey,
   })
@@ -677,7 +730,7 @@ test("evidence: anchors keyed to a checkpoint the bundle does not contain are fl
   const iss = makeAnchorIssuer("https://anchors.example")
   const res = verifyEvidenceBundle(bundle, {
     trustedRoots: [rootA, rootB],
-    anchors: { "cp-1": [iss.anchorFor(rootA)], "cp-RENAMED": [iss.anchorFor(rootB)] },
+    anchors: { "cp-1": [iss.anchorFor(rootA, "1", "1")], "cp-RENAMED": [iss.anchorFor(rootB, "2", "2")] },
     anchorPolicy: { requiredAnchors: 1, trustedIssuers: [iss.issuer], quorum: "N_OF_M" },
     resolveAnchorKey: iss.resolveKey,
   })

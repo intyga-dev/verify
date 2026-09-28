@@ -4,19 +4,22 @@ import { fileURLToPath } from "node:url"
 import {
   canonicalAgentAuthorityPayload,
   canonicalIntentPayload,
+  canonicalOfflineIntentPayload,
   canonicalPlatformIntentPayload,
   selfCertifyingDid,
   verificationCode,
   type ApprovalReceipt,
   type PlatformReceipt,
 } from "../index.js"
-import { signAnchor, type SignedAnchor } from "../ledger-anchor.js"
+import { anchorDigest, signAnchor, type SignedAnchor } from "../ledger-anchor.js"
 import { chainHash, type RootsChainEntry } from "../ledger-chain.js"
 import { type EvidenceBundle, EVIDENCE_BUNDLE_KIND } from "../ledger-evidence.js"
 import { type AuditLeaf, leafHash } from "../ledger-leaf.js"
 import { BUNDLE_KIND, type ProofBundle } from "../ledger-bundle.js"
 import { hashLeaf, merkleProof, merkleRoot } from "../ledger-merkle.js"
 import { rekorPayloadHashFor } from "../ledger-rekor.js"
+import { buildDewpEvidenceHardening } from "./dewp-evidence-hardening-vectors.js"
+import { buildVerifierInputHardening } from "./verifier-input-hardening-vectors.js"
 
 interface Pair {
   publicKey: crypto.KeyObject
@@ -329,6 +332,59 @@ const evidenceApprovalCases = (() => {
   ]
 })()
 
+// DIV §4.3.2: a non-empty `allowedAaguids` model allowlist is refused offline exactly like
+// `requireHardwareKey` — an offline witness is a bare key, which has no authenticator model at all.
+// The control case differs ONLY in the allowlist, so the refusal cannot be for another reason.
+function offlineApproval(allowedAaguids: string[]): ApprovalReceipt {
+  const requester = { did: "did:intyga:agent:payments", attestation: null }
+  const canonical = canonicalOfflineIntentPayload({
+    target: approvalTarget,
+    actionType: approvalActionType,
+    display: "Wire USD 4,200",
+    params: approvalParams,
+    requester,
+    requirement: {
+      requiredApprovals: 1,
+      requireHardwareKey: false,
+      allowedAaguids,
+      requesterCannotApprove: false,
+      signerClass: "human",
+    },
+    nonce: approvalNonce,
+    challengedAt: AS_OF,
+    expiresAt: "2026-09-01T12:30:00.000Z",
+  })
+  return {
+    canonicalPayload: canonical,
+    target: approvalTarget,
+    actionType: approvalActionType,
+    actionDescription: "Wire USD 4,200",
+    params: approvalParams,
+    requester,
+    signerDid: "did:intyga:alice",
+    signerPublicKey: spki(alice),
+    signature: sign(alice, canonical),
+    sigAlg: "ES256",
+    verificationCode: verificationCode(canonical),
+  }
+}
+const offlineApprovalCases = [
+  {
+    name: "offline-bare-key-without-hardware-policy-verifies",
+    receipt: offlineApproval([]),
+    options: { asOf: "2026-09-01T12:01:00.000Z", allowOffline: true },
+    ok: true,
+    signers: [spki(alice)],
+  },
+  {
+    name: "offline-aaguid-allowlist-refused",
+    receipt: offlineApproval(["cb69481e-8ff7-4039-93ec-0a2729a154a8"]),
+    options: { asOf: "2026-09-01T12:01:00.000Z", allowOffline: true },
+    ok: false,
+    reasonIncludes: "cannot be produced offline",
+  },
+]
+
 const approvals = {
   expected: {
     approverKeyIds: ["alice"],
@@ -384,8 +440,8 @@ const approvals = {
     {
       name: "valid-es256-signature-relabeled-unknown",
       receipt: { ...approvalGood, sigAlg: "UNKNOWN" },
-      ok: false,
-      reasonIncludes: "unsupported witness signature algorithm",
+      ok: true,
+      signers: [spki(alice)],
     },
     {
       name: "requester-key-labeled-mallory-under-key-only-trust",
@@ -399,6 +455,7 @@ const approvals = {
     // wrong reason — a params mismatch instead of an unsupported payload shape — is exactly the
     // divergence these vectors exist to catch.
     ...evidenceApprovalCases,
+    ...offlineApprovalCases,
   ],
 }
 
@@ -477,12 +534,12 @@ const agentAuthority = {
       signers: ["did:intyga:alice", "did:intyga:bob"],
       actionPatterns: ["payments.", "refund"],
     },
-    { name: "unknown-witness-algorithm-refused", receipt: unknownAlgAuthority, ok: false },
+    { name: "unknown-witness-algorithm-es256-fallback", receipt: unknownAlgAuthority, ok: true },
     {
       name: "key-only-authority-without-four-eyes",
       receipt: authorityGood,
       expected: { approverKeyIds: ["alice", "bob"] },
-      ok: true,
+      ok: false,
     },
     {
       name: "four-eyes-requires-identity-trust",
@@ -613,6 +670,21 @@ function proofBundle(leaf: AuditLeaf): { bundle: ProofBundle; root: string } {
   }
 }
 const pb = proofBundle(auditLeaf("1", true))
+// The checkpoint the proof's root belongs to: genesis, one entry at seq 1. Every anchor binds this
+// position (DEWP §5.2) as well as the root.
+const pbChainHash = chainHash({
+  prevChainHash: "",
+  root: pb.root,
+  seqStart: "1",
+  seqEnd: "1",
+  entryCount: 1,
+  anchoredAt: AS_OF,
+})
+const pbPosition = { seqStart: "1", seqEnd: "1", chainHash: pbChainHash }
+// A single proof carries no checkpoint, so an external witness's time is bounded against the
+// CALLER's record of it — the roots-file line for its root (DEWP §5.3/§6.2). Rekor cases pass it.
+const pbTrustedCheckpoint = { root: pb.root, ...pbPosition, entryCount: 1, anchoredAt: AS_OF }
+const AS_OF_SECONDS = Date.parse(AS_OF) / 1000
 const anchorPairs: Array<[string, Pair, SignedAnchor["algorithm"]]> = [
   ["anchor-es256", anchorEc, "ES256"],
   ["anchor-ed25519", anchorEd, "Ed25519"],
@@ -629,6 +701,7 @@ const anchors = anchorPairs.map(([id, pair, algorithm]) => {
     issuer: required(k.issuer, `issuer ${id}`),
     algorithm,
     keyId: id,
+    ...pbPosition,
   }
   return { ...base, signature: signAnchor(base, pair.privateKey) }
 })
@@ -638,23 +711,47 @@ const divergentBase = {
   issuer: required(required(keys[4], "ES256 anchor key").issuer, "ES256 issuer"),
   algorithm: "ES256" as const,
   keyId: "anchor-es256",
+  ...pbPosition,
 }
 const divergent = { ...divergentBase, signature: signAnchor(divergentBase, anchorEc.privateKey) }
 
-function rekorEntry(hash: string) {
+/** PEM for a hashedrekord `publicKey.content` (which carries base64 of the PEM text). */
+const pem = (p: Pair): string => p.publicKey.export({ format: "pem", type: "spki" }).toString()
+function rekorEntry(
+  hash: string,
+  opts: {
+    integratedTime?: number
+    submitter?: { pair: Pair; anchor: Parameters<typeof anchorDigest>[0] }
+  } = {},
+) {
+  // Without a submitter the entry carries placeholder key material: nothing checks it unless the
+  // caller pins the producer's submission key, which is exactly what the pinned cases exercise.
+  const signature = opts.submitter
+    ? {
+        content: crypto
+          .sign("sha256", anchorDigest(opts.submitter.anchor), {
+            key: opts.submitter.pair.privateKey,
+            dsaEncoding: "der",
+          })
+          .toString("base64"),
+        publicKey: { content: Buffer.from(pem(opts.submitter.pair)).toString("base64") },
+      }
+    : { content: "c2ln", publicKey: { content: "cGs=" } }
   const body = Buffer.from(
     JSON.stringify({
       apiVersion: "0.0.1",
       kind: "hashedrekord",
       spec: {
         data: { hash: { algorithm: "sha256", value: hash } },
-        signature: { content: "c2ln", publicKey: { content: "cGs=" } },
+        signature,
       },
     }),
   ).toString("base64")
   const bare = {
     body,
-    integratedTime: 1785000000,
+    // Two minutes after the checkpoint's claimed time unless a case says otherwise: inside the
+    // default DEWP §5.3 time bound.
+    integratedTime: opts.integratedTime ?? AS_OF_SECONDS + 120,
     logID: "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d",
     logIndex: 4215889,
   }
@@ -676,10 +773,60 @@ const rekorBase = {
   keyId: "rekor",
   signature: "",
   kind: "REKOR",
+  ...pbPosition,
+}
+const rekorEvidence = (entry: ReturnType<typeof rekorEntry>): string =>
+  Buffer.from(JSON.stringify(entry)).toString("base64")
+// Witnessed 117 days after the checkpoint claims to exist: what re-anchoring a rewritten old root
+// today produces. Everything else about it is genuine.
+const LATE_SECONDS = AS_OF_SECONDS + 117 * 86_400
+const rekorLateAnchor = {
+  ...rekorBase,
+  evidence: rekorEvidence(rekorEntry(rekorPayloadHashFor(rekorBase), { integratedTime: LATE_SECONDS })),
+}
+// Witnessed an hour BEFORE the checkpoint claims to exist — beyond the clock-skew tolerance.
+const rekorEarlyAnchor = {
+  ...rekorBase,
+  evidence: rekorEvidence(
+    rekorEntry(rekorPayloadHashFor(rekorBase), { integratedTime: AS_OF_SECONDS - 3600 }),
+  ),
+}
+// Submitted under the producer's own anchor key (anchor-es256), and under an impostor's.
+const rekorPinnedAnchor = {
+  ...rekorBase,
+  evidence: rekorEvidence(
+    rekorEntry(rekorPayloadHashFor(rekorBase), { submitter: { pair: anchorEc, anchor: rekorBase } }),
+  ),
+}
+const rekorImpostorAnchor = {
+  ...rekorBase,
+  evidence: rekorEvidence(
+    rekorEntry(rekorPayloadHashFor(rekorBase), { submitter: { pair: mallory, anchor: rekorBase } }),
+  ),
 }
 const rekorAnchor = {
   ...rekorBase,
   evidence: Buffer.from(JSON.stringify(rekorEntry(rekorPayloadHashFor(rekorBase)))).toString("base64"),
+}
+const secondRekorLabelBase = {
+  ...rekorBase,
+  issuer: "https://second-label.example",
+}
+const secondRekorLabelAnchor = {
+  ...secondRekorLabelBase,
+  evidence: Buffer.from(JSON.stringify(rekorEntry(rekorPayloadHashFor(secondRekorLabelBase)))).toString(
+    "base64",
+  ),
+}
+const secondLabelDivergentBase = {
+  ...secondRekorLabelBase,
+  dailyRoot: "d".repeat(64),
+}
+const secondLabelDivergentAnchor = {
+  ...secondLabelDivergentBase,
+  evidence: Buffer.from(JSON.stringify(rekorEntry(rekorPayloadHashFor(secondLabelDivergentBase)))).toString(
+    "base64",
+  ),
 }
 const badRekor = {
   ...rekorBase,
@@ -687,7 +834,10 @@ const badRekor = {
     JSON.stringify(rekorEntry(crypto.createHash("sha256").update("wrong").digest("hex"))),
   ).toString("base64"),
 }
+// Signed over the right root by a trusted key, but for a DIFFERENT seq range: not evidence for this
+// checkpoint. Only the evidence harness can hold it against a checkpoint position (see below).
 const anchorPolicy = { requiredAnchors: 2, trustedIssuers: anchors.map((a) => a.issuer), quorum: "N_OF_M" }
+const rekorOnly = { requiredAnchors: 1, trustedIssuers: [rekorBase.issuer], quorum: "N_OF_M" }
 const bundles = {
   anchorPolicy,
   cases: [
@@ -772,15 +922,183 @@ const bundles = {
       name: "valid-rekor-anchor",
       bundle: { ...pb.bundle, anchors: [rekorAnchor] },
       policy: { requiredAnchors: 1, trustedIssuers: [rekorBase.issuer], quorum: "N_OF_M" },
-      options: { trustedRoot: pb.root, rekorKeyId: "rekor" },
+      options: { trustedRoot: pb.root, trustedCheckpoint: pbTrustedCheckpoint, rekorKeyId: "rekor" },
       ok: true,
       properties: { anchorVerified: true },
+      witnessTimes: { [rekorBase.issuer]: AS_OF_SECONDS + 120 },
+    },
+    {
+      name: "rekor-scoped-issuer-in-multi-issuer-policy",
+      bundle: { ...pb.bundle, anchors: [rekorAnchor] },
+      policy: {
+        requiredAnchors: 1,
+        trustedIssuers: [rekorBase.issuer, secondRekorLabelBase.issuer],
+        quorum: "N_OF_M",
+      },
+      options: {
+        trustedRoot: pb.root,
+        trustedCheckpoint: pbTrustedCheckpoint,
+        rekorKeyId: "rekor",
+        rekorIssuer: rekorBase.issuer,
+      },
+      ok: true,
+      properties: { anchorVerified: true },
+    },
+    {
+      name: "rekor-wrong-issuer-scope-refused",
+      bundle: { ...pb.bundle, anchors: [rekorAnchor] },
+      policy: {
+        requiredAnchors: 1,
+        trustedIssuers: [rekorBase.issuer, secondRekorLabelBase.issuer],
+        quorum: "N_OF_M",
+      },
+      options: {
+        trustedRoot: pb.root,
+        trustedCheckpoint: pbTrustedCheckpoint,
+        rekorKeyId: "rekor",
+        rekorIssuer: secondRekorLabelBase.issuer,
+      },
+      ok: false,
+      properties: { anchorVerified: false },
+    },
+    {
+      name: "rekor-unscoped-multi-issuer-refused",
+      bundle: { ...pb.bundle, anchors: [rekorAnchor] },
+      policy: {
+        requiredAnchors: 1,
+        trustedIssuers: [rekorBase.issuer, secondRekorLabelBase.issuer],
+        quorum: "N_OF_M",
+      },
+      options: { trustedRoot: pb.root, trustedCheckpoint: pbTrustedCheckpoint, rekorKeyId: "rekor" },
+      ok: false,
+      properties: { anchorVerified: false },
+    },
+    {
+      name: "rekor-one-key-two-labels-cannot-fill-quorum",
+      bundle: { ...pb.bundle, anchors: [rekorAnchor, secondRekorLabelAnchor] },
+      policy: {
+        requiredAnchors: 2,
+        trustedIssuers: [rekorBase.issuer, secondRekorLabelBase.issuer],
+        quorum: "N_OF_M",
+      },
+      options: {
+        trustedRoot: pb.root,
+        trustedCheckpoint: pbTrustedCheckpoint,
+        rekorKeyId: "rekor",
+        rekorIssuer: rekorBase.issuer,
+      },
+      ok: false,
+      properties: { anchorVerified: false },
+    },
+    {
+      name: "rekor-wrong-label-cannot-declare-divergence",
+      bundle: { ...pb.bundle, anchors: [rekorAnchor] },
+      policy: {
+        requiredAnchors: 1,
+        trustedIssuers: [rekorBase.issuer, secondRekorLabelBase.issuer],
+        quorum: "N_OF_M",
+      },
+      options: {
+        trustedRoot: pb.root,
+        trustedCheckpoint: pbTrustedCheckpoint,
+        rekorKeyId: "rekor",
+        rekorIssuer: rekorBase.issuer,
+        divergenceAnchors: [rekorAnchor, secondLabelDivergentAnchor],
+      },
+      ok: true,
+      properties: { anchorVerified: true },
+    },
+    {
+      name: "rekor-anchor-witnessed-after-lag-refused",
+      bundle: { ...pb.bundle, anchors: [rekorLateAnchor] },
+      policy: rekorOnly,
+      options: { trustedRoot: pb.root, trustedCheckpoint: pbTrustedCheckpoint, rekorKeyId: "rekor" },
+      ok: false,
+      properties: { anchorVerified: false },
+      witnessTimes: { [rekorBase.issuer]: LATE_SECONDS },
+    },
+    {
+      name: "rekor-anchor-lag-within-caller-policy",
+      bundle: { ...pb.bundle, anchors: [rekorLateAnchor] },
+      policy: { ...rekorOnly, maxAnchorLagSeconds: 200 * 86_400 },
+      options: { trustedRoot: pb.root, trustedCheckpoint: pbTrustedCheckpoint, rekorKeyId: "rekor" },
+      ok: true,
+      properties: { anchorVerified: true },
+      witnessTimes: { [rekorBase.issuer]: LATE_SECONDS },
+    },
+    {
+      name: "rekor-anchor-witnessed-before-checkpoint-refused",
+      bundle: { ...pb.bundle, anchors: [rekorEarlyAnchor] },
+      policy: rekorOnly,
+      options: { trustedRoot: pb.root, trustedCheckpoint: pbTrustedCheckpoint, rekorKeyId: "rekor" },
+      ok: false,
+      properties: { anchorVerified: false },
+      witnessTimes: { [rekorBase.issuer]: AS_OF_SECONDS - 3600 },
+    },
+    {
+      name: "rekor-pinned-submitter-key-verifies",
+      bundle: { ...pb.bundle, anchors: [rekorPinnedAnchor] },
+      policy: rekorOnly,
+      options: {
+        trustedRoot: pb.root,
+        trustedCheckpoint: pbTrustedCheckpoint,
+        rekorKeyId: "rekor",
+        rekorSubmitterKeyIds: ["anchor-es256"],
+      },
+      ok: true,
+      properties: { anchorVerified: true },
+    },
+    {
+      name: "rekor-unpinned-submitter-key-refused",
+      bundle: { ...pb.bundle, anchors: [rekorImpostorAnchor] },
+      policy: rekorOnly,
+      options: {
+        trustedRoot: pb.root,
+        trustedCheckpoint: pbTrustedCheckpoint,
+        rekorKeyId: "rekor",
+        rekorSubmitterKeyIds: ["anchor-es256"],
+      },
+      ok: false,
+      properties: { anchorVerified: false },
+    },
+    {
+      name: "rekor-placeholder-submitter-refused-when-pinned",
+      bundle: { ...pb.bundle, anchors: [rekorAnchor] },
+      policy: rekorOnly,
+      options: {
+        trustedRoot: pb.root,
+        trustedCheckpoint: pbTrustedCheckpoint,
+        rekorKeyId: "rekor",
+        rekorSubmitterKeyIds: ["anchor-es256"],
+      },
+      ok: false,
+      properties: { anchorVerified: false },
+    },
+    {
+      name: "anchor-without-position-fields-refused",
+      bundle: {
+        ...pb.bundle,
+        anchors: [
+          (() => {
+            const { chainHash: _omitted, ...rest } = required(anchors[0], "first anchor")
+            return rest
+          })(),
+        ],
+      },
+      policy: {
+        requiredAnchors: 1,
+        trustedIssuers: [required(anchors[0], "first anchor").issuer],
+        quorum: "N_OF_M",
+      },
+      options: { trustedRoot: pb.root },
+      ok: false,
+      properties: { anchorVerified: false },
     },
     {
       name: "rekor-wrong-payload-refused",
       bundle: { ...pb.bundle, anchors: [badRekor] },
       policy: { requiredAnchors: 1, trustedIssuers: [rekorBase.issuer], quorum: "N_OF_M" },
-      options: { trustedRoot: pb.root, rekorKeyId: "rekor" },
+      options: { trustedRoot: pb.root, trustedCheckpoint: pbTrustedCheckpoint, rekorKeyId: "rekor" },
       ok: false,
       properties: { anchorVerified: false },
     },
@@ -801,13 +1119,22 @@ const bundles = {
   ],
 }
 
-function evidenceBundle(tenantSeqs: string[]): { bundle: EvidenceBundle; root: string } {
+function evidenceBundle(tenantSeqs: string[]): { bundle: EvidenceBundle; root: string; chainHash: string } {
   const leaves = tenantSeqs.map((n, i) => ({ ...auditLeaf(n), seq: String(i + 1), detail: `event ${i + 1}` }))
   const hashes = leaves.map(leafHash),
     blockRoot = merkleRoot(hashes),
     root = merkleRoot([hashLeaf(blockRoot)])
+  const cpChainHash = chainHash({
+    prevChainHash: "",
+    root,
+    seqStart: "1",
+    seqEnd: String(leaves.length),
+    entryCount: leaves.length,
+    anchoredAt: AS_OF,
+  })
   return {
     root,
+    chainHash: cpChainHash,
     bundle: {
       kind: EVIDENCE_BUNDLE_KIND,
       version: 1,
@@ -823,6 +1150,9 @@ function evidenceBundle(tenantSeqs: string[]): { bundle: EvidenceBundle; root: s
           anchoredAt: AS_OF,
           seqStart: "1",
           seqEnd: String(leaves.length),
+          entryCount: leaves.length,
+          prevChainHash: "",
+          chainHash: cpChainHash,
         },
       ],
       entries: leaves.map((leaf, i) => ({
@@ -867,8 +1197,24 @@ const evAnchorBase = {
   issuer: required(anchors[0], "first anchor").issuer,
   algorithm: "ES256" as const,
   keyId: "anchor-es256",
+  seqStart: "1",
+  seqEnd: "3",
+  chainHash: evGood.chainHash,
 }
 const evAnchor = { ...evAnchorBase, signature: signAnchor(evAnchorBase, anchorEc.privateKey) }
+// A genuine signature over this root, but binding a different seq range: not this checkpoint's anchor.
+const evWrongRangeBase = { ...evAnchorBase, seqEnd: "4" }
+const evWrongRange = { ...evWrongRangeBase, signature: signAnchor(evWrongRangeBase, anchorEc.privateKey) }
+// A genuine signature over a DIFFERENT root for this checkpoint's exact position: real divergence.
+const evDivergentBase = { ...evAnchorBase, dailyRoot: "f".repeat(64) }
+const evDivergent = { ...evDivergentBase, signature: signAnchor(evDivergentBase, anchorEc.privateKey) }
+// A genuine signature over a different root AND a different seq range: another checkpoint's anchor.
+const evOtherCheckpointBase = { ...evDivergentBase, seqStart: "4", seqEnd: "6" }
+const evOtherCheckpoint = {
+  ...evOtherCheckpointBase,
+  signature: signAnchor(evOtherCheckpointBase, anchorEc.privateKey),
+}
+const evFirstCheckpoint = required(evGood.bundle.checkpoints[0], "first checkpoint")
 const evPolicy = { requiredAnchors: 1, trustedIssuers: [evAnchor.issuer], quorum: "N_OF_M" }
 const evAnchored = {
   ...evGood.bundle,
@@ -897,7 +1243,44 @@ const evidence = {
       name: "evidence-caller-keyed-divergence",
       bundle: evAnchored,
       policy: evPolicy,
-      options: { trustedRoots: [evGood.root], anchors: { "cp-1": [divergent] } },
+      options: { trustedRoots: [evGood.root], anchors: { "cp-1": [evDivergent] } },
+      ok: false,
+    },
+    {
+      // Keyed to cp-1 by the caller and signed over a different root, but its own signed range names
+      // ANOTHER checkpoint (seq 4..6), so it is not divergence for cp-1 — a caller mis-filing a
+      // genuine anchor must not produce a tamper alarm. evAnchor still meets the quorum.
+      name: "evidence-caller-keyed-other-range-is-not-divergence",
+      bundle: evAnchored,
+      policy: evPolicy,
+      options: { trustedRoots: [evGood.root], anchors: { "cp-1": [evAnchor, evOtherCheckpoint] } },
+      ok: true,
+    },
+    {
+      name: "evidence-anchor-for-other-seq-range-does-not-count",
+      bundle: { ...evGood.bundle, checkpoints: [{ ...evFirstCheckpoint, anchors: [evWrongRange] }] },
+      policy: evPolicy,
+      options: { trustedRoots: [evGood.root] },
+      ok: false,
+    },
+    {
+      name: "evidence-checkpoint-chain-hash-tampered",
+      bundle: {
+        ...evGood.bundle,
+        checkpoints: [{ ...evFirstCheckpoint, chainHash: "e".repeat(64), anchors: [evAnchor] }],
+      },
+      options: { trustedRoots: [evGood.root] },
+      ok: false,
+    },
+    {
+      // The chain hash commits to anchoredAt, so a checkpoint re-dated after the fact no longer
+      // recomputes — and an anchor's time bound is measured from this committed instant.
+      name: "evidence-checkpoint-anchored-at-rewritten",
+      bundle: {
+        ...evGood.bundle,
+        checkpoints: [{ ...evFirstCheckpoint, anchoredAt: "2026-09-02T12:00:00.000Z", anchors: [evAnchor] }],
+      },
+      options: { trustedRoots: [evGood.root] },
       ok: false,
     },
     {
@@ -1112,6 +1495,267 @@ const rootsChain = {
   ],
 }
 
+// Spec-derived backstops: valid signatures must not disguise a wrong trust-anchor shape.
+const quorumAlice = ec(),
+  quorumBob = ec()
+keys.push(
+  { id: "quorum-alice", did: "did:intyga:alice", spkiB64: spki(quorumAlice) },
+  { id: "quorum-bob", did: "did:intyga:bob", spkiB64: spki(quorumBob) },
+)
+const quorumCanonical = approvalGood.canonicalPayload.replace(
+  '"requiredApprovals":1',
+  '"requiredApprovals":2',
+)
+const quorumReceipt: ApprovalReceipt = {
+  ...approvalGood,
+  canonicalPayload: quorumCanonical,
+  signatures: [quorumAlice, quorumBob].map((p, i) => ({
+    signerDid: i === 0 ? "did:intyga:alice" : "did:intyga:bob",
+    signerPublicKey: spki(p),
+    signature: sign(p, quorumCanonical),
+    sigAlg: "ES256",
+  })),
+  verificationCode: verificationCode(quorumCanonical),
+}
+const extraApprovalCases = [
+  {
+    name: "multi-person-quorum-refuses-key-only-trust",
+    receipt: quorumReceipt,
+    expected: { approverKeyIds: ["quorum-alice", "quorum-bob"] },
+    ok: false,
+    reasonIncludes: "multi-approver quorum requires a DID-mode trust anchor",
+  },
+  ...[undefined, null].map((sigAlg) => ({
+    name: `legacy-${sigAlg === null ? "null" : "missing"}-sigalg`,
+    receipt: { ...approvalGood, sigAlg },
+    ok: true,
+    signers: [spki(alice)],
+  })),
+  {
+    name: "auto-approved-witness-never-falls-back",
+    receipt: {
+      ...approvalGood,
+      signatures: [
+        {
+          signerDid: "did:intyga:alice",
+          signerPublicKey: spki(alice),
+          signature: required(approvalGood.signature, "approvalGood.signature"),
+          sigAlg: "AUTO_APPROVED",
+        },
+      ],
+    },
+    ok: false,
+  },
+]
+// PK-11 (DIV §4.4.5 rule 6): under a signed requireHardwareKey, a WEBAUTHN witness whose signed
+// authenticatorData says Backup Eligible / Backup State is refused; without the requirement a synced
+// passkey is an ordinary approver. These cases carry `approverKeyEncoding: "cose"`: a WEBAUTHN
+// witness verifies under the credential's COSE_Key, so the harness pins `coseB64`, not `spkiB64`.
+const passkeyHolder = ec()
+keys.push({
+  id: "passkey-holder",
+  did: "did:intyga:passkey-holder",
+  spkiB64: spki(passkeyHolder),
+  coseB64: cose(passkeyHolder),
+})
+const WEBAUTHN_RP = "app.example.com"
+const WEBAUTHN_ORIGIN = "https://app.example.com"
+function webauthnApproval(flags: number, requireHardwareKey: boolean): ApprovalReceipt {
+  const requester = { did: "did:intyga:agent:payments", attestation: null }
+  const canonical = canonicalIntentPayload({
+    target: approvalTarget,
+    actionType: approvalActionType,
+    display: "Wire USD 4,200",
+    params: approvalParams,
+    requester,
+    requirement: {
+      requiredApprovals: 1,
+      requireHardwareKey,
+      allowedAaguids: [],
+      requesterCannotApprove: false,
+      signerClass: "human",
+    },
+    nonce: approvalNonce,
+    expiresAt: EXPIRES,
+  })
+  const client = Buffer.from(
+    JSON.stringify({
+      type: "webauthn.get",
+      challenge: Buffer.from(canonical).toString("base64url"),
+      origin: WEBAUTHN_ORIGIN,
+      crossOrigin: false,
+    }),
+  )
+  const auth = Buffer.concat([
+    crypto.createHash("sha256").update(WEBAUTHN_RP).digest(),
+    Buffer.from([flags, 0, 0, 0, 1]),
+  ])
+  const signature = crypto.sign(
+    "sha256",
+    Buffer.concat([auth, crypto.createHash("sha256").update(client).digest()]),
+    { key: passkeyHolder.privateKey, dsaEncoding: "der" },
+  )
+  return {
+    canonicalPayload: canonical,
+    target: approvalTarget,
+    actionType: approvalActionType,
+    actionDescription: "Wire USD 4,200",
+    params: approvalParams,
+    requester,
+    signerDid: "did:intyga:passkey-holder",
+    signerPublicKey: cose(passkeyHolder),
+    signature: signature.toString("base64url"),
+    sigAlg: "WEBAUTHN",
+    authenticatorData: auth.toString("base64url"),
+    clientDataJSON: client.toString("base64url"),
+    verificationCode: verificationCode(canonical),
+  }
+}
+const UP_UV = 0x05
+const webauthnHardwareCases = [
+  { name: "webauthn-device-bound-under-hardware-key", flags: UP_UV, requireHardwareKey: true, ok: true },
+  {
+    name: "webauthn-backup-eligible-under-hardware-key-refused",
+    flags: UP_UV | 0x08,
+    requireHardwareKey: true,
+    ok: false,
+  },
+  {
+    name: "webauthn-backed-up-under-hardware-key-refused",
+    flags: UP_UV | 0x18,
+    requireHardwareKey: true,
+    ok: false,
+  },
+  {
+    name: "webauthn-backup-state-only-under-hardware-key-refused",
+    flags: UP_UV | 0x10,
+    requireHardwareKey: true,
+    ok: false,
+  },
+  {
+    name: "webauthn-synced-without-hardware-key-verifies",
+    flags: UP_UV | 0x18,
+    requireHardwareKey: false,
+    ok: true,
+  },
+].map((c) => ({
+  name: c.name,
+  receipt: webauthnApproval(c.flags, c.requireHardwareKey),
+  approverKeyEncoding: "cose",
+  expected: { approverKeyIds: ["passkey-holder"] },
+  options: { asOf: "2026-09-01T12:01:00.000Z", expectedOrigin: WEBAUTHN_ORIGIN, expectedRpId: WEBAUTHN_RP },
+  ok: c.ok,
+  ...(c.ok ? { signers: [cose(passkeyHolder)] } : { reasonIncludes: "backup-eligible" }),
+}))
+// DIV §5 step 3d: the relying party's own minimum requirement (`expected.requirement`). The signed
+// requirement is authored by the signers, so without a floor a verifier proves only the quorum they
+// stated. These reuse already-signed receipts: the floor is a verifier INPUT, never signed bytes.
+const WEAKER = "weaker than the relying party's policy"
+const floor = (requiredApprovals: number, requesterCannotApprove = false, requireHardwareKey = false) => ({
+  requirement: { requiredApprovals, requesterCannotApprove, requireHardwareKey },
+})
+const deviceBound = required(webauthnHardwareCases[0], "device-bound WebAuthn case")
+const requirementFloorCases = [
+  {
+    name: "requirement-floor-absent-proves-only-signed-quorum",
+    receipt: approvalGood,
+    ok: true,
+    signers: [spki(alice)],
+  },
+  {
+    name: "requirement-floor-quorum-downgrade-refused",
+    receipt: approvalGood,
+    expected: floor(2, true),
+    ok: false,
+    reasonIncludes: WEAKER,
+  },
+  {
+    name: "requirement-floor-four-eyes-downgrade-refused",
+    receipt: approvalGood,
+    expected: floor(1, true),
+    ok: false,
+    reasonIncludes: WEAKER,
+  },
+  {
+    name: "requirement-floor-hardware-downgrade-refused",
+    receipt: approvalGood,
+    expected: floor(1, false, true),
+    ok: false,
+    reasonIncludes: WEAKER,
+  },
+  {
+    name: "requirement-floor-equal-accepted",
+    receipt: approvalGood,
+    expected: floor(1),
+    ok: true,
+    signers: [spki(alice)],
+  },
+  {
+    name: "requirement-floor-hardware-equal-accepted",
+    receipt: deviceBound.receipt,
+    approverKeyEncoding: "cose",
+    expected: { ...deviceBound.expected, ...floor(1, false, true) },
+    options: deviceBound.options,
+    ok: true,
+    signers: [cose(passkeyHolder)],
+  },
+]
+const authorityFloorCases = [
+  {
+    name: "authority-requirement-floor-downgrade-refused",
+    receipt: authorityGood,
+    expected: floor(3),
+    ok: false,
+    reasonIncludes: WEAKER,
+  },
+  {
+    name: "authority-requirement-floor-equal-accepted",
+    receipt: authorityGood,
+    expected: floor(2),
+    ok: true,
+    signers: ["did:intyga:alice", "did:intyga:bob"],
+  },
+]
+const registry = { hashAlgorithm: "SHA-256", serialization: "RFC8785-JCS", merkleVersion: 1 }
+const envelopeCases = [
+  { name: "empty-protocol", patch: { protocol: "", version: "1.0" }, ok: false },
+  {
+    name: "registry-field-case",
+    patch: {
+      algorithmRegistry: { HashAlgorithm: "SHA-256", serialization: "RFC8785-JCS", merkleVersion: 1 },
+    },
+    ok: false,
+  },
+  { name: "legacy-revision-two", patch: { version: 2 }, ok: true },
+  { name: "null-registry", patch: { algorithmRegistry: null }, ok: false },
+  {
+    name: "current-envelope",
+    patch: { protocol: "DEWP", version: "1.0", algorithmRegistry: registry },
+    ok: true,
+  },
+  { name: "wrong-protocol", patch: { protocol: "OTHER", version: "1.0" }, ok: false },
+  { name: "future-version", patch: { protocol: "DEWP", version: "2.0" }, ok: false },
+  { name: "wrong-legacy-version", patch: { version: 3 }, ok: false },
+  { name: "missing-version", patch: { version: undefined }, ok: false },
+  { name: "wrong-hash", patch: { algorithmRegistry: { ...registry, hashAlgorithm: "SHA-512" } }, ok: false },
+  {
+    name: "wrong-serialization",
+    patch: { algorithmRegistry: { ...registry, serialization: "JSON" } },
+    ok: false,
+  },
+  {
+    name: "wrong-merkle-version",
+    patch: { algorithmRegistry: { ...registry, merkleVersion: 2 } },
+    ok: false,
+  },
+  { name: "incomplete-registry", patch: { algorithmRegistry: {} }, ok: false },
+]
+const proofBase = required(bundles.cases[0], "bundles.cases[0]")
+const evidenceBase = required(
+  evidence.cases.find((c) => c.name === "contiguous-tenant-sequence"),
+  "contiguous-tenant-sequence evidence case",
+)
+
 const out = {
   version: 1,
   generated: new Date().toISOString(),
@@ -1121,16 +1765,56 @@ const out = {
   // test must assert EVERY optional field a case carries, not just the verdict. This is how Go came
   // to report a wrong-shaped trust anchor as a quorum shortfall while its vectors stayed green.
   mustAssert:
-    "Besides `ok`, assert every optional field present on a case: signers, reasonIncludes, actionPatterns, verificationLevel, properties, total, contentVerified, commitmentOnly, brokenAt, unchained, verifiedCount.",
+    "Besides `ok`, assert every optional field present on a case: signers, reasonIncludes, actionPatterns, verificationLevel, properties, witnessTimes, total, contentVerified, commitmentOnly, brokenAt, unchained, verifiedCount. Bundle options may carry rekorSubmitterKeyIds (map to the pinned Rekor submitter keys); a policy may carry maxAnchorLagSeconds.",
   keys,
-  approvals,
+  approvals: {
+    ...approvals,
+    cases: [...approvals.cases, ...extraApprovalCases, ...webauthnHardwareCases, ...requirementFloorCases],
+  },
   platform,
-  agentAuthority,
-  bundles,
-  evidence,
+  agentAuthority: { ...agentAuthority, cases: [...agentAuthority.cases, ...authorityFloorCases] },
+  bundles: {
+    ...bundles,
+    cases: [
+      ...bundles.cases,
+      ...envelopeCases.map((c) => ({
+        name: `envelope-${c.name}`,
+        bundle: { ...proofBase.bundle, ...c.patch },
+        options: proofBase.options,
+        policy: proofBase.policy,
+        ok: c.ok,
+        ...(!c.ok ? { verificationLevel: "INVALID" } : {}),
+      })),
+    ],
+  },
+  evidence: {
+    ...evidence,
+    cases: [
+      ...evidence.cases,
+      ...envelopeCases.map((c) => ({
+        name: `envelope-${c.name}`,
+        bundle: { ...evidenceBase.bundle, ...c.patch },
+        options: evidenceBase.options,
+        ok: c.ok,
+      })),
+    ],
+  },
   rootsChain,
+  // Kept last and self-contained (own keys) so it merges and regenerates independently.
+  dewpEvidenceHardening: buildDewpEvidenceHardening(),
+  // Self-contained like the section above (2026-09-27 review L15-L18, I7, I8).
+  verifierInputHardening: buildVerifierInputHardening(),
 }
 writeFileSync(
   fileURLToPath(new URL("../../vectors/verifier-parity-vectors.json", import.meta.url)),
+  `${JSON.stringify(out, null, 2)}\n`,
+)
+writeFileSync(
+  fileURLToPath(
+    new URL(
+      "../../../../apps/marketing/public/specs/v1.0/vectors/verifier-parity-vectors.json",
+      import.meta.url,
+    ),
+  ),
   `${JSON.stringify(out, null, 2)}\n`,
 )

@@ -10,8 +10,10 @@ import { type AuditLeaf, leafHash } from "./ledger-leaf.js"
 import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
 
 // The downloadable proof bundle a member exports (GET /api/audit/proof/:seq) and what it means to
-// verify one. A verdict is only as strong as the daily root you check against: obtain that root from
-// the EXTERNAL anchor (anchorRef), never from the bundle itself.
+// verify one. A verdict is only as strong as the daily root you check against: use a root you
+// obtained before and independently of this bundle — one you recorded earlier, or one from the
+// published roots file — never one copied out of the bundle itself. (An external anchor cannot hand
+// you the root: Rekor stores a hash of the anchor digest and a TSA the digest, neither reveals it.)
 
 // DEWP canonical kind (docs/DEWP.md §6.2). Producers emit this form and verifiers require it; there
 // is no vendor-prefixed alias, since no bundle has ever been exported under one.
@@ -152,10 +154,23 @@ export type VerificationLevel =
   | "FULLY_VERIFIED"
 
 export interface BundleVerification {
-  /** Overall verdict. Only true when the root was supplied independently AND every applicable check passed. */
+  /** Overall verdict. Only true when the caller supplied the root AND every applicable check passed. */
   ok: boolean
   dailyRoot: string | null
-  rootSource: "independent" | "self-asserted" | "none"
+  /**
+   * Where the root verified against came from. `caller-supplied` means only that: the caller passed
+   * it in. This verifier cannot tell a root recorded independently from one copied out of this very
+   * bundle, so it never labels a root "independent" — that is the caller's claim to make, and it is
+   * only true of a root obtained before and apart from the export (an earlier record, or the
+   * published roots file). `self-asserted` is the bundle's own root; `none` means there was none.
+   */
+  rootSource: "caller-supplied" | "self-asserted" | "none"
+  /**
+   * Authenticated external witness time per anchor issuer, Unix seconds (Rekor integratedTime, TSA
+   * genTime), for every external anchor whose evidence verified — including ones refused by the
+   * time bound. Empty when no quorum was evaluated.
+   */
+  witnessTimes: Record<string, number>
   /** DEWP §7.1 independent properties. */
   properties: VerificationProperties
   /** DEWP §7.1 summary level derived from `properties`. */
@@ -228,16 +243,94 @@ export interface VerifyOptions {
    */
   externalKeys?: ExternalAnchorKeys
 
-  /** The daily root obtained from the external anchor. Required for a trustworthy verdict. */
+  /**
+   * The daily root to verify against. Required for `ok`. It is only as independent as its source:
+   * a root recorded earlier or taken from the published roots file is; a root copied from this
+   * bundle is not, and the verdict labels it `caller-supplied` either way.
+   */
   trustedRoot?: string
   /**
    * Signed anchor objects over the daily root (DEWP §5.2). When supplied with `anchorPolicy` and
    * `resolveAnchorKey`, `anchorVerified` reflects a real multi-anchor quorum check (signatures over
-   * the 0x03-tagged digest) instead of the weaker "an independent root was handed to me" signal.
+   * the 0x03-tagged digest) instead of the weaker "a root was handed to me" signal.
    */
   anchors?: SignedAnchor[]
   anchorPolicy?: AnchorPolicy
   resolveAnchorKey?: AnchorKeyResolver
+  /**
+   * The checkpoint this proof's root belongs to, as YOU hold it — normally the chain-verified line of
+   * the published roots file for that root (DEWP §5.4.1). A single proof carries no checkpoint of its
+   * own, so this is the only checkpoint time and chain hash an anchor can be held to: without it an
+   * external witness (Rekor, RFC 3161) does not count, because the §5.3 time bound would be measured
+   * against the anchor's own producer-chosen `timestamp`. Its `root` stands in for `trustedRoot` when
+   * that is absent, and must equal it when both are given; its `entryCount` bounds the proof's leaf
+   * counts.
+   */
+  trustedCheckpoint?: TrustedCheckpoint
+}
+
+/**
+ * A checkpoint record the CALLER trusts (DEWP §5.4.1 roots-file line). Every field but `root` is
+ * optional because a hand-built minimal list may carry only roots; a field that is present is binding.
+ */
+export interface TrustedCheckpoint {
+  root: string
+  seqStart?: string | null
+  seqEnd?: string | null
+  entryCount?: number | null
+  anchoredAt?: string | null
+  chainHash?: string | null
+}
+
+/**
+ * Why a proof's leaf counts cannot belong to a checkpoint committing `entryCount` events, or null.
+ *
+ * `blockLeafCount`/`checkpointLeafCount` arrive inside the proof, so a prover can shrink them: an
+ * interior node of a 4-leaf block then verifies as "leaf 0 of a 2-leaf block" — a redacted event that
+ * never existed. A checkpoint's entry count is the sum of its blocks' leaf counts, which bounds both.
+ */
+export function leafCountMismatch(
+  proof: InclusionProof,
+  entryCount: number | null | undefined,
+): string | null {
+  if (typeof entryCount !== "number" || !Number.isSafeInteger(entryCount) || entryCount < 0) return null
+  const { blockLeafCount, checkpointLeafCount } = proof
+  if (!Number.isSafeInteger(blockLeafCount) || !Number.isSafeInteger(checkpointLeafCount)) return null
+  if (
+    checkpointLeafCount > entryCount ||
+    blockLeafCount + checkpointLeafCount - 1 > entryCount ||
+    (checkpointLeafCount === 1 && blockLeafCount !== entryCount)
+  ) {
+    return (
+      `proof claims ${blockLeafCount} leaves in its block and ${checkpointLeafCount} block(s) under the ` +
+      `checkpoint, which cannot sum to the checkpoint's ${entryCount} committed events`
+    )
+  }
+  return null
+}
+
+/** DEWP §7 check 1 / §12: never interpret a future protocol under today's algorithms.
+ * Numeric revisions 1 and 2 without a protocol is the explicitly supported legacy export format.
+ */
+export function supportedEnvelope(bundle: {
+  protocol?: string
+  version: unknown
+  algorithmRegistry?: AlgorithmRegistry
+}): boolean {
+  if (bundle.protocol != null && bundle.protocol !== "DEWP") return false
+  if (
+    bundle.version !== "1.0" &&
+    !(bundle.protocol == null && (bundle.version === 1 || bundle.version === 2))
+  )
+    return false
+  const a = bundle.algorithmRegistry
+  return (
+    a === undefined ||
+    (a !== null &&
+      a.hashAlgorithm === "SHA-256" &&
+      a.serialization === "RFC8785-JCS" &&
+      a.merkleVersion === 1)
+  )
 }
 
 export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): BundleVerification {
@@ -247,9 +340,9 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
   // other value." A note let a container of one type be fed to the verifier for another and still
   // come back ok — the caller would be reading a verdict produced under semantics the artifact was
   // never built for. `verifyEvidenceBundle` has always rejected; this is the same rule.
-  const kindRejected = bundle.kind !== BUNDLE_KIND
+  const kindRejected = bundle.kind !== BUNDLE_KIND || !supportedEnvelope(bundle)
   if (kindRejected) {
-    notes.push(`Refusing bundle kind "${bundle.kind}" (expected "${BUNDLE_KIND}") — DEWP §6.5.`)
+    notes.push("Refusing bundle kind, protocol, version or algorithm registry (DEWP §7/§12).")
   }
 
   // An unknown Application Profile means an unknown canonical-array layout (DEWP §4.5). Recomputing
@@ -268,16 +361,27 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
   // Which root do we verify against, and how much do we trust its provenance?
   let dailyRoot: string | null
   let rootSource: BundleVerification["rootSource"]
-  if (opts.trustedRoot) {
-    dailyRoot = opts.trustedRoot
-    rootSource = "independent"
+  const trustedCheckpoint = opts.trustedCheckpoint
+  const callerRoot = opts.trustedRoot || trustedCheckpoint?.root
+  // Two caller inputs naming different roots: which one the caller meant is unknowable, so neither wins.
+  const checkpointConflict = Boolean(
+    opts.trustedRoot && trustedCheckpoint && trustedCheckpoint.root !== opts.trustedRoot,
+  )
+  if (checkpointConflict) {
+    notes.push(
+      "The supplied trustedCheckpoint names a different root than trustedRoot — refusing to pick one.",
+    )
+  }
+  if (callerRoot) {
+    dailyRoot = callerRoot
+    rootSource = "caller-supplied"
   } else if (selfAssertedRoot) {
     dailyRoot = selfAssertedRoot
     rootSource = "self-asserted"
     notes.push(
-      "No independent root supplied — verifying against the root inside the bundle. This proves the " +
-        "bundle is internally consistent, NOT that it matches Intyga's anchored log. Re-run with the " +
-        "root from the external anchor (anchorRef) for a real verdict.",
+      "No root supplied — verifying against the root inside the bundle. This proves the bundle is " +
+        "internally consistent, NOT that it matches the producer's anchored log. Re-run with a root " +
+        "you obtained earlier or from the published roots file for a real verdict.",
     )
   } else {
     dailyRoot = null
@@ -285,18 +389,25 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     notes.push("No daily root available (event not yet committed to an anchored checkpoint).")
   }
 
+  // DEWP §17.3: the proof's own leaf counts are bound to the trusted checkpoint's entry count.
+  const countMismatch =
+    trustedCheckpoint && dailyRoot === trustedCheckpoint.root
+      ? leafCountMismatch(bundle.proof, trustedCheckpoint.entryCount)
+      : null
   const inclusion: CheckResult =
     dailyRoot === null
       ? { pass: null, detail: "No daily root to verify against." }
-      : verifyInclusionProof(bundle.proof, dailyRoot)
-        ? {
-            pass: true,
-            detail: "Event leaf recomputes to the daily root through block and checkpoint.",
-          }
-        : {
-            pass: false,
-            detail: "Recomputed root does not match — proof is invalid for this root.",
-          }
+      : countMismatch
+        ? { pass: false, detail: `${countMismatch} — the proof is not for this checkpoint's tree.` }
+        : verifyInclusionProof(bundle.proof, dailyRoot)
+          ? {
+              pass: true,
+              detail: "Event leaf recomputes to the daily root through block and checkpoint.",
+            }
+          : {
+              pass: false,
+              detail: "Recomputed root does not match — proof is invalid for this root.",
+            }
 
   const rootConsistency: CheckResult =
     dailyRoot === null
@@ -417,7 +528,8 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
   const contentBoundWhenPresent = bundle.event.canonical ? leafBinding.pass === true : true
   const ok =
     !kindRejected &&
-    rootSource === "independent" &&
+    !checkpointConflict &&
+    rootSource === "caller-supplied" &&
     inclusion.pass === true &&
     rootConsistency.pass === true &&
     leafBinding.pass !== false &&
@@ -432,7 +544,7 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     contentVerified && bundle.event.canonical ? verifyEmbeddedSignature(bundle.event.canonical) : false
   // Anchor verification (DEWP §5.3). If signed anchors + a policy are supplied, require a real quorum
   // over the daily root. Otherwise fall back to the weaker signal: the checkpoint root was handed to
-  // us from an independent external source (not the bundle's own self-asserted flag).
+  // us by the caller (not the bundle's own self-asserted flag).
   //
   // Anchors carried INSIDE the bundle are used only when the caller supplied a policy and a key
   // resolver — the signatures are then checked against keys the VERIFIER trusts, so a bundle cannot
@@ -443,22 +555,42 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
   ]
   // Bundle-carried anchors may COUNT toward quorum — they still have to verify under a key the
   // caller trusts, so a bundle cannot vouch for itself. They may not, however, trigger the fatal
-  // DIVERGENCE verdict: an anchor's signed preimage carries no checkpoint identity, so a genuine
-  // anchor from another day is indistinguishable from a conflicting one, and appending a real,
-  // publicly available anchor would be enough to make a valid proof read as tampering. Only anchors
-  // the caller fetched itself, per checkpoint, can establish divergence.
+  // DIVERGENCE verdict. A single proof carries no checkpoint position of its own to hold an anchor's
+  // signed seq range against, so a genuine anchor from another day is indistinguishable here from a
+  // conflicting one, and appending a real, publicly available anchor would be enough to make a valid
+  // proof read as tampering. Only anchors the caller fetched itself, per checkpoint, can establish
+  // divergence.
   const divergenceAnchors = opts.anchors ?? []
   let anchorVerified: boolean
+  let witnessTimes: Record<string, number> = {}
   // Gated on the CALLER having asked (policy + resolver), never on candidates existing: a bundle
   // shipped with its anchors stripped must evaluate to "quorum not met (0/N)" under a supplied
-  // policy — falling back to the weaker independent-root signal there would let the prover switch
+  // policy — falling back to the weaker caller-supplied-root signal there would let the prover switch
   // off the very check the caller configured.
-  if (opts.anchorPolicy && opts.resolveAnchorKey && dailyRoot) {
-    const q = verifyAnchorQuorum(candidateAnchors, dailyRoot, opts.anchorPolicy, opts.resolveAnchorKey, {
-      divergenceAnchors,
-      externalKeys: opts.externalKeys,
-    })
+  if (opts.anchorPolicy && (opts.resolveAnchorKey || opts.externalKeys) && dailyRoot) {
+    const q = verifyAnchorQuorum(
+      candidateAnchors,
+      dailyRoot,
+      opts.anchorPolicy,
+      opts.resolveAnchorKey ?? (() => null),
+      {
+        divergenceAnchors,
+        externalKeys: opts.externalKeys,
+        // A single proof carries no checkpoint, so the only position and time an anchor can be held
+        // to is the caller's own record. Naming an EMPTY checkpoint when there is none is deliberate:
+        // it keeps an external witness from being bounded by the anchor's producer-chosen timestamp.
+        checkpoint: trustedCheckpoint
+          ? {
+              seqStart: trustedCheckpoint.seqStart,
+              seqEnd: trustedCheckpoint.seqEnd,
+              chainHash: trustedCheckpoint.chainHash,
+              anchoredAt: trustedCheckpoint.anchoredAt,
+            }
+          : {},
+      },
+    )
     anchorVerified = commitmentVerified && q.ok
+    witnessTimes = q.witnessTimes
     if (q.divergence) {
       notes.push(`ANCHOR DIVERGENCE — ${q.reason}. Treating as INVALID.`)
     } else if (!q.ok && q.reason) {
@@ -466,8 +598,7 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     } else if (q.ok) {
       notes.push(`Anchor quorum met: ${q.verifiedIssuers.length} independent issuer(s) signed this root.`)
     }
-    // RFC 3161 honesty: a TSA anchor is real evidence this tool cannot check offline; say so rather
-    // than let "quorum not met" read as "unanchored".
+    // Report TSA evidence that could not be verified under the caller's configuration.
     if (q.note) notes.push(q.note)
     // A divergent anchor is fatal regardless of inclusion.
     if (q.divergence) {
@@ -475,6 +606,7 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
         ok: false,
         dailyRoot,
         rootSource,
+        witnessTimes,
         properties: {
           commitmentVerified,
           contentVerified,
@@ -490,13 +622,15 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     // DEWP §3 Invariant 7 / §7.1: anchorVerified holds IF AND ONLY IF the root was verified against
     // an anchor quorum. Being handed a root out of band is not that check — no anchor signature was
     // examined — so it cannot make this property true, and FULLY_VERIFIED must stay out of reach.
-    // `rootSource: "independent"` already reports the weaker provenance signal on its own.
+    // `rootSource: "caller-supplied"` already reports the weaker provenance signal on its own.
     anchorVerified = false
     if (opts.anchorPolicy) {
-      notes.push("Anchor quorum could not be evaluated: a daily root and resolveAnchorKey are required.")
-    } else if (commitmentVerified && rootSource === "independent") {
       notes.push(
-        "An independently supplied root was used, but no anchor policy was given, so no anchor " +
+        "Anchor quorum could not be evaluated: a daily root and resolveAnchorKey or externalKeys are required.",
+      )
+    } else if (commitmentVerified && rootSource === "caller-supplied") {
+      notes.push(
+        "A caller-supplied root was used, but no anchor policy was given, so no anchor " +
           "signature or quorum was evaluated (DEWP §5.2/§5.3): anchorVerified stays false and " +
           "FULLY_VERIFIED is not reachable. Supply anchors + anchorPolicy + resolveAnchorKey for a " +
           "real quorum verdict.",
@@ -519,6 +653,7 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     ok: ok && (!opts.anchorPolicy || anchorVerified),
     dailyRoot,
     rootSource,
+    witnessTimes,
     properties,
     verificationLevel,
     checks: { inclusion, rootConsistency, leafBinding, headerBinding, anchored },

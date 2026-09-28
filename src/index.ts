@@ -193,7 +193,8 @@ export class NonCanonicalValue extends Error {}
 export function stableStringify(value: unknown): string {
   if (value === null) return "null"
   const t = typeof value
-  if (t === "string" || t === "boolean") return JSON.stringify(value)
+  if (t === "string") return canonicalString(value as string)
+  if (t === "boolean") return JSON.stringify(value)
   if (t === "number") {
     const n = value as number
     if (!Number.isFinite(n)) throw new NonCanonicalValue("NaN/Infinity is not JSON")
@@ -231,7 +232,23 @@ export function stableStringify(value: unknown): string {
   }
   const obj = value as Record<string, unknown>
   const keys = Object.keys(obj).sort()
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`
+  return `{${keys.map((k) => `${canonicalString(k)}:${stableStringify(obj[k])}`).join(",")}}`
+}
+
+// An unpaired UTF-16 surrogate (a high surrogate with no low one after it, or a low one with no high
+// one before it). Lookarounds rather than `String.prototype.isWellFormed`, which Node 18 lacks.
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+
+/**
+ * A string (value or member name) as RFC 8785 serializes it, refusing one that is not valid Unicode.
+ * RFC 8785 builds on I-JSON (RFC 7493 §2.1), which forbids unpaired surrogates. `JSON.stringify`
+ * would escape one as `\udXXX` — and then a receipt carrying one verified here while Go (U+FFFD),
+ * Rust and Python (refusal) could not agree on the same input (DIV §4.1). Mirrors mcp-schemas.
+ */
+function canonicalString(s: string): string {
+  if (LONE_SURROGATE.test(s))
+    throw new NonCanonicalValue("a string contains an unpaired UTF-16 surrogate, which is not I-JSON")
+  return JSON.stringify(s)
 }
 
 /** The requesting workload's identity, as bound into a DIV Intent Payload. Mirrors mcp-schemas. */
@@ -294,7 +311,7 @@ export function validateAgentIntentContext(context: AgentIntentContext, expiresA
   )
     throw new Error("agent monetary amount and aggregate disagree")
   const from = Date.parse(nbf)
-  const to = Date.parse(expiresAt)
+  const to = parseRfc3339Ms(expiresAt)
   if (
     !Number.isFinite(from) ||
     !Number.isFinite(to) ||
@@ -304,6 +321,41 @@ export function validateAgentIntentContext(context: AgentIntentContext, expiresA
     new Date(to).toISOString() !== expiresAt
   )
     throw new Error("agent intent must use canonical UTC times within five minutes")
+}
+
+// RFC 3339 §5.6 `date-time`, strictly: four-digit year, uppercase `T`, seconds present, an optional
+// fraction of 1–9 digits, and an explicit `Z` or `±hh:mm` zone. Ranges are checked separately below.
+const RFC3339_DATE_TIME =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-](\d{2}):(\d{2}))$/
+
+/**
+ * Milliseconds since the epoch for a signed RFC 3339 timestamp, or NaN (DIV §6.2).
+ *
+ * `Date.parse` alone is far too lenient for signed times: it accepts a bare date, a zone-less time
+ * (read in the HOST's timezone, so the verdict moved with the machine's TZ setting), lowercase
+ * separators and 30 February, which it rolls into March. Every port applies this same grammar:
+ * the date must exist, hours 00–23, minutes and seconds 00–59 (no leap second — Go and ECMAScript
+ * refuse `:60`), offset hours 00–23 and minutes 00–59.
+ */
+function parseRfc3339Ms(value: unknown): number {
+  if (typeof value !== "string") return Number.NaN
+  const m = RFC3339_DATE_TIME.exec(value)
+  if (!m) return Number.NaN
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number) as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ]
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+  if (days === undefined || day < 1 || day > days || hour > 23 || minute > 59 || second > 59)
+    return Number.NaN
+  if (m[7] !== undefined && (Number(m[7]) > 23 || Number(m[8]) > 59)) return Number.NaN
+  const ms = Date.parse(value)
+  return Number.isFinite(ms) ? ms : Number.NaN
 }
 
 /** DIV protocol version and type discriminator — identical to mcp-schemas. */
@@ -394,12 +446,14 @@ export const MAX_DELEGATION_WINDOW_HOURS = 72
  *  - `requiredApprovals` — fully checkable. Counts distinct trusted approver signatures.
  *  - `requesterCannotApprove` — fully checkable. The requester DID is in the same signed payload.
  *  - `requireHardwareKey` — PARTIALLY checkable. A verifier can confirm the witness is a WebAuthn
- *    assertion rather than a bare P-256 key, but an assertion carries no attestation, so it cannot
- *    distinguish a discrete security key from a synced platform passkey.
+ *    assertion rather than a bare P-256 key, and it refuses one whose signed authenticatorData says
+ *    Backup Eligible or Backup State (a synced passkey announcing itself). An assertion carries no
+ *    attestation, though, so BE=0 is the authenticator's claim, not proof of a discrete security key.
  *  - `allowedAaguids` — NOT checkable offline. The AAGUID lives in attestedCredentialData, which is
  *    present at REGISTRATION, not in an assertion. Only the gateway (which stored it at enrollment)
- *    can enforce this. It is carried here so the approver signs the policy they were told applied,
- *    not so a relying party can re-derive it.
+ *    can enforce the model. What a verifier CAN do is refuse what obviously cannot satisfy it: a
+ *    non-empty allowlist is treated exactly like `requireHardwareKey` — a bare-key witness is refused
+ *    and an offline proof is refused outright (`requiresHardwareCredential`).
  *  - `signerClass` — PARTIALLY checkable, and differently per witness kind. For a WEBAUTHN witness
  *    the UV flag (already required by `verifyWebAuthnSignature`) is cryptographic evidence a
  *    user-verification ceremony — a human gesture — happened at signing. An ES256 witness carries no
@@ -411,6 +465,23 @@ export const MAX_DELEGATION_WINDOW_HOURS = 72
  *    `signerClass: "human"` — humans legitimately sign with raw P-256 keys (offline break-glass);
  *    a deployment wanting cryptographic proof of the ceremony pins `requireHardwareKey`.
  */
+/**
+ * Whether a signed requirement can only be met by a hardware-backed WebAuthn credential: an explicit
+ * `requireHardwareKey`, OR a non-empty `allowedAaguids` model allowlist. The two are the same class of
+ * policy for every check a verifier can make — a bare key satisfies neither, and neither can be met
+ * offline — so they are refused together. Treating the allowlist as "not checkable, so not checked"
+ * let a bare software key satisfy a YubiKey-only rule on every offline path.
+ */
+export function requiresHardwareCredential(requirement: {
+  requireHardwareKey?: unknown
+  allowedAaguids?: unknown
+}): boolean {
+  return (
+    requirement.requireHardwareKey === true ||
+    (Array.isArray(requirement.allowedAaguids) && requirement.allowedAaguids.length > 0)
+  )
+}
+
 export interface ApprovalRequirementAttestation {
   requiredApprovals: number
   requireHardwareKey: boolean
@@ -516,8 +587,18 @@ export function canonicalIntentPayload(input: {
     evidence: null,
     ...commonSignedFields(input.requester, input.requirement),
     nonce: input.nonce,
+    // The four agent-extension keys by NAME, never a spread: a context object carrying any other
+    // top-level key (`target`, `params`, …) would otherwise overwrite the signed fields above, so a
+    // relying party that filled `agentContext` from the receipt itself would verify the receipt
+    // against its own bytes. The Go, Rust, Java and Python builders copy exactly these four.
     ...(input.agentContext
-      ? { ...input.agentContext, exp: input.expiresAt }
+      ? {
+          action: input.agentContext.action,
+          agent: input.agentContext.agent,
+          session: input.agentContext.session,
+          nbf: input.agentContext.nbf,
+          exp: input.expiresAt,
+        }
       : { expiresAt: input.expiresAt }),
   })
 }
@@ -766,6 +847,62 @@ const INVALID_QUORUM_REASON =
   "signed requirement.requiredApprovals must be an integer of at least 1 (DIV §4.3.2)"
 
 /**
+ * The MINIMUM approval requirement YOUR policy demands for this action (DIV §5 step 3d).
+ *
+ * The signed `requirement` is authored by whoever composed the bytes the approvers signed — the
+ * issuing gateway, or any one approver composing their own payload. Its signature protects it
+ * against third parties, NOT against the signers the quorum constrains: an approver who is also
+ * the requester can sign `{ requiredApprovals: 1, requesterCannotApprove: false }` alone and, without
+ * a floor, that receipt verifies. Supplying the floor makes the verifier refuse any signed
+ * requirement weaker than it, before a single signature is counted.
+ *
+ * Without a floor the verifier proves only the signers' OWN stated quorum. Supply one whenever you
+ * hold the approval rule (a trust bundle, a pinned policy, your own configuration).
+ *
+ * Only strictly weaker values are refused: a signed requirement at least as strict passes, and the
+ * signed value is what is then enforced. `allowedAaguids` is not floored — express a model
+ * restriction as `requireHardwareKey`, which a verifier can at least partially check.
+ */
+export interface RequirementFloor {
+  /** Integer ≥ 1. The signed `requiredApprovals` must be at least this. */
+  requiredApprovals: number
+  /** When true, the signed requirement must also forbid the requester approving. Defaults to false. */
+  requesterCannotApprove?: boolean
+  /** When true, the signed requirement must also demand a hardware key. Defaults to false. */
+  requireHardwareKey?: boolean
+}
+
+/** The reason stem every port uses when a signed requirement is below the caller's floor. */
+export const WEAKER_REQUIREMENT_REASON = "signed requirement is weaker than the relying party's policy"
+
+/**
+ * DIV §5 step 3d. `null` when no floor was supplied or the signed requirement meets it. Fails CLOSED
+ * on a malformed floor: a floor the caller got wrong must not silently become "no floor".
+ */
+function requirementFloorProblem(
+  signed: Partial<ApprovalRequirementAttestation>,
+  floor: RequirementFloor | undefined,
+): string | null {
+  if (floor === undefined || floor === null) return null
+  if (
+    typeof floor !== "object" ||
+    typeof floor.requiredApprovals !== "number" ||
+    !isValidQuorum(floor.requiredApprovals) ||
+    (floor.requesterCannotApprove !== undefined && typeof floor.requesterCannotApprove !== "boolean") ||
+    (floor.requireHardwareKey !== undefined && typeof floor.requireHardwareKey !== "boolean")
+  )
+    return "expected.requirement is malformed: requiredApprovals must be an integer of at least 1 and the flags booleans"
+  const signedApprovals = signed.requiredApprovals ?? 0
+  if (signedApprovals < floor.requiredApprovals)
+    return `${WEAKER_REQUIREMENT_REASON}: it requires ${signedApprovals} approval(s), the policy ${floor.requiredApprovals} (DIV §5 step 3d)`
+  if (floor.requesterCannotApprove === true && signed.requesterCannotApprove !== true)
+    return `${WEAKER_REQUIREMENT_REASON}: it does not forbid the requester approving (DIV §5 step 3d)`
+  if (floor.requireHardwareKey === true && signed.requireHardwareKey !== true)
+    return `${WEAKER_REQUIREMENT_REASON}: it does not require a hardware key (DIV §5 step 3d)`
+  return null
+}
+
+/**
  * The approver identities/keys YOU trust, resolved from your own key-management policy.
  *
  * This is the single most important input to verification. Without it, `verifyApprovalReceipt` would
@@ -858,6 +995,13 @@ export interface ReceiptExpectation {
   requesterDid?: string
   /** Independent PEP state for an AI_AGENT receipt. Never copy this from the receipt. */
   agentContext?: AgentIntentContext
+  /**
+   * STRONGLY RECOMMENDED. The minimum requirement YOUR approval rule demands for this action — see
+   * RequirementFloor. Without it this verifier enforces only the quorum the signers themselves
+   * stated, which one approver (possibly the requester) can set to 1-of-1. Under a delegation, pass
+   * the ORDINARY rule: the delegated quorum must already be at least as strict (DIV §5a.5).
+   */
+  requirement?: RequirementFloor
 }
 
 /** Verification options. The WebAuthn expectations are mandatory for a WEBAUTHN receipt. */
@@ -866,7 +1010,12 @@ export interface VerifyReceiptOptions {
   /** A complete root-to-leaf, independently trusted chain is mandatory for delegated agent receipts. */
   agentAuthorityChain?: Array<{
     receipt: ApprovalReceipt
-    expected: { approvers: ApproverTrustAnchor; target: string; agentDid: string }
+    expected: {
+      approvers: ApproverTrustAnchor
+      target: string
+      agentDid: string
+      requirement?: RequirementFloor
+    }
   }>
   /**
    * Accept an OFFLINE APPROVAL (`type: "div-offline-intent"`). Defaults to FALSE — an offline proof is
@@ -932,6 +1081,8 @@ export interface VerifyReceiptOptions {
 // WebAuthn authenticatorData flag bits (WebAuthn L3 §6.1).
 const AUTH_DATA_FLAG_UP = 0x01 // User Present
 const AUTH_DATA_FLAG_UV = 0x04 // User Verified
+const AUTH_DATA_FLAG_BE = 0x08 // Backup Eligible — the credential may be synced to other devices
+const AUTH_DATA_FLAG_BS = 0x10 // Backup State — the credential is currently backed up
 
 /**
  * The keys we are willing to accept this witness under, drawn ENTIRELY from the caller's trust anchor.
@@ -960,7 +1111,12 @@ function candidateKeys(
    */
   restrictTo?: string[],
 ): { keys: { key: string; identity: string }[] } | { reason: string } {
-  if (anchor.publicKeys) {
+  // Plain-JS callers can hand over any shape; a malformed anchor is a refusal, never a TypeError.
+  if (typeof anchor !== "object" || anchor === null)
+    return { reason: "trust anchor must be { publicKeys } or { dids, resolveKey }" }
+  if (anchor.publicKeys !== undefined) {
+    if (!Array.isArray(anchor.publicKeys) || anchor.publicKeys.some((k) => typeof k !== "string"))
+      return { reason: "trust anchor publicKeys must be an array of base64 key strings" }
     // A delegation names identities, and in publicKeys mode `signerDid` is an unverified string —
     // enforcing `delegatedTo` against it would be security theatre. Refuse rather than pretend.
     if (restrictTo)
@@ -971,6 +1127,8 @@ function candidateKeys(
     if (anchor.publicKeys.length === 0) return { reason: "trusted approver allowlist is empty" }
     return { keys: anchor.publicKeys.map((key) => ({ key, identity: key })) }
   }
+  if (!Array.isArray(anchor.dids))
+    return { reason: "trust anchor must be { publicKeys } or { dids, resolveKey }" }
   if (!witness.signerDid || !anchor.dids.includes(witness.signerDid)) {
     return { reason: `signer ${witness.signerDid || "(unknown)"} is not an authorized approver` }
   }
@@ -1015,6 +1173,24 @@ function candidateKeys(
   return { reason: `no trusted key could be resolved for ${witness.signerDid}` }
 }
 
+/**
+ * One key, one person (DIV §4.4.6). An identity-associating anchor that maps the SAME key to two
+ * DIDs (an export bug, or one person enrolled under two identifiers) would otherwise let that key's
+ * holder count as two approvers, since quorum counts distinct identities. So a key already counted
+ * for one identity cannot count for another: distinct keys AND distinct identities are required.
+ * Keys are compared by their decoded bytes, so padded/unpadded and base64/base64url spellings of one
+ * encoding match; the same key in a different encoding (COSE vs SPKI) is not detected.
+ * Records the key when it is free; returns the refusal reason when it is not.
+ */
+function sharedKeyProblem(counted: Map<string, string>, key: string, identity: string): string | null {
+  const fingerprint = Buffer.from(key, "base64").toString("hex")
+  const owner = counted.get(fingerprint)
+  if (owner !== undefined && owner !== identity)
+    return `signer ${identity} verified under a key already counted for ${owner}; two approver identities sharing one key count once (DIV §4.4.6)`
+  counted.set(fingerprint, identity)
+  return null
+}
+
 /** Verify one witness signature over the canonical payload, using an already-TRUSTED key. */
 function verifyWitness(
   witness: ApprovalWitness,
@@ -1022,10 +1198,11 @@ function verifyWitness(
   canonicalPayload: string,
   opts: VerifyReceiptOptions,
 ): { ok: true } | { ok: false; reason: string } {
-  if (witness.sigAlg !== "ES256" && witness.sigAlg !== "WEBAUTHN") {
+  // DIV §4.4.2: legacy missing/unknown labels use ES256; AUTO_APPROVED never does.
+  if (witness.sigAlg === "AUTO_APPROVED" || (witness.sigAlg != null && typeof witness.sigAlg !== "string")) {
     return { ok: false, reason: "unsupported witness signature algorithm" }
   }
-  if (witness.sigAlg === "ES256") {
+  if (witness.sigAlg !== "WEBAUTHN") {
     return verifyEcdsaP256(trustedKey, canonicalPayload, witness.signature)
       ? { ok: true }
       : { ok: false, reason: "signature does not verify against the trusted signer key" }
@@ -1044,28 +1221,92 @@ function verifyWitness(
         "WebAuthn receipts require expectedOrigin and expectedRpId — without them an assertion from any relying party would verify",
     }
   }
+  return verifyWebAuthnAssertion(
+    {
+      authenticatorData: witness.authenticatorData,
+      clientDataJSON: witness.clientDataJSON,
+      signature: witness.signature,
+    },
+    // The COSE key is parsed from the TRUSTED key, not from the receipt's copy.
+    () => coseKeyObject(Buffer.from(trustedKey, "base64")),
+    canonicalPayload,
+    {
+      expectedOrigins: [opts.expectedOrigin],
+      expectedRpId: opts.expectedRpId,
+      requireUserVerification: opts.requireUserVerification !== false,
+      allowCrossOrigin: opts.allowCrossOrigin === true,
+    },
+  )
+}
+
+/** A P-256 COSE_Key as a Node key object. Throws on anything else (see parseCosePublicKey). */
+function coseKeyObject(cose: Buffer): crypto.KeyObject {
+  const { x, y } = parseCosePublicKey(cose)
+  return crypto.createPublicKey({ format: "jwk", key: { kty: "EC", crv: "P-256", x, y } })
+}
+
+interface WebAuthnAssertionParts {
+  authenticatorData: string
+  clientDataJSON: string
+  signature: string
+}
+interface WebAuthnAssertionExpectation {
+  expectedOrigins: readonly string[]
+  expectedRpId: string
+  requireUserVerification: boolean
+  allowCrossOrigin: boolean
+}
+
+/**
+ * The §4.4.5 checks on one assertion: the ceremony type, origin, cross-origin flag, challenge binding,
+ * RP ID hash, UP/UV flags and the signature over authenticatorData ‖ SHA-256(clientDataJSON). Shared
+ * by every receipt verifier (through verifyWitness) and by the standalone verifyWebAuthnWitness, so
+ * there is exactly one implementation of it in this package. `keyOf` is resolved only after the
+ * cheaper checks, in the same order as ever, so a refusal names the same reason it always did.
+ */
+function verifyWebAuthnAssertion(
+  parts: WebAuthnAssertionParts,
+  keyOf: () => crypto.KeyObject,
+  signedPayload: string,
+  expect: WebAuthnAssertionExpectation,
+): { ok: true } | { ok: false; reason: string } {
   try {
-    const clientDataBuf = Buffer.from(witness.clientDataJSON, "base64")
+    const clientDataBuf = Buffer.from(parts.clientDataJSON, "base64")
     const clientData = JSON.parse(clientDataBuf.toString("utf-8")) as {
       challenge: string
       type?: string
       origin?: string
       crossOrigin?: boolean
+      topOrigin?: unknown
     }
 
     // An assertion, not a registration: webauthn.create signs a different ceremony over the same
     // challenge bytes, and must never be accepted as approval.
     if (clientData.type !== "webauthn.get")
       return { ok: false, reason: "clientDataJSON is not a webauthn.get assertion" }
-    if (clientData.origin !== opts.expectedOrigin)
+    if (typeof clientData.origin !== "string" || !expect.expectedOrigins.includes(clientData.origin))
       return { ok: false, reason: "assertion origin does not match expectedOrigin" }
     // See VerifyReceiptOptions.allowCrossOrigin: origin and rpIdHash both match for an embedded RP
     // frame, so this flag is the only thing that separates "the human approved on our page" from
     // "the human approved inside someone else's page".
-    if (clientData.crossOrigin === true && opts.allowCrossOrigin !== true)
+    if (clientData.crossOrigin === true && !expect.allowCrossOrigin)
       return { ok: false, reason: "assertion was produced in a cross-origin frame (crossOrigin=true)" }
+    // WebAuthn L3 `topOrigin` names the top-level page when the ceremony ran in a frame. One that
+    // differs from `origin` is the same embedding as `crossOrigin: true`, reported another way, and
+    // is refused exactly like it (DIV §4.4.5 rule 5) — the rule the gateway applies at ingest with
+    // `webAuthnCrossOriginRefusal` (@intyga/mcp-schemas), so offline and online verdicts agree.
+    if (
+      clientData.topOrigin !== undefined &&
+      clientData.topOrigin !== clientData.origin &&
+      !expect.allowCrossOrigin
+    )
+      return {
+        ok: false,
+        reason:
+          "assertion was produced in a frame embedded by another origin (topOrigin differs from origin)",
+      }
 
-    const expectedChallenge = base64url(canonicalPayload)
+    const expectedChallenge = base64url(signedPayload)
     const clientChallengeClean = clientData.challenge
       .replace(/\+/g, "-")
       .replace(/\//g, "_")
@@ -1075,20 +1316,18 @@ function verifyWitness(
 
     // authenticatorData is signed but was previously never INSPECTED: it carries the RP ID the
     // credential answered for and whether the user was actually present/verified.
-    const authData = Buffer.from(witness.authenticatorData, "base64")
+    const authData = Buffer.from(parts.authenticatorData, "base64")
     if (authData.length < 37) return { ok: false, reason: "authenticatorData is too short" }
-    const rpIdHash = crypto.createHash("sha256").update(opts.expectedRpId, "utf8").digest()
+    const rpIdHash = crypto.createHash("sha256").update(expect.expectedRpId, "utf8").digest()
     if (!crypto.timingSafeEqual(authData.subarray(0, 32), rpIdHash))
       return { ok: false, reason: "authenticatorData rpIdHash does not match expectedRpId" }
     const flags = authData.readUInt8(32)
     if (!(flags & AUTH_DATA_FLAG_UP))
       return { ok: false, reason: "authenticatorData user-present flag is not set" }
-    if (opts.requireUserVerification !== false && !(flags & AUTH_DATA_FLAG_UV))
+    if (expect.requireUserVerification && !(flags & AUTH_DATA_FLAG_UV))
       return { ok: false, reason: "authenticatorData user-verified flag is not set" }
 
-    // The COSE key is parsed from the TRUSTED key, not from the receipt's copy.
-    const { x, y } = parseCosePublicKey(Buffer.from(trustedKey, "base64"))
-    const keyObject = crypto.createPublicKey({ format: "jwk", key: { kty: "EC", crv: "P-256", x, y } })
+    const keyObject = keyOf()
 
     const clientDataHash = crypto.createHash("sha256").update(clientDataBuf).digest()
     const signatureVerifyData = Buffer.concat([authData, clientDataHash])
@@ -1099,7 +1338,7 @@ function verifyWitness(
       "sha256",
       signatureVerifyData,
       { key: keyObject, dsaEncoding: "der" },
-      Buffer.from(witness.signature, "base64"),
+      Buffer.from(parts.signature, "base64"),
     )
     return verified
       ? { ok: true }
@@ -1108,6 +1347,105 @@ function verifyWitness(
     const msg = err instanceof Error ? err.message : String(err)
     return { ok: false, reason: `WebAuthn verification failed: ${msg}` }
   }
+}
+
+/**
+ * Under a signed `requireHardwareKey`, a WebAuthn witness whose authenticatorData carries the Backup
+ * Eligible or Backup State flag cannot count (DIV §4.4.5 rule 6). Both flags are covered by the
+ * assertion signature, so a relying party can catch an issuer that let a synced passkey sign a
+ * hardware-pinned action. The converse is NOT evidence: BE=0 is the authenticator's own claim, not
+ * attestation — the model still comes only from enrollment records (§4.3.2).
+ *
+ * Only called for a witness that has already verified, so authenticatorData is at least 37 bytes.
+ */
+function backupFlagsProblem(witness: ApprovalWitness): string | null {
+  const flags = Buffer.from(witness.authenticatorData ?? "", "base64").readUInt8(32)
+  if (!(flags & (AUTH_DATA_FLAG_BE | AUTH_DATA_FLAG_BS))) return null
+  return `signer ${witness.signerDid} used a backup-eligible (synced) passkey — authenticatorData BE/BS flag set — but the signed policy requires a hardware-backed WebAuthn credential`
+}
+
+/** One WebAuthn assertion and the exact payload it claims to sign — a single stored witness row. */
+export interface WebAuthnWitness {
+  /** The string whose UTF-8 bytes were the assertion challenge (the canonical payload), as signed. */
+  signedPayload: string
+  /**
+   * The credential's P-256 public key, base64 or base64url: a COSE_Key (as recorded at registration)
+   * or DER SubjectPublicKeyInfo. Supply it from YOUR record of the credential — never from the thing
+   * being verified — or any key the presenter chose will do.
+   */
+  publicKey: string
+  /** base64 or base64url, as the browser returned them. */
+  authenticatorData: string
+  clientDataJSON: string
+  /** The DER ECDSA assertion signature. */
+  signature: string
+}
+
+export interface WebAuthnWitnessExpectation {
+  /** The origin(s) the assertion may carry, e.g. "https://app.example.com". Required. */
+  expectedOrigin: string | readonly string[]
+  /** The RP ID the authenticatorData must hash to, e.g. "app.example.com". Required. */
+  expectedRpId: string
+  /** Demand the User-Verified flag. Defaults to TRUE; User-Present is always required. */
+  requireUserVerification?: boolean
+  /** Accept `clientDataJSON.crossOrigin: true`. Defaults to FALSE (DIV §4.4.5 rule 5). */
+  allowCrossOrigin?: boolean
+}
+
+/**
+ * Verify ONE WebAuthn assertion on its own — the §4.4.5 checks every receipt verifier here applies
+ * to each WEBAUTHN witness, without a receipt around it: one approver of a quorum, a console step-up,
+ * a login approval, a row read back out of an audit ledger. Same implementation, not a copy.
+ *
+ * It answers only "did the holder of THIS key sign THIS payload, at THIS relying party, with the
+ * user present". It knows nothing of quorum, validity windows, payload type, the signed requirement
+ * or who the key belongs to: a caller verifying an approval must use verifyApprovalReceipt (or the
+ * delegation/agent-authority/platform verifiers), which also enforce those. Never throws.
+ */
+export function verifyWebAuthnWitness(
+  witness: WebAuthnWitness,
+  expectation: WebAuthnWitnessExpectation,
+): { ok: true } | { ok: false; reason: string } {
+  const origins: readonly unknown[] =
+    typeof expectation?.expectedOrigin === "string"
+      ? [expectation.expectedOrigin]
+      : (expectation?.expectedOrigin ?? [])
+  // Fail closed, as verifyWitness does: with nothing pinned, an assertion from any RP would verify.
+  if (
+    origins.length === 0 ||
+    !origins.every((o) => typeof o === "string" && o.length > 0) ||
+    typeof expectation.expectedRpId !== "string" ||
+    !expectation.expectedRpId
+  )
+    return {
+      ok: false,
+      reason:
+        "a WebAuthn witness requires expectedOrigin and expectedRpId — without them an assertion from any relying party would verify",
+    }
+  const fields = ["signedPayload", "publicKey", "authenticatorData", "clientDataJSON", "signature"] as const
+  for (const field of fields)
+    if (typeof witness?.[field] !== "string" || !witness[field])
+      return { ok: false, reason: `WebAuthn witness missing ${field}` }
+  return verifyWebAuthnAssertion(
+    witness,
+    () => webAuthnPublicKey(Buffer.from(witness.publicKey, "base64")),
+    witness.signedPayload,
+    {
+      expectedOrigins: origins as readonly string[],
+      expectedRpId: expectation.expectedRpId,
+      requireUserVerification: expectation.requireUserVerification !== false,
+      allowCrossOrigin: expectation.allowCrossOrigin === true,
+    },
+  )
+}
+
+/** A caller-supplied P-256 credential key: DER SPKI (a SEQUENCE, 0x30) or a COSE_Key (a CBOR map). */
+function webAuthnPublicKey(der: Buffer): crypto.KeyObject {
+  if (der[0] !== 0x30) return coseKeyObject(der)
+  const key = crypto.createPublicKey({ key: der, format: "der", type: "spki" })
+  if (key.asymmetricKeyType !== "ec" || key.asymmetricKeyDetails?.namedCurve !== "prime256v1")
+    throw new Error("public key is not a P-256 key")
+  return key
 }
 
 /** Normalize a receipt to a witness list: `signatures` if present, else the single-signature fields. */
@@ -1137,6 +1475,11 @@ function witnessesOf(receipt: ApprovalReceipt): ApprovalWitness[] {
  * action, with exactly these params, for exactly the target and nonce you pass in `expected`; that the
  * number of distinct valid signatures meets the quorum recorded in the signed payload; that the
  * requester did not self-approve when the signed policy forbids it; and that the proof has not expired.
+ *
+ * THE SIGNED QUORUM IS THE SIGNERS' OWN STATEMENT. The signed `requirement` is authored by whoever
+ * composed the bytes — so one approver (possibly the requester) can sign a 1-of-1 payload alone. Pass
+ * `expected.requirement` (your own rule, see RequirementFloor) and a weaker signed requirement is
+ * refused (DIV §5 step 3d). Without it, "quorum met" means only "the quorum the signers stated".
  *
  * THE TRUST ANCHOR IS NOT OPTIONAL. Verification uses the key you resolve for an approver, never the
  * `signerPublicKey` carried in the receipt. A receipt verified against its own embedded key proves
@@ -1277,8 +1620,9 @@ export function verifyApprovalReceipt(
       reason:
         "expected.approvers is required — the Approver key MUST come from your own trust policy, never from the receipt (DIV Invariant 3)",
     }
-  // The requirement is part of the SIGNED bytes, so reading it from the payload is not circular: a
-  // forged value changes the string and fails the byte comparison below.
+  // The requirement is part of the SIGNED bytes, so a third party cannot alter it: a forged value
+  // changes the string and fails the byte comparison below. It does NOT bind the signers themselves —
+  // they authored it — which is why step 3d compares it against the caller's `expected.requirement`.
   const requirement = parseField<Partial<ApprovalRequirementAttestation>>(
     receipt.canonicalPayload,
     "requirement",
@@ -1291,6 +1635,10 @@ export function verifyApprovalReceipt(
   if (!isValidQuorum(requirement.requiredApprovals)) return { ok: false, reason: INVALID_QUORUM_REASON }
   const signerClass = parseSignerClass(requirement)
   if (!signerClass.ok) return { ok: false, reason: signerClass.reason }
+  // DIV §5 step 3d: the signed requirement is authored by the signers, so it is compared against the
+  // caller's own policy BEFORE anything is counted toward it.
+  const weaker = requirementFloorProblem(requirement, expected.requirement)
+  if (weaker) return { ok: false, reason: weaker }
 
   // DIV §5-step-3c. Sits with the other signed-bytes structural gates, BEFORE Local Payload
   // Reconstruction. A non-null evidence value would also fail the byte comparison further down, but
@@ -1309,13 +1657,13 @@ export function verifyApprovalReceipt(
     if (typeof raw !== "string" || raw.length === 0)
       return { ok: false, reason: "offline proof is missing challengedAt" }
     challengedAt = raw
-    const challengedMs = Date.parse(challengedAt)
+    const challengedMs = parseRfc3339Ms(challengedAt)
     if (Number.isNaN(challengedMs))
       return { ok: false, reason: "challengedAt is not a valid RFC3339 timestamp" }
     // An unparseable `expiresAt` must be refused HERE rather than skipping the window cap and relying
     // on the expiry check below — that check is disabled by `allowExpired`, so the combination left
     // the cap unenforced on a proof whose window could not be computed at all.
-    const expiryMs = Date.parse(expiresAt)
+    const expiryMs = parseRfc3339Ms(expiresAt)
     if (Number.isNaN(expiryMs)) return { ok: false, reason: "expiresAt is not a valid RFC3339 timestamp" }
     const windowMinutes = (expiryMs - challengedMs) / 60_000
     if (windowMinutes > MAX_OFFLINE_WINDOW_MINUTES)
@@ -1337,8 +1685,10 @@ export function verifyApprovalReceipt(
     // A hardware-key policy CANNOT be satisfied offline (DIV §5a.3 step 4, §5a.8). WebAuthn needs a
     // secure context and an RP ID that an offline signing surface will not match, so an offline
     // witness is always a bare key. Accepting the proof anyway would silently downgrade the very
-    // policy the approver attested to, so it is refused instead — fail closed, and say why.
-    if (requirement.requireHardwareKey === true)
+    // policy the approver attested to, so it is refused instead — fail closed, and say why. A
+    // non-empty authenticator-model allowlist is the same kind of policy: a bare key has no model at
+    // all, and the enrollment record that would name one is not available offline (DIV §4.3.2).
+    if (requiresHardwareCredential(requirement))
       return {
         ok: false,
         reason:
@@ -1354,7 +1704,7 @@ export function verifyApprovalReceipt(
     const d = opts.delegation
     // A successful seal check can be cached or precede a long signing ceremony. Its expiry must
     // still hold at USE time (DIV §5a.6), under the same clock/forensic policy as this approval.
-    const delegationExpiryMs = Date.parse(d.expiresAt)
+    const delegationExpiryMs = parseRfc3339Ms(d.expiresAt)
     if (!Number.isFinite(delegationExpiryMs))
       return { ok: false, reason: "delegation expiresAt is not a valid RFC3339 timestamp" }
     const nowMs = (opts.asOf ?? new Date()).getTime()
@@ -1428,7 +1778,7 @@ export function verifyApprovalReceipt(
 
   // Expiration (DIV §5 step 8 / §6.2). Fail-closed by default; opt out only for audit re-verification.
   if (!opts.allowExpired) {
-    const expiryMs = Date.parse(expiresAt)
+    const expiryMs = parseRfc3339Ms(expiresAt)
     if (Number.isNaN(expiryMs)) return { ok: false, reason: "expiresAt is not a valid RFC3339 timestamp" }
     const nowMs = (opts.asOf ?? new Date()).getTime()
     const skewMs = (opts.clockSkewSeconds ?? DEFAULT_CLOCK_SKEW_SECONDS) * 1000
@@ -1488,6 +1838,9 @@ export function verifyApprovalReceipt(
   // the wrong shape for the signed policy, which is not a quorum shortfall. It used to sit inside
   // the loop, after a witness had matched, so a receipt where nothing matched reported "quorum not
   // met" instead. Go, Rust, Java and Python all decide it here.
+  if (requirement.requiredApprovals > 1 && "publicKeys" in expected.approvers) {
+    return { ok: false, reason: "multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)" }
+  }
   if (requirement.requesterCannotApprove === true && "publicKeys" in expected.approvers) {
     return {
       ok: false,
@@ -1497,6 +1850,7 @@ export function verifyApprovalReceipt(
   }
 
   const verifiedSigners = new Set<string>()
+  const countedKeys = new Map<string, string>()
   const failures: string[] = []
   for (const witness of witnesses) {
     const candidates = candidateKeys(expected.approvers, witness, delegatedTo)
@@ -1507,11 +1861,13 @@ export function verifyApprovalReceipt(
     // Try each trusted candidate; the one that verifies identifies the approver. In DID mode the
     // candidates are all keys held by that one DID, so a match still counts as a single approver.
     let matched: string | null = null
+    let matchedKey = ""
     let lastReason = "signature does not verify against any trusted approver key"
     for (const candidate of candidates.keys) {
       const attempt = verifyWitness(witness, candidate.key, receipt.canonicalPayload, opts)
       if (attempt.ok) {
         matched = candidate.identity
+        matchedKey = candidate.key
         break
       }
       lastReason = attempt.reason
@@ -1523,15 +1879,26 @@ export function verifyApprovalReceipt(
     // A hardware-key policy is only partially checkable offline (see ApprovalRequirementAttestation):
     // a bare P-256 key carries no attestation at all, so it can never satisfy the requirement, while a
     // WebAuthn assertion is accepted without being able to prove the authenticator's model.
-    if (requirement.requireHardwareKey === true && witness.sigAlg !== "WEBAUTHN") {
+    if (requiresHardwareCredential(requirement) && witness.sigAlg !== "WEBAUTHN") {
       failures.push(
         `signer ${witness.signerDid} used a bare key, but the signed policy requires a hardware-backed WebAuthn credential`,
       )
       continue
     }
+    // The assertion's signed BE/BS flags can prove a synced passkey signed (DIV §4.4.5 rule 6).
+    const synced = requirement.requireHardwareKey === true ? backupFlagsProblem(witness) : null
+    if (synced) {
+      failures.push(synced)
+      continue
+    }
     // Four-eyes, verified offline against the requester in the same signed payload.
     if (requirement.requesterCannotApprove === true && witness.signerDid === receipt.requester.did) {
       failures.push(`four-eyes: requester ${witness.signerDid} cannot approve their own action`)
+      continue
+    }
+    const shared = sharedKeyProblem(countedKeys, matchedKey, matched)
+    if (shared) {
+      failures.push(shared)
       continue
     }
     verifiedSigners.add(matched)
@@ -1654,7 +2021,13 @@ export function verifyPlatformReceipt(
   // the assertion against a different RP than the bytes name.
   if (opts.expectedRpId !== undefined && opts.expectedRpId !== expected.rpId)
     return { ok: false, reason: "opts.expectedRpId conflicts with expected.rpId — pass the RP ID once" }
-  const effOpts: VerifyReceiptOptions = { ...opts, expectedRpId: expected.rpId }
+  // User verification is UNCONDITIONAL on this plane (DIV §5c.3): `requireUserVerification: false`
+  // is an ordinary-receipt option and is overridden here, never honoured.
+  const effOpts: VerifyReceiptOptions = {
+    ...opts,
+    expectedRpId: expected.rpId,
+    requireUserVerification: true,
+  }
 
   const signedAt = parseField<string>(receipt.canonicalPayload, "signedAt")
   const expiresAt = parseField<string>(receipt.canonicalPayload, "expiresAt")
@@ -1670,20 +2043,25 @@ export function verifyPlatformReceipt(
 
   // Local Payload Reconstruction: digest, RP and nonce from YOUR state; signedAt/expiresAt/subject
   // from the signed bytes (a forged value changes the string and fails the comparison).
-  const recomputed = canonicalPlatformIntentPayload({
-    payloadHash: expected.payloadHash,
-    rpId: expected.rpId,
-    subjectExternalId,
-    signedAt,
-    expiresAt,
-    nonce: expected.nonce,
-  })
+  let recomputed: string
+  try {
+    recomputed = canonicalPlatformIntentPayload({
+      payloadHash: expected.payloadHash,
+      rpId: expected.rpId,
+      subjectExternalId,
+      signedAt,
+      expiresAt,
+      nonce: expected.nonce,
+    })
+  } catch (err) {
+    return { ok: false, reason: `platform payload is not canonicalizable: ${(err as Error).message}` }
+  }
   if (recomputed !== receipt.canonicalPayload)
     return { ok: false, reason: "payloadHash/rpId do not match what was signed" }
 
   // Timestamp sanity, then expiry — fail closed (DIV §6.2), opt out only for audit re-verification.
-  const signedMs = Date.parse(signedAt)
-  const expiryMs = Date.parse(expiresAt)
+  const signedMs = parseRfc3339Ms(signedAt)
+  const expiryMs = parseRfc3339Ms(expiresAt)
   if (Number.isNaN(signedMs)) return { ok: false, reason: "signedAt is not a valid RFC3339 timestamp" }
   if (Number.isNaN(expiryMs)) return { ok: false, reason: "expiresAt is not a valid RFC3339 timestamp" }
   if (expiryMs < signedMs) return { ok: false, reason: "receipt expires before it was signed" }
@@ -1715,6 +2093,7 @@ export function verifyPlatformReceipt(
     }
 
   const verifiedSigners = new Set<string>()
+  const countedKeys = new Map<string, string>()
   const failures: string[] = []
   for (const witness of witnesses) {
     // §5c.3: every witness is a WebAuthn assertion. A bare-key signature has no origin/RP binding,
@@ -1729,17 +2108,24 @@ export function verifyPlatformReceipt(
       continue
     }
     let matched: string | null = null
+    let matchedKey = ""
     let lastReason = "signature does not verify against any trusted subject key"
     for (const candidate of candidates.keys) {
       const attempt = verifyWitness(witness, candidate.key, receipt.canonicalPayload, effOpts)
       if (attempt.ok) {
         matched = candidate.identity
+        matchedKey = candidate.key
         break
       }
       lastReason = attempt.reason
     }
     if (matched === null) {
       failures.push(lastReason)
+      continue
+    }
+    const shared = sharedKeyProblem(countedKeys, matchedKey, matched)
+    if (shared) {
+      failures.push(shared)
       continue
     }
     verifiedSigners.add(matched)
@@ -1793,6 +2179,12 @@ export function verifyDelegation(
     target: string
     actionType: string
     params: Record<string, unknown>
+    /**
+     * STRONGLY RECOMMENDED. The ORDINARY approval rule for the delegated action: the delegation's
+     * sealing requirement must be at least this strict (DIV §5a.5, §5 step 3d). Without it only the
+     * sealers' own stated quorum is enforced.
+     */
+    requirement?: RequirementFloor
   },
   opts: VerifyReceiptOptions = {},
 ): { ok: boolean; reason?: string; delegation?: VerifiedDelegation } {
@@ -1833,8 +2225,8 @@ export function verifyDelegation(
     return { ok: false, reason: "delegation is missing sealedAt" }
   if (typeof expiresAt !== "string" || expiresAt.length === 0)
     return { ok: false, reason: "delegation is missing expiresAt" }
-  const sealedMs = Date.parse(sealedAt)
-  const expiryMs = Date.parse(expiresAt)
+  const sealedMs = parseRfc3339Ms(sealedAt)
+  const expiryMs = parseRfc3339Ms(expiresAt)
   if (Number.isNaN(sealedMs)) return { ok: false, reason: "sealedAt is not a valid RFC3339 timestamp" }
   if (Number.isNaN(expiryMs)) return { ok: false, reason: "expiresAt is not a valid RFC3339 timestamp" }
   const windowHours = (expiryMs - sealedMs) / 3_600_000
@@ -1868,6 +2260,8 @@ export function verifyDelegation(
   if (!isValidQuorum(requirement.requiredApprovals)) return { ok: false, reason: INVALID_QUORUM_REASON }
   const signerClass = parseSignerClass(requirement)
   if (!signerClass.ok) return { ok: false, reason: signerClass.reason }
+  const weaker = requirementFloorProblem(requirement, expected.requirement)
+  if (weaker) return { ok: false, reason: weaker }
   if (typeof expected.target !== "string" || expected.target.length === 0)
     return {
       ok: false,
@@ -1943,6 +2337,9 @@ export function verifyDelegation(
   // the wrong shape for the signed policy, which is not a quorum shortfall. It used to sit inside
   // the loop, after a witness had matched, so a receipt where nothing matched reported "quorum not
   // met" instead. Go, Rust, Java and Python all decide it here.
+  if (requirement.requiredApprovals > 1 && "publicKeys" in expected.approvers) {
+    return { ok: false, reason: "multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)" }
+  }
   if (requirement.requesterCannotApprove === true && "publicKeys" in expected.approvers) {
     return {
       ok: false,
@@ -1952,6 +2349,7 @@ export function verifyDelegation(
   }
 
   const verifiedSigners = new Set<string>()
+  const countedKeys = new Map<string, string>()
   const failures: string[] = []
   for (const witness of witnesses) {
     const candidates = candidateKeys(expected.approvers, witness)
@@ -1960,11 +2358,13 @@ export function verifyDelegation(
       continue
     }
     let matched: string | null = null
+    let matchedKey = ""
     let lastReason = "signature does not verify against any trusted approver key"
     for (const candidate of candidates.keys) {
       const attempt = verifyWitness(witness, candidate.key, receipt.canonicalPayload, opts)
       if (attempt.ok) {
         matched = candidate.identity
+        matchedKey = candidate.key
         break
       }
       lastReason = attempt.reason
@@ -1973,14 +2373,25 @@ export function verifyDelegation(
       failures.push(lastReason)
       continue
     }
-    if (requirement.requireHardwareKey === true && witness.sigAlg !== "WEBAUTHN") {
+    if (requiresHardwareCredential(requirement) && witness.sigAlg !== "WEBAUTHN") {
       failures.push(
         `signer ${witness.signerDid} used a bare key, but the signed policy requires a hardware-backed WebAuthn credential`,
       )
       continue
     }
+    // The assertion's signed BE/BS flags can prove a synced passkey signed (DIV §4.4.5 rule 6).
+    const synced = requirement.requireHardwareKey === true ? backupFlagsProblem(witness) : null
+    if (synced) {
+      failures.push(synced)
+      continue
+    }
     if (requirement.requesterCannotApprove === true && witness.signerDid === receipt.requester.did) {
       failures.push(`four-eyes: requester ${witness.signerDid} cannot delegate to themselves`)
+      continue
+    }
+    const shared = sharedKeyProblem(countedKeys, matchedKey, matched)
+    if (shared) {
+      failures.push(shared)
       continue
     }
     verifiedSigners.add(matched)
@@ -2061,6 +2472,12 @@ export function verifyAgentAuthority(
     target: string
     /** The agent whose authority you are checking, asserted independently of the artifact. */
     agentDid: string
+    /**
+     * STRONGLY RECOMMENDED. YOUR sealing policy for agent authority: the signed sealing requirement
+     * must be at least this strict (DIV §5b.3, §5 step 3d). Without it only the sealers' own stated
+     * quorum is enforced.
+     */
+    requirement?: RequirementFloor
   },
   opts: VerifyReceiptOptions = {},
 ): { ok: boolean; reason?: string; authority?: VerifiedAgentAuthority } {
@@ -2090,8 +2507,8 @@ export function verifyAgentAuthority(
     return { ok: false, reason: "authority is missing sealedAt" }
   if (typeof expiresAt !== "string" || expiresAt.length === 0)
     return { ok: false, reason: "authority is missing expiresAt" }
-  const sealedMs = Date.parse(sealedAt)
-  const expiryMs = Date.parse(expiresAt)
+  const sealedMs = parseRfc3339Ms(sealedAt)
+  const expiryMs = parseRfc3339Ms(expiresAt)
   if (Number.isNaN(sealedMs)) return { ok: false, reason: "sealedAt is not a valid RFC3339 timestamp" }
   if (Number.isNaN(expiryMs)) return { ok: false, reason: "expiresAt is not a valid RFC3339 timestamp" }
   // No 72-hour cap here, deliberately: that cap exists because a delegation pre-authorizes offline
@@ -2115,6 +2532,8 @@ export function verifyAgentAuthority(
   if (!isValidQuorum(requirement.requiredApprovals)) return { ok: false, reason: INVALID_QUORUM_REASON }
   const signerClass = parseSignerClass(requirement)
   if (!signerClass.ok) return { ok: false, reason: signerClass.reason }
+  const weaker = requirementFloorProblem(requirement, expected.requirement)
+  if (weaker) return { ok: false, reason: weaker }
   if (typeof expected.target !== "string" || expected.target.length === 0)
     return {
       ok: false,
@@ -2189,6 +2608,9 @@ export function verifyAgentAuthority(
   // the wrong shape for the signed policy, which is not a quorum shortfall. It used to sit inside
   // the loop, after a witness had matched, so a receipt where nothing matched reported "quorum not
   // met" instead. Go, Rust, Java and Python all decide it here.
+  if (requirement.requiredApprovals > 1 && "publicKeys" in expected.approvers) {
+    return { ok: false, reason: "multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)" }
+  }
   if (requirement.requesterCannotApprove === true && "publicKeys" in expected.approvers) {
     return {
       ok: false,
@@ -2198,6 +2620,7 @@ export function verifyAgentAuthority(
   }
 
   const verifiedSigners = new Set<string>()
+  const countedKeys = new Map<string, string>()
   const failures: string[] = []
   for (const witness of witnesses) {
     const candidates = candidateKeys(expected.approvers, witness)
@@ -2206,11 +2629,13 @@ export function verifyAgentAuthority(
       continue
     }
     let matched: string | null = null
+    let matchedKey = ""
     let lastReason = "signature does not verify against any trusted approver key"
     for (const candidate of candidates.keys) {
       const attempt = verifyWitness(witness, candidate.key, receipt.canonicalPayload, opts)
       if (attempt.ok) {
         matched = candidate.identity
+        matchedKey = candidate.key
         break
       }
       lastReason = attempt.reason
@@ -2219,14 +2644,25 @@ export function verifyAgentAuthority(
       failures.push(lastReason)
       continue
     }
-    if (requirement.requireHardwareKey === true && witness.sigAlg !== "WEBAUTHN") {
+    if (requiresHardwareCredential(requirement) && witness.sigAlg !== "WEBAUTHN") {
       failures.push(
         `signer ${witness.signerDid} used a bare key, but the signed policy requires a hardware-backed WebAuthn credential`,
       )
       continue
     }
+    // The assertion's signed BE/BS flags can prove a synced passkey signed (DIV §4.4.5 rule 6).
+    const synced = requirement.requireHardwareKey === true ? backupFlagsProblem(witness) : null
+    if (synced) {
+      failures.push(synced)
+      continue
+    }
     if (requirement.requesterCannotApprove === true && witness.signerDid === receipt.requester.did) {
       failures.push(`four-eyes: requester ${witness.signerDid} cannot seal their own request`)
+      continue
+    }
+    const shared = sharedKeyProblem(countedKeys, matchedKey, matched)
+    if (shared) {
+      failures.push(shared)
       continue
     }
     verifiedSigners.add(matched)
@@ -2264,10 +2700,13 @@ export function verifyAgentAuthority(
  * never-approved pending intent to be used as a parent receipt. */
 export function agentReceiptDigest(receipt: ApprovalReceipt): string {
   const witnesses = witnessesOf(receipt)
+    // Absent fields project to JSON null (DIV §4.3.6). A DID-mode witness may legitimately omit
+    // `signerPublicKey` (the key comes from the caller's anchor), and hashing `undefined` used to
+    // throw out of every chain verifier that reached this digest.
     .map((w) => ({
-      signerDid: w.signerDid,
-      signerPublicKey: w.signerPublicKey,
-      signature: w.signature,
+      signerDid: w.signerDid ?? null,
+      signerPublicKey: w.signerPublicKey ?? null,
+      signature: w.signature ?? null,
       sigAlg: w.sigAlg ?? null,
       authenticatorData: w.authenticatorData ?? null,
       clientDataJSON: w.clientDataJSON ?? null,
@@ -2287,7 +2726,12 @@ export function agentReceiptDigest(receipt: ApprovalReceipt): string {
 export function verifyAgentDelegationChain(
   chain: Array<{
     receipt: ApprovalReceipt
-    expected: { approvers: ApproverTrustAnchor; target: string; agentDid: string }
+    expected: {
+      approvers: ApproverTrustAnchor
+      target: string
+      agentDid: string
+      requirement?: RequirementFloor
+    }
   }>,
   action: { target: string; actionType: string; agentDid: string; delegatedBy: string },
   opts: VerifyReceiptOptions = {},
@@ -2308,8 +2752,8 @@ export function verifyAgentDelegationChain(
       return { ok: false, reason: "delegated authority has a missing or different parent receipt" }
     if (parent) {
       if (
-        Date.parse(authority.sealedAt) < Date.parse(parent.sealedAt) ||
-        Date.parse(authority.expiresAt) > Date.parse(parent.expiresAt)
+        parseRfc3339Ms(authority.sealedAt) < parseRfc3339Ms(parent.sealedAt) ||
+        parseRfc3339Ms(authority.expiresAt) > parseRfc3339Ms(parent.expiresAt)
       )
         return { ok: false, reason: "child authority outlives or predates its parent" }
       const parentPatterns = parent.actionPatterns.map((pattern) => pattern.toLowerCase())
@@ -2321,7 +2765,14 @@ export function verifyAgentDelegationChain(
         return { ok: false, reason: "child authority escalates the parent's action scope" }
     }
     parent = authority
-    parentHash = agentReceiptDigest(link.receipt)
+    try {
+      parentHash = agentReceiptDigest(link.receipt)
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `authority link ${index + 1} cannot be digested: ${(err as Error).message}`,
+      }
+    }
   }
   if (parentHash !== action.delegatedBy || parent?.agentDid !== action.agentDid)
     return { ok: false, reason: "action does not name its delegated agent and leaf authority receipt" }
@@ -2386,7 +2837,15 @@ export function verifyAgentSessionChain(
       return { ok: false, reason: "agent chain has a gap, duplicate, or forked sequence" }
     if (session.prev !== previous)
       return { ok: false, reason: "agent chain predecessor is missing or forked" }
-    const digest = agentReceiptDigest(receipt)
+    let digest: string
+    try {
+      digest = agentReceiptDigest(receipt)
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `agent chain entry ${index + 1} cannot be digested: ${(err as Error).message}`,
+      }
+    }
     if (seen.has(digest)) return { ok: false, reason: "agent chain repeats a receipt" }
     seen.add(digest)
     previous = digest
@@ -2427,7 +2886,9 @@ export {
   DEWP_PROTOCOL,
   DEWP_VERSION,
   deriveVerificationLevel,
+  leafCountMismatch,
   type ProofBundle,
+  type TrustedCheckpoint,
   type VerificationLevel,
   type VerificationProperties,
   verifyBundle,
@@ -2445,13 +2906,20 @@ export {
   verifyEvidenceBundle,
 } from "./ledger-evidence.js"
 export {
+  ANCHOR_ALGORITHMS,
+  ANCHOR_CLOCK_SKEW_SECONDS,
+  type AnchorInput,
   type AnchorKeyResolver,
   type AnchorPolicy,
   type AnchorQuorumResult,
+  DEFAULT_MAX_ANCHOR_LAG_SECONDS,
+  type ExpectedCheckpoint,
   type ExternalAnchorKeys,
   anchorDigest,
   anchorDigestHex,
   anchorPreimage,
+  isWellFormedAnchor,
+  parseAnchorTimestampMs,
   signAnchor,
   type SignedAnchor,
   verifyAnchorQuorum,
@@ -2484,3 +2952,11 @@ export {
   verifyMerkleProof,
 } from "./ledger-merkle.js"
 export { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
+
+export {
+  verifyRfc3161Anchor,
+  verifyRfc3161Timestamp,
+  verifyRfc3161TimestampAsync,
+  type Rfc3161Trust,
+  type Rfc3161Verification,
+} from "./ledger-rfc3161.js"

@@ -17,7 +17,7 @@
 // same self-referential trap as verifying a receipt against the key inside it.
 
 import crypto from "node:crypto"
-import { anchorDigest, type SignedAnchor } from "./ledger-anchor.js"
+import { type AnchorInput, anchorDigest } from "./ledger-anchor.js"
 
 /** The parts of a Rekor log entry we need. Mirrors what packages/db persists as `evidence`. */
 export interface RekorEvidence {
@@ -64,19 +64,71 @@ function setPayload(e: RekorEvidence): string {
   })
 }
 
-/** Decode the base64 `body` into a hashedrekord and pull out the payload hash it attests to. */
-function hashedRekordPayloadHash(bodyB64: string): string | null {
+interface HashedRekordBody {
+  kind?: string
+  spec?: {
+    data?: { hash?: { algorithm?: string; value?: string } }
+    signature?: { content?: string; publicKey?: { content?: string } }
+  }
+}
+
+/** Decode the base64 `body` into a hashedrekord, or null if it is not one. */
+function decodeHashedRekord(bodyB64: string): HashedRekordBody | null {
   try {
-    const decoded = JSON.parse(Buffer.from(bodyB64, "base64").toString("utf-8")) as {
-      kind?: string
-      spec?: { data?: { hash?: { algorithm?: string; value?: string } } }
-    }
-    if (decoded.kind !== "hashedrekord") return null
-    const hash = decoded.spec?.data?.hash
-    if (hash?.algorithm !== "sha256" || typeof hash.value !== "string") return null
-    return hash.value.toLowerCase()
+    const decoded = JSON.parse(Buffer.from(bodyB64, "base64").toString("utf-8")) as HashedRekordBody
+    return decoded && decoded.kind === "hashedrekord" ? decoded : null
   } catch {
     return null
+  }
+}
+
+/** The payload hash a hashedrekord attests to, lowercased, or null. */
+function hashedRekordPayloadHash(decoded: HashedRekordBody): string | null {
+  const hash = decoded.spec?.data?.hash
+  if (hash?.algorithm !== "sha256" || typeof hash.value !== "string") return null
+  return hash.value.toLowerCase()
+}
+
+/** DER SPKI bytes of a PEM or base64 key, or null. */
+function spkiDer(key: string): Buffer | null {
+  try {
+    const obj = key.includes("BEGIN")
+      ? crypto.createPublicKey(key)
+      : crypto.createPublicKey({ key: Buffer.from(key, "base64"), format: "der", type: "spki" })
+    return obj.export({ format: "der", type: "spki" })
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Was this entry submitted by a key the caller pinned, and does that key's signature cover the
+ * anchor digest? Rekor itself checks the signature at submission, but it accepts ANY key — so without
+ * this, anyone who can compute an anchor digest (it is built from public fields) can get it logged
+ * under a throwaway key. `publicKey.content` is base64 of the PEM, as hashedrekord requires.
+ */
+function submittedByPinnedKey(decoded: HashedRekordBody, anchor: AnchorInput, pinned: string[]): boolean {
+  const content = decoded.spec?.signature?.publicKey?.content
+  const sig = decoded.spec?.signature?.content
+  if (typeof content !== "string" || typeof sig !== "string") return false
+  const submitted = spkiDer(Buffer.from(content, "base64").toString("utf-8"))
+  if (!submitted) return false
+  if (!pinned.some((k) => spkiDer(k)?.equals(submitted) === true)) return false
+  try {
+    const key = crypto.createPublicKey({ key: submitted, format: "der", type: "spki" })
+    if (key.asymmetricKeyType !== "ec" || key.asymmetricKeyDetails?.namedCurve !== "prime256v1") return false
+    const digest = anchorDigest(anchor)
+    const signature = Buffer.from(sig, "base64")
+    const verify = (dsaEncoding: "der" | "ieee-p1363") => {
+      try {
+        return crypto.verify("sha256", digest, { key, dsaEncoding }, signature)
+      } catch {
+        return false
+      }
+    }
+    return (signature.length === 64 && verify("ieee-p1363")) || verify("der")
+  } catch {
+    return false
   }
 }
 
@@ -87,9 +139,7 @@ function hashedRekordPayloadHash(bodyB64: string): string | null {
  * 32-byte anchor digest, and the signature scheme applies SHA-256 to those bytes itself — so the
  * value Rekor holds is SHA-256 OF the anchor digest, not the digest.
  */
-export function rekorPayloadHashFor(
-  anchor: Pick<SignedAnchor, "dailyRoot" | "timestamp" | "issuer" | "algorithm">,
-): string {
+export function rekorPayloadHashFor(anchor: AnchorInput): string {
   return crypto.createHash("sha256").update(anchorDigest(anchor)).digest("hex")
 }
 
@@ -102,8 +152,12 @@ export function rekorPayloadHashFor(
  */
 export function verifyRekorAnchor(
   evidence: RekorEvidence,
-  anchor: Pick<SignedAnchor, "dailyRoot" | "timestamp" | "issuer" | "algorithm">,
+  anchor: AnchorInput,
   rekorPublicKey: string,
+  opts: {
+    /** The producer's pinned Rekor submission key(s); see ExternalAnchorKeys.rekorSubmitterKeys. */
+    submitterKeys?: string[]
+  } = {},
 ): RekorVerification {
   if (!evidence.body) return { ok: false, reason: "rekor evidence carries no entry body" }
   const set = evidence.verification?.signedEntryTimestamp
@@ -114,13 +168,27 @@ export function verifyRekorAnchor(
 
   // (2) first — cheap, and it is the check that stops an unrelated (but perfectly valid) public
   // Rekor entry from being presented as evidence for this checkpoint.
-  const logged = hashedRekordPayloadHash(evidence.body)
-  if (!logged) return { ok: false, reason: "rekor entry body is not a readable hashedrekord" }
+  const decoded = decodeHashedRekord(evidence.body)
+  const logged = decoded ? hashedRekordPayloadHash(decoded) : null
+  if (!decoded || !logged) return { ok: false, reason: "rekor entry body is not a readable hashedrekord" }
   const expected = rekorPayloadHashFor(anchor)
   if (logged !== expected) {
     return {
       ok: false,
       reason: `rekor entry attests a different payload (logged ${logged.slice(0, 16)}…, expected ${expected.slice(0, 16)}…) — this entry is not about this checkpoint`,
+    }
+  }
+
+  // (2b) Who submitted it — only when the caller pinned the producer's key.
+  if (
+    opts.submitterKeys &&
+    opts.submitterKeys.length > 0 &&
+    !submittedByPinnedKey(decoded, anchor, opts.submitterKeys)
+  ) {
+    return {
+      ok: false,
+      reason:
+        "rekor entry was not submitted under a pinned producer key with a valid signature over this anchor",
     }
   }
 

@@ -236,6 +236,26 @@ describe("shared canonical vectors (committed artifact, same file the other port
         expected,
       )
     }
+    // An agent context carrying extra top-level keys must not reach the bytes: a spread let
+    // `target`/`params` in the context overwrite the signed fields, so an RP that filled the context
+    // from the receipt verified the receipt against itself. Go/Rust/Java/Python copy four keys only.
+    for (const { input, expected } of vectors.agentIntentPayloads) {
+      const polluted = { ...input.agentContext, target: "EVIL", params: { x: 1 } } as AgentIntentContext
+      assert.equal(
+        canonicalIntentPayload({
+          target: input.target,
+          actionType: input.actionType,
+          display: input.actionDescription,
+          params: input.params,
+          requester: input.requester,
+          requirement: input.requirement,
+          nonce: input.nonce,
+          expiresAt: input.expiresAt,
+          agentContext: polluted,
+        }),
+        expected,
+      )
+    }
     // DIV §5c — TS-only until the ports implement it (see the section's note in the vectors file).
     for (const { input, expected } of vectors.platformIntentPayloads.cases) {
       assert.equal(canonicalPlatformIntentPayload(input), expected)

@@ -16,6 +16,9 @@ const DAILY_ROOT = "e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0
 const base = {
   dailyRoot: DAILY_ROOT,
   timestamp: "2026-07-24T23:59:00.000Z",
+  seqStart: "1",
+  seqEnd: "10",
+  chainHash: "c".repeat(64),
 }
 
 function es256() {
@@ -28,11 +31,20 @@ function mkAnchor(issuer: string, priv: crypto.KeyObject, root = DAILY_ROOT): Si
   return { ...a, signature: signAnchor(a, priv) }
 }
 
-test("anchor preimage is JCS of [dailyRoot, timestamp, issuer, algorithm]", () => {
+test("anchor preimage is JCS of [dailyRoot, timestamp, issuer, algorithm, seqStart, seqEnd, chainHash]", () => {
   assert.equal(
     anchorPreimage({ ...base, issuer: "https://a.example", algorithm: "ES256" }),
-    `["${DAILY_ROOT}","2026-07-24T23:59:00.000Z","https://a.example","ES256"]`,
+    `["${DAILY_ROOT}","2026-07-24T23:59:00.000Z","https://a.example","ES256","1","10","${"c".repeat(64)}"]`,
   )
+})
+
+test("an anchor missing a position field is refused, not hashed over nulls", () => {
+  const { publicKey, privateKey } = es256()
+  const anchor = mkAnchor("https://a.example", privateKey)
+  const { chainHash: _dropped, ...positionless } = anchor
+  // A digest over [..., "1", "10", null] is not the preimage any conformant producer signed.
+  assert.equal(verifyAnchorSignature(positionless as unknown as SignedAnchor, publicKey), false)
+  assert.equal(verifyAnchorSignature({ ...anchor, seqEnd: "ten" }, publicKey), false)
 })
 
 test("digest is deterministic and 32 bytes (64 hex)", () => {
@@ -111,9 +123,9 @@ test("quorum: divergence (a trusted issuer signs a DIFFERENT root) is fatal", ()
     trustedIssuers: ["https://a.example", "https://b.example"],
     quorum: "N_OF_M" as const,
   }
-  // Divergence is only established by anchors the CALLER fetched per checkpoint. The signed anchor
-  // preimage carries no checkpoint identity, so a conflicting root and a perfectly ordinary anchor
-  // from another day look identical — see verifyAnchorQuorum's divergenceAnchors.
+  // Divergence is only established by anchors the CALLER fetched per checkpoint: a bundle is the
+  // producer's selection, and an ordinary anchor from another day must never read as a conflict —
+  // see verifyAnchorQuorum's divergenceAnchors.
   const res = verifyAnchorQuorum([anchorA, anchorBFork], DAILY_ROOT, policy, resolve, {
     divergenceAnchors: [anchorBFork],
   })
@@ -169,12 +181,15 @@ test("DEWP §10 published reference vectors reproduce exactly", () => {
     timestamp: "2026-07-24T23:59:00.000Z",
     issuer: "https://transparency.example.org",
     algorithm: "ES256" as const,
+    seqStart: "1048576",
+    seqEnd: "1049600",
+    chainHash: "6ae54abac75d273317f9f369306f2fbe85f2fafc9dd30685dc4f8a375257ef2b",
   }
   assert.equal(
     anchorPreimage(anchor),
-    '["e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8","2026-07-24T23:59:00.000Z","https://transparency.example.org","ES256"]',
+    '["e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8","2026-07-24T23:59:00.000Z","https://transparency.example.org","ES256","1048576","1049600","6ae54abac75d273317f9f369306f2fbe85f2fafc9dd30685dc4f8a375257ef2b"]',
   )
-  assert.equal(anchorDigestHex(anchor), "005978edb1a6227bb93622874436fc662e01ee9bb53d3708d245f728e98d5120")
+  assert.equal(anchorDigestHex(anchor), "058a3dbd2ad910d9e06597eab8350b9e4df2e94985dd09f7dfb5144df433ed77")
   // The signed message is the RAW digest, never its hex text (§5.2).
   assert.equal(anchorDigest(anchor).length, 32)
 
@@ -227,7 +242,7 @@ test("shared signedAnchor vectors verify (raw-digest signing, cross-language)", 
 // ── RFC 3161 honesty ─────────────────────────────────────────────────────────
 // The producer's publication quorum legitimately counts TSA anchors (they ARE third-party
 // evidence, checkable with `openssl ts -verify`), but this zero-dependency verifier deliberately
-// carries no CMS/X.509 stack and cannot check them. That asymmetry must be REPORTED, not silent:
+// has no configured TSA trust/backend in these cases. Unverified evidence must be REPORTED:
 // "0 verified issuers" over a TSA-anchored root would otherwise read as "unanchored".
 test("RFC 3161 TSA anchors are reported present-but-unverifiable, never silently dropped", () => {
   const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
@@ -277,7 +292,7 @@ test("RFC 3161 TSA anchors are reported present-but-unverifiable, never silently
   )
   assert.equal(notMet.ok, false)
   assert.match(notMet.reason ?? "", /anchor quorum not met \(1\/2\)/)
-  assert.match(notMet.note ?? "", /openssl ts -verify/)
+  assert.match(notMet.note ?? "", /configure RFC 3161 trust and OpenSSL 3/)
 
   // No TSA present ⇒ no note. The note must never fire vacuously, or it trains readers to skip it.
   const clean = verifyAnchorQuorum(

@@ -1,8 +1,16 @@
 import assert from "node:assert/strict"
 import fs from "node:fs"
 import path from "node:path"
+import crypto from "node:crypto"
 import { test } from "node:test"
-import { type ApprovalReceipt, type ApproverTrustAnchor, verifyApprovalReceipt } from "./index.ts"
+import {
+  type ApprovalReceipt,
+  type ApproverTrustAnchor,
+  canonicalIntentPayload,
+  verifyApprovalReceipt,
+  verifyWebAuthnWitness,
+  type WebAuthnWitness,
+} from "./index.ts"
 
 // The shared WebAuthn golden vector (DIV §4.4.5) was consumed by verify-go, verify-rust,
 // verify-java and sdk-python but by NO TypeScript test — so the reference implementation, the one
@@ -126,4 +134,185 @@ test("WebAuthn vector: the key must come from the caller's anchor, never the rec
     expectedRpId: v.rpId,
   })
   assert.equal(r.ok, false, "no trust anchor means no verdict (DIV Invariant 3)")
+})
+
+// ─── The standalone witness check (verifyWebAuthnWitness) ────────────────────────────────────────
+// One assertion without a receipt around it — what the console needs to re-verify a single stored
+// ledger witness. It is the same implementation the receipt verifiers run, pinned here against the
+// same golden bytes.
+
+function witnessOf(v: WebAuthnVector): WebAuthnWitness {
+  return {
+    signedPayload: v.receipt.canonicalPayload,
+    publicKey: v.receipt.signerPublicKey ?? "",
+    authenticatorData: v.receipt.authenticatorData ?? "",
+    clientDataJSON: v.receipt.clientDataJSON ?? "",
+    signature: v.receipt.signature ?? "",
+  }
+}
+
+test("verifyWebAuthnWitness: the golden assertion verifies on its own, under its COSE key or the same key as SPKI", () => {
+  const v = loadVector()
+  const expectation = { expectedOrigin: v.origin, expectedRpId: v.rpId }
+  assert.deepEqual(verifyWebAuthnWitness(witnessOf(v), expectation), { ok: true })
+  // The same P-256 key re-encoded as DER SPKI, from the COSE x/y coordinates.
+  const cose = Buffer.from(v.receipt.signerPublicKey ?? "", "base64")
+  const x = cose.subarray(10, 42).toString("base64url")
+  const y = cose.subarray(45, 77).toString("base64url")
+  const spki = crypto
+    .createPublicKey({ format: "jwk", key: { kty: "EC", crv: "P-256", x, y } })
+    .export({ format: "der", type: "spki" })
+    .toString("base64")
+  assert.deepEqual(verifyWebAuthnWitness({ ...witnessOf(v), publicKey: spki }, expectation), { ok: true })
+  // A list of acceptable origins (a multi-origin relying party) is accepted too.
+  assert.equal(
+    verifyWebAuthnWitness(witnessOf(v), {
+      expectedOrigin: ["https://other.example", v.origin],
+      expectedRpId: v.rpId,
+    }).ok,
+    true,
+  )
+})
+
+test("verifyWebAuthnWitness: payload, key, origin, RP ID and signature are each bound", () => {
+  const v = loadVector()
+  const expectation = { expectedOrigin: v.origin, expectedRpId: v.rpId }
+  const refused = (w: WebAuthnWitness, e = expectation) => {
+    const r = verifyWebAuthnWitness(w, e)
+    assert.equal(r.ok, false)
+    return r.ok ? "" : r.reason
+  }
+  assert.match(refused({ ...witnessOf(v), signedPayload: `${v.receipt.canonicalPayload} ` }), /challenge/)
+  const other = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  const otherSpki = other.publicKey.export({ format: "der", type: "spki" }).toString("base64")
+  assert.match(refused({ ...witnessOf(v), publicKey: otherSpki }), /signature does not verify/)
+  const rsa = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 })
+  const rsaSpki = rsa.publicKey.export({ format: "der", type: "spki" }).toString("base64")
+  assert.match(refused({ ...witnessOf(v), publicKey: rsaSpki }), /not a P-256 key/)
+  assert.match(
+    refused(witnessOf(v), { ...expectation, expectedOrigin: "https://evil.example.com" }),
+    /origin/,
+  )
+  assert.match(refused(witnessOf(v), { ...expectation, expectedRpId: "evil.example.com" }), /rpIdHash/)
+  const sig = Buffer.from(v.receipt.signature ?? "", "base64url")
+  sig.writeUInt8(sig.readUInt8(sig.length - 1) ^ 0x01, sig.length - 1)
+  assert.equal(refused({ ...witnessOf(v), signature: sig.toString("base64url") }).length > 0, true)
+})
+
+test("verifyWebAuthnWitness: fails closed on missing expectations or fields, and never throws", () => {
+  const v = loadVector()
+  for (const expectation of [
+    { expectedOrigin: "", expectedRpId: v.rpId },
+    { expectedOrigin: [], expectedRpId: v.rpId },
+    { expectedOrigin: v.origin, expectedRpId: "" },
+    {} as never,
+  ]) {
+    const r = verifyWebAuthnWitness(witnessOf(v), expectation)
+    assert.equal(r.ok, false)
+    assert.match(r.ok ? "" : r.reason, /expectedOrigin and expectedRpId/)
+  }
+  for (const field of [
+    "signedPayload",
+    "publicKey",
+    "authenticatorData",
+    "clientDataJSON",
+    "signature",
+  ] as const) {
+    const r = verifyWebAuthnWitness(
+      { ...witnessOf(v), [field]: "" },
+      { expectedOrigin: v.origin, expectedRpId: v.rpId },
+    )
+    assert.equal(r.ok, false, field)
+  }
+  const garbage = verifyWebAuthnWitness(
+    { ...witnessOf(v), publicKey: "AAAA", authenticatorData: "AAAA", clientDataJSON: "e30=" },
+    { expectedOrigin: v.origin, expectedRpId: v.rpId },
+  )
+  assert.equal(garbage.ok, false)
+})
+
+// ─── PK-11: signed backup flags under requireHardwareKey (DIV §4.4.5 rule 6) ─────────────────────
+
+/** A WebAuthn receipt over a fresh intent, with the authenticatorData flags byte chosen by the test. */
+function syncedReceipt(flags: number, requireHardwareKey: boolean) {
+  const rpId = "app.example.com"
+  const origin = "https://app.example.com"
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  const jwk = publicKey.export({ format: "jwk" }) as { x: string; y: string }
+  const cose = Buffer.concat([
+    Buffer.from([0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20]),
+    Buffer.from(jwk.x, "base64url"),
+    Buffer.from([0x22, 0x58, 0x20]),
+    Buffer.from(jwk.y, "base64url"),
+  ]).toString("base64")
+  const intent = {
+    target: "prod-payments",
+    nonce: "pk11-nonce",
+    actionType: "payments.wire",
+    params: { amount: 1 },
+    requester: { did: "did:intyga:agent", attestation: null },
+    display: "Wire 1",
+    expiresAt: "2999-01-01T00:00:00.000Z",
+    requirement: {
+      requiredApprovals: 1,
+      requireHardwareKey,
+      allowedAaguids: [],
+      requesterCannotApprove: false,
+      signerClass: "human",
+    },
+  }
+  const canonicalPayload = canonicalIntentPayload(intent as never)
+  const clientDataJSON = Buffer.from(
+    JSON.stringify({
+      type: "webauthn.get",
+      challenge: Buffer.from(canonicalPayload).toString("base64url"),
+      origin,
+    }),
+  )
+  const authenticatorData = Buffer.concat([
+    crypto.createHash("sha256").update(rpId).digest(),
+    Buffer.from([flags, 0, 0, 0, 1]),
+  ])
+  const signature = crypto.sign(
+    "sha256",
+    Buffer.concat([authenticatorData, crypto.createHash("sha256").update(clientDataJSON).digest()]),
+    privateKey,
+  )
+  const receipt: ApprovalReceipt = {
+    canonicalPayload,
+    actionDescription: intent.display,
+    params: intent.params,
+    signerDid: "did:intyga:human",
+    signerPublicKey: cose,
+    signature: signature.toString("base64url"),
+    sigAlg: "WEBAUTHN",
+    authenticatorData: authenticatorData.toString("base64url"),
+    clientDataJSON: clientDataJSON.toString("base64url"),
+    requester: intent.requester,
+    verificationCode: "",
+  }
+  const expected = {
+    target: intent.target,
+    nonce: intent.nonce,
+    actionType: intent.actionType,
+    params: intent.params,
+    approvers: { publicKeys: [cose] },
+  }
+  return verifyApprovalReceipt(receipt, expected, { expectedOrigin: origin, expectedRpId: rpId })
+}
+
+test("requireHardwareKey refuses a WebAuthn witness whose signed flags say backup-eligible or backed up", () => {
+  const UP_UV = 0x05
+  assert.equal(syncedReceipt(UP_UV, true).ok, true, "device-bound flags satisfy the check")
+  for (const [flags, label] of [
+    [UP_UV | 0x08, "BE"],
+    [UP_UV | 0x10, "BS"],
+    [UP_UV | 0x18, "BE+BS"],
+  ] as const) {
+    const r = syncedReceipt(flags, true)
+    assert.equal(r.ok, false, label)
+    assert.match(r.reason ?? "", /backup-eligible/, label)
+    // Without the hardware requirement a synced passkey is an ordinary approver.
+    assert.equal(syncedReceipt(flags, false).ok, true, `${label} without requireHardwareKey`)
+  }
 })

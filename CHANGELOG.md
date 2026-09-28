@@ -5,6 +5,81 @@ All notable changes to `@intyga/verify` are documented here. The format follows
 
 ## [Unreleased]
 
+- **DIV/DEWP 1.0 pre-release correction (2026-09-27 review L15-L19, I7, I8):** signed timestamps
+  are parsed under one strict RFC 3339 grammar (four-digit year, uppercase `T`/`Z`, seconds, a 1-9
+  digit fraction, `Z` or `±hh:mm`, a date that exists, no leap second) instead of bare `Date.parse`,
+  which accepted date-only and zone-less values and rolled 30 February into March. `stableStringify`
+  refuses a string with an unpaired surrogate (`NonCanonicalValue`) instead of escaping it (DIV §4.1).
+  A WebAuthn `topOrigin` differing from `origin` is refused like `crossOrigin: true`.
+  `verifyPlatformReceipt` requires user verification even when `requireUserVerification: false` is
+  passed (DIV §5c.3). A key mapped to two DIDs counts once toward a quorum (DIV §4.4.6). A malformed
+  trust anchor (`approvers: {}`) refuses instead of throwing; `agentReceiptDigest` projects an absent
+  witness field to `null` and the chain verifiers refuse rather than throw. RSA-PSS anchors require a
+  32-byte salt and a 2048-bit modulus, and `signAnchor` now signs with a 32-byte salt (**breaking**
+  for RSA-PSS anchors signed with the maximum salt). Divergence evidence is held to the quorum's
+  seq-range and witness-time rules, and a Rekor entry establishes divergence only under pinned
+  submitter keys. Pinned in all five languages by the `verifierInputHardening` parity vectors; no canonical bytes change for valid input.
+- **DIV 1.0 pre-release correction (H1):** add `expected.requirement` (`RequirementFloor`:
+  `requiredApprovals`, optional `requesterCannotApprove` / `requireHardwareKey`) to
+  `verifyApprovalReceipt`, `verifyDelegation`, `verifyAgentAuthority` and the `agentAuthorityChain`
+  links, and export `WEAKER_REQUIREMENT_REASON`. The signed `requirement` is authored by the signers,
+  so one approver (possibly the requester) could self-compose a 1-of-1 receipt for a 3-of-3 four-eyes
+  action and it verified. A weaker signed requirement is now refused before any signature is counted
+  when the caller supplies its own rule (DIV §5 step 3d), on approval, offline, delegation and
+  agent-authority verification; the reason starts "signed requirement is weaker than the relying
+  party's policy". Omitting the floor keeps the previous behaviour, which proves only the quorum the
+  signers stated. No signed byte changes; shared parity vectors pin it in all five languages.
+- **DEWP evidence verification (1.0 pre-release correction, Sep 2026):** an entry that carries a
+  canonical preimage reads `tenantSeq` only from it (`null` ⇒ no counter) and fails when its
+  redaction record's counter disagrees; a tenant-bound entry fails in a bundle that declares no (or
+  another) tenant; a preimage under an unknown profile fails the bundle; a repeated leaf or `seq`, or
+  leaf counts inconsistent with each other or the checkpoint's `entryCount`, fail; a checkpoint with
+  no `chainHash`/`anchoredAt` is never anchored. New `trustedCheckpoints` (evidence) and
+  `trustedCheckpoint` (single proof) options take caller-held roots-file records: a contradicting
+  bundle checkpoint fails and anchors are held to the record; a single proof counts a Rekor/TSA anchor
+  only against one. `isWellFormedAnchor` requires `algorithm` ∈ ES256/Ed25519/RSA-PSS. Pinned in all
+  five languages by the `dewpEvidenceHardening` parity vectors.
+- **DIV 1.0 pre-release correction (PK-11):** under a signed `requireHardwareKey`, a WEBAUTHN witness
+  whose signed authenticatorData carries the Backup Eligible or Backup State flag no longer counts
+  toward the quorum (DIV §4.4.5 rule 6) — a relying party now catches an issuer that let a synced
+  passkey sign a hardware-pinned action. No signed byte changes; shared parity vectors pin it in all
+  five languages.
+- Add `verifyWebAuthnWitness(witness, expectation)`: the DIV §4.4.5 checks on ONE WebAuthn assertion
+  (payload binding, origin, RP ID, UP/UV, crossOrigin, signature under a caller-supplied COSE or SPKI
+  P-256 key) without a receipt around it — for re-verifying a single stored witness. It is the same
+  implementation every receipt verifier runs, not a copy, and it enforces no quorum, window or policy.
+- **Breaking (DEWP 1.0 pre-release correction):** the anchored preimage is now
+  `[dailyRoot, timestamp, issuer, algorithm, seqStart, seqEnd, chainHash]`; anchors lacking the
+  position fields never verify. External witness times (Rekor `integratedTime`, TSA `genTime`) must
+  fall within `maxAnchorLagSeconds` (default 86400) after — or 300 s before — the checkpoint's claimed
+  time; anchors must match the checkpoint's seq range, chain hash and `anchoredAt`; evidence-bundle
+  chain hashes are recomputed; verdicts expose per-issuer witness times; an optional pinned Rekor
+  submitter key is enforced. A supplied root is reported as `rootSource: "caller-supplied"` (was
+  `"independent"`).
+- A non-empty `allowedAaguids` is refused exactly like `requireHardwareKey`: bare-key witnesses do not
+  count and offline proofs are rejected (DIV §4.3.2/§5a.3).
+
+- Add optional OpenSSL 3 RFC 3161 verification with issuer-specific certificate pins, offline CRL policy, shared cross-language vectors and quorum/divergence integration.
+
+- Enforce DIV §5 identity trust for multi-approver quorums; preserve DIV §4.4.2 ES256
+  compatibility for absent/null/unknown witness labels, while refusing AUTO_APPROVED witnesses.
+- Validate DEWP protocol, version and declared hash/serialization/Merkle algorithms before
+  accepting proof or evidence bundles. Legacy numeric revisions 1/2 remain supported without
+  a protocol declaration. Shared cross-language fixtures cover these contracts.
+
+- Packaging: the published type entry is `dist/index.d.ts` (and `dist/approval-policy.d.ts` for
+  the subpath) instead of the raw `src/*.ts`. Pointing `types` at source made every consumer compile
+  this package under THEIR `tsconfig`: on `lib` below ES2022 that produced TS2550 on `Object.hasOwn`
+  and `Array.at` from inside the package, unfixable from the consumer side because `skipLibCheck`
+  only skips `.d.ts` files. `engines.node` is `>=18`, and a Node-18-targeted `lib` is exactly the
+  case that broke.
+- Packaging: the tarball is `dist` only — no `src`, no tests, no vectors, no source maps (24 files,
+  82.6 kB, down from 62 and 245 kB). The source shipped alongside the build could not verify it:
+  no `tsconfig.json` ships, so nobody could rebuild `dist` from it and compare, which made it an
+  audit artifact that bound nothing. The source, the vectors and a CI run of the full suite are in
+  the public repository, tagged at each released version; what binds a released tarball to that tag
+  is the passkey-signed approval receipt over its sha256, not a copy of the source. No runtime or
+  canonical-byte change.
 - **Wire format: DIV v1 agent intents now sign `action`, `agent`, `session`, `nbf`, and `exp` instead of ordinary `expiresAt`; `div-agent-authority` requires `parentReceiptHash` (null for a root).** Older §5b seals lacking that key cannot verify under this pre-release profile and must be re-sealed. All canonical producers, five verifier ports and vectors must move together; the ordinary HUMAN/SERVICE intent keeps `expiresAt`.
 
 - The shared approval-policy resolver supports internal tenant policy version 3: one `*` baseline, exact case-sensitive

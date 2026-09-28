@@ -42,8 +42,9 @@ export interface InclusionProof {
 
 /**
  * Verify a two-hop inclusion proof against a KNOWN daily root (event → block → day).
- * Pass the daily root you obtained independently (from the external anchor), NOT proof.checkpointRoot —
- * trusting the root shipped inside the proof would let a forged bundle vouch for itself.
+ * Pass a daily root you obtained independently — recorded earlier, or from the published roots file —
+ * NOT proof.checkpointRoot: trusting the root shipped inside the proof would let a forged bundle vouch
+ * for itself. (An external anchor cannot supply the root; it holds only a digest committing to it.)
  */
 export function verifyInclusionProof(proof: InclusionProof, dailyRoot: string): boolean {
   // Position is REQUIRED, and its absence is a rejection rather than a skipped check. This tree pads

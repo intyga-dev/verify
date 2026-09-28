@@ -39,6 +39,9 @@ function quorumFor(dailyRoot: string): {
     timestamp: "2026-07-15T23:59:00.000Z",
     issuer: ANCHOR_ISSUER,
     algorithm: "ES256" as const,
+    seqStart: "1",
+    seqEnd: "1",
+    chainHash: "c".repeat(64),
   }
   return {
     anchors: [{ ...unsigned, keyId: "k1", signature: signAnchor(unsigned, privateKey) }],
@@ -125,7 +128,7 @@ test("tampering with the leaf breaks verification", () => {
   assert.equal(verifyInclusionProof(tampered, dailyRoot), false)
 })
 
-test("verifyBundle: independent root + canonical leaf => ok", () => {
+test("verifyBundle: caller-supplied root + canonical leaf => ok", () => {
   const target = 5
   const { proof, dailyRoot } = buildProof(target)
   const bundle: ProofBundle = {
@@ -167,7 +170,8 @@ test("verifyBundle: independent root + canonical leaf => ok", () => {
   // an anchor check. It still verifies the commitment, but must not claim anchorVerified.
   const rootOnly = verifyBundle(bundle, { trustedRoot: dailyRoot })
   assert.equal(rootOnly.ok, true)
-  assert.equal(rootOnly.rootSource, "independent")
+  // The verifier cannot tell where a supplied root came from, so it never calls it "independent".
+  assert.equal(rootOnly.rootSource, "caller-supplied")
   assert.equal(rootOnly.properties.anchorVerified, false, "no quorum was evaluated")
   assert.notEqual(rootOnly.verificationLevel, "FULLY_VERIFIED")
   assert.ok(
@@ -665,7 +669,7 @@ test("golden vectors: every negative inclusion case is refused", () => {
 })
 
 // A caller that configured an anchor quorum must get a quorum verdict even when the bundle ships
-// with its anchors stripped. Falling back to the weaker "an independent root was handed to me"
+// with its anchors stripped. Falling back to the weaker "a root was handed to me"
 // signal there was a check the prover could switch off — the CLI printed `anchor:yes` under a
 // policy nobody evaluated.
 test("verifyBundle: a supplied anchor policy is evaluated even when the bundle carries no anchors", () => {
@@ -689,7 +693,7 @@ test("verifyBundle: a supplied anchor policy is evaluated even when the bundle c
   // out of band is provenance (`rootSource`), never the §5.3 check.
   const weak = verifyBundle(bundle, { trustedRoot: dailyRoot })
   assert.equal(weak.properties.anchorVerified, false)
-  assert.equal(weak.rootSource, "independent")
+  assert.equal(weak.rootSource, "caller-supplied")
 })
 
 test("verifyBundle: a configured anchor quorum controls the public verdict", () => {
