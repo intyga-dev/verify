@@ -11,8 +11,13 @@ import {
   leafCountMismatch,
   supportedEnvelope,
   type TrustedCheckpoint,
-  verifyEmbeddedSignature,
 } from "./ledger-bundle.js"
+import {
+  verifyAuditSignature,
+  uncheckedSignature,
+  type AuditSignaturePolicy,
+  type AuditSignatureCheck,
+} from "./ledger-signature.js"
 import { chainHash } from "./ledger-chain.js"
 import { type AuditLeaf, leafHash } from "./ledger-leaf.js"
 import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
@@ -142,17 +147,14 @@ export interface EvidenceVerification {
     witnessTimes: Record<string, number>
   }[]
   /**
-   * DEWP §7.1 `signatureVerified`, per entry. The Extended Profile (§9.2) requires offline DIV
-   * signature verification alongside evidence-bundle verification, and only ES256 proof material is
-   * checkable from a leaf: a WEBAUTHN receipt also needs authenticatorData/clientDataJSON, which the
-   * leaf does not carry, and AUTO_APPROVED has no human signature at all (§4.6.1). Those, plus
-   * unsigned and redacted entries, are counted as not checkable rather than as failures.
-   *
-   * An invalid signature does NOT fail the entry: the signature bytes are themselves committed in
-   * the leaf, so leaf binding already proved they are the ones anchored. What it means is that the
-   * producer anchored proof material that does not verify — reported, never silently dropped.
+   * Per-event mathematical signature checks, with explicit status and caller-key trust.
+   * WebAuthn uses committed metadata.webauthn plus caller-selected keys, origin and RP ID.
+   * No authorization/quorum is inferred; use verifyApprovalReceipt for the full approval policy.
+   * By default an invalid signature is reported without treating the ledger inclusion as invalid.
+   * requireSignatures additionally fails the bundle unless EVERY entry has a trusted signature.
    */
   signatures: {
+    checks?: Array<AuditSignatureCheck & { seq: string }>
     verified: number
     invalid: { seq: string }[]
     notCheckable: number
@@ -172,6 +174,8 @@ export interface EvidenceVerification {
 export type EvidenceAnchorSet = SignedAnchor[] | Record<string, SignedAnchor[]>
 
 export interface EvidenceVerifyOptions {
+  signaturePolicy?: AuditSignaturePolicy
+  requireSignatures?: boolean
   /**
    * Daily roots to verify against (root hex strings). When supplied, every entry must chain to one of
    * them. They are only as independent as their source: roots recorded earlier or taken from the
@@ -241,6 +245,7 @@ export function verifyEvidenceBundle(
   let commitmentOnly = 0
   /** Entries whose displayed type/outcome rest on the producer's redaction record, not on the log. */
   let redactedDisplayed = 0
+  const signatureChecks = new Map<string, AuditSignatureCheck>()
   let signaturesVerified = 0
   let signaturesNotCheckable = 0
   const signaturesInvalid: { seq: string }[] = []
@@ -544,12 +549,11 @@ export function verifyEvidenceBundle(
       // §7.1 signatureVerified. Runs only once the leaf binding above passed, so the signature we
       // check is provably the committed one rather than something the bundle attached.
       const canonical = entry.event.canonical
-      if (canonical.sigAlg === "ES256" && canonical.signature && canonical.signerPublicKey) {
-        if (verifyEmbeddedSignature(canonical)) signaturesVerified++
-        else signaturesInvalid.push({ seq })
-      } else {
-        signaturesNotCheckable++
-      }
+      const signature = verifyAuditSignature(canonical, opts.signaturePolicy)
+      signatureChecks.set(seq, signature)
+      if (signature.status === "verified") signaturesVerified++
+      else if (signature.status === "invalid") signaturesInvalid.push({ seq })
+      else signaturesNotCheckable++
       contentVerified++
     } else {
       failed.push({
@@ -805,14 +809,24 @@ export function verifyEvidenceBundle(
         "it means the producer anchored a signature that does not check out.",
     )
   }
+  const checks = bundle.entries.map((e) => ({
+    seq: e.event.seq,
+    ...(signatureChecks.get(e.event.seq) ?? uncheckedSignature()),
+  }))
+  if (opts.requireSignatures)
+    for (const check of checks) {
+      if (check.status !== "verified" || !check.trusted)
+        failed.push({ seq: check.seq, reason: `Required trusted signature: ${check.reason}` })
+    }
   return {
-    ok,
+    ok: ok && failed.length === 0,
     total: bundle.entries.length,
     contentVerified,
     commitmentOnly,
     failed,
     roots,
     signatures: {
+      checks,
       verified: signaturesVerified,
       invalid: signaturesInvalid,
       notCheckable: signaturesNotCheckable,

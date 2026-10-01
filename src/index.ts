@@ -2960,3 +2960,9 @@ export {
   type Rfc3161Trust,
   type Rfc3161Verification,
 } from "./ledger-rfc3161.js"
+
+export {
+  verifyAuditSignature,
+  type AuditSignaturePolicy,
+  type AuditSignatureCheck,
+} from "./ledger-signature.js"

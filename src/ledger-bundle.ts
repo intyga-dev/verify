@@ -1,4 +1,10 @@
 import crypto from "node:crypto"
+import {
+  verifyAuditSignature,
+  uncheckedSignature,
+  type AuditSignaturePolicy,
+  type AuditSignatureCheck,
+} from "./ledger-signature.js"
 import type { ExternalAnchorKeys } from "./ledger-anchor.js"
 import {
   type AnchorKeyResolver,
@@ -135,7 +141,7 @@ export interface VerificationProperties {
   commitmentVerified: boolean
   /** commitmentVerified AND the canonical preimage is present and its leaf hash matches. */
   contentVerified: boolean
-  /** contentVerified AND the embedded event signature (ES256 over signedPayload) verifies offline. */
+  /** contentVerified AND the event signature verifies. See signature.trusted for caller-key trust. */
   signatureVerified: boolean
   /**
    * The checkpoint root was verified against an ANCHOR QUORUM under the caller's §5.3 policy — DEWP
@@ -154,6 +160,7 @@ export type VerificationLevel =
   | "FULLY_VERIFIED"
 
 export interface BundleVerification {
+  signature: AuditSignatureCheck
   /** Overall verdict. Only true when the caller supplied the root AND every applicable check passed. */
   ok: boolean
   dailyRoot: string | null
@@ -193,9 +200,9 @@ export interface BundleVerification {
 }
 
 /**
- * Verify the event's embedded DIV signature (ES256 over `signedPayload`) from the leaf alone. Only
- * ES256 is checkable here: a WEBAUTHN receipt also needs authenticatorData/clientDataJSON, which the
- * audit leaf does not carry, and AUTO_APPROVED has no human signature. Returns false for those.
+ * Verify the event's embedded DIV signature (ES256 over `signedPayload`) from the leaf alone. This legacy helper
+ * checks ES256 against the embedded key only. Use verifyAuditSignature for caller-trusted keys and
+ * WebAuthn assertions stored in canonical.metadata.webauthn. AUTO_APPROVED has no human signature.
  */
 export function verifyEmbeddedSignature(canonical: AuditLeaf): boolean {
   if (canonical.sigAlg !== "ES256") return false
@@ -236,6 +243,9 @@ export function deriveVerificationLevel(p: VerificationProperties, hasSigner: bo
 }
 
 export interface VerifyOptions {
+  signaturePolicy?: AuditSignaturePolicy
+  /** Require every selected event to have a valid signature under caller-trusted keys. */
+  requireSignatures?: boolean
   /**
    * Pinned public keys for EXTERNAL logs (Rekor today). A Rekor anchor carries no DEWP signature —
    * its Signed Entry Timestamp is the attestation — so without the log key it cannot be verified and
@@ -539,9 +549,12 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
   // DEWP §7.1 independent properties.
   const commitmentVerified = inclusion.pass === true && rootConsistency.pass === true
   const contentVerified = commitmentVerified && leafBinding.pass === true && headerBinding.pass !== false
-  const hasSigner = Boolean(bundle.event.canonical?.signature && bundle.event.canonical?.signerPublicKey)
-  const signatureVerified =
-    contentVerified && bundle.event.canonical ? verifyEmbeddedSignature(bundle.event.canonical) : false
+  const signature =
+    contentVerified && bundle.event.canonical
+      ? verifyAuditSignature(bundle.event.canonical, opts.signaturePolicy)
+      : uncheckedSignature()
+  const signatureVerified = signature.status === "verified"
+  const hasSigner = signature.status !== "not_applicable"
   // Anchor verification (DEWP §5.3). If signed anchors + a policy are supplied, require a real quorum
   // over the daily root. Otherwise fall back to the weaker signal: the checkpoint root was handed to
   // us by the caller (not the bundle's own self-asserted flag).
@@ -604,6 +617,7 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     if (q.divergence) {
       return {
         ok: false,
+        signature,
         dailyRoot,
         rootSource,
         witnessTimes,
@@ -650,7 +664,11 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
 
   return {
     // A configured policy is an applicable check even when its anchors or resolver are missing.
-    ok: ok && (!opts.anchorPolicy || anchorVerified),
+    ok:
+      ok &&
+      (!opts.anchorPolicy || anchorVerified) &&
+      (!opts.requireSignatures || (signatureVerified && signature.trusted)),
+    signature,
     dailyRoot,
     rootSource,
     witnessTimes,

@@ -5,6 +5,10 @@ All notable changes to `@intyga/verify` are documented here. The format follows
 
 ## [Unreleased]
 
+- Verify profile-carried WebAuthn audit signatures with caller-trusted signer keys, origin and RP ID.
+  Report explicit per-event signature status and key trust; add strict signature acceptance for
+  single and bulk evidence. Audit signature checks do not replace full approval-receipt verification.
+
 - **DIV/DEWP 1.0 pre-release correction (2026-09-27 review L15-L19, I7, I8):** signed timestamps
   are parsed under one strict RFC 3339 grammar (four-digit year, uppercase `T`/`Z`, seconds, a 1-9
   digit fraction, `Z` or `±hh:mm`, a date that exists, no leap second) instead of bare `Date.parse`,
