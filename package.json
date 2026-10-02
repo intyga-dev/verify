@@ -1,7 +1,7 @@
 {
   "name": "@intyga/verify",
   "version": "1.0.0",
-  "description": "Independently verify Intyga approval receipts — confirm a human cryptographically approved exactly the action about to run, with NO Intyga secret. Zero npm runtime dependencies; optional OpenSSL 3 for timestamps.",
+  "description": "Independently verify INTYGA approval receipts — confirm a human cryptographically approved exactly the action about to run, with NO INTYGA secret. Zero npm runtime dependencies; optional OpenSSL 3 for timestamps.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -47,7 +47,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist && tsc",
     "generate:parity-vectors": "node --import tsx src/scripts/generate-verifier-parity-vectors.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test 'src/**/*.test.ts'",

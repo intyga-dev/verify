@@ -1,17 +1,17 @@
 # @intyga/verify
 
-**Independently confirm that a human cryptographically approved exactly the action you're about to run — with no Intyga secret.**
+**Independently confirm that a human cryptographically approved exactly the action you're about to run — with no INTYGA secret.**
 
-When Intyga returns an approval, it hands you a **receipt**: the exact canonical payload the human's key signed, plus the signature and public key. This library lets your own code re-derive that payload from *your* parameters, check it byte-for-byte against what was signed, and verify the signature — entirely offline. You don't have to trust Intyga's word that the approval is real; you check the math yourself.
+When INTYGA returns an approval, it hands you a **receipt**: the exact canonical payload the human's key signed, plus the signature and public key. This library lets your own code re-derive that payload from *your* parameters, check it byte-for-byte against what was signed, and verify the signature — entirely offline. You don't have to trust INTYGA's word that the approval is real; you check the math yourself.
 
 - **Zero npm runtime dependencies.** Receipt verification uses Node cryptography. Optional RFC 3161 timestamp verification additionally requires an installed OpenSSL 3 executable.
-- **No Intyga secret required.** Verification uses approver keys **you** resolve — never a key read out of the receipt (see [Whose key?](#whose-key-the-trust-anchor)).
+- **No INTYGA secret required.** Verification uses approver keys **you** resolve — never a key read out of the receipt (see [Whose key?](#whose-key-the-trust-anchor)).
 - Verifies both **WebAuthn** approvals (passkey / hardware security key — the normal path) and **raw P-256** signatures (legacy/headless signer keys), plus policy `AUTO_APPROVED` receipts.
 
 ```ts
 import { verifyApprovalReceipt } from "@intyga/verify";
 
-// `receipt` came back from Intyga when the human approved.
+// `receipt` came back from INTYGA when the human approved.
 const check = verifyApprovalReceipt(receipt, {
   target: "prod-payments-eu",                           // YOUR service identifier — see below
   actionType: "wipe_production",
@@ -38,7 +38,7 @@ if (!check.ok) throw new Error(`Refusing to proceed: ${check.reason}`);
 
 Why re-pass the params? So the approval can't be swapped: if what you're about to execute differs by a
 single byte from what the human saw and signed, `verifyApprovalReceipt` returns `{ ok: false }`. This is
-your defense-in-depth even against a compromised Intyga gateway.
+your defense-in-depth even against a compromised INTYGA gateway.
 
 `target` is **required and must come from your own configuration, never from the receipt**. It is what
 rejects an approval that was minted for a *different* service (DIV Target Isolation): if the verifier
@@ -86,7 +86,7 @@ ports and exercised by shared verifier fixtures.
 cannot also change: your deployment config, your secrets manager, your own IdP/directory, or keys you
 pinned at enrollment.
 
-**Where it must NOT come from.** Fetching approver keys from the Intyga gateway at verification time
+**Where it must NOT come from.** Fetching approver keys from the INTYGA gateway at verification time
 defeats the entire property — a compromised gateway would then supply both the receipt and the key that
 validates it, and this library would happily agree. If you are going to trust the gateway for keys, you
 do not need this library; you can just trust its answer.
@@ -191,7 +191,7 @@ verifyApprovalReceipt(receipt, expected, { allowAutoApproved: true }); // → { 
 - `verifyEcdsaP256(publicKeyB64, payload, signatureB64)` → `boolean`
 - `verifyWebAuthnWitness({ signedPayload, publicKey, authenticatorData, clientDataJSON, signature }, { expectedOrigin, expectedRpId, requireUserVerification?, allowCrossOrigin? })` → `{ ok, reason? }` — the DIV §4.4.5 checks on ONE assertion (e.g. a single stored ledger witness), under a COSE or SPKI P-256 key you supply from your own records. It checks the signature binding only: no quorum, window, payload type or signed requirement — verify an approval with `verifyApprovalReceipt`.
 
-> The canonicalization here is byte-for-byte identical to the Intyga gateway, the approval UI, and
+> The canonicalization here is byte-for-byte identical to the INTYGA gateway, the approval UI, and
 > `@intyga/mcp-schemas`. That identity is the whole point — don't reformat it.
 
 ## DIV / DEWP conformance

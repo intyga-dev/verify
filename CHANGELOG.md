@@ -5,6 +5,11 @@ All notable changes to `@intyga/verify` are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.0]
+
+- Packaging: disable source maps in the workspace build and clean old output before compiling,
+  matching the standalone build and the tarball's build-output-only contract.
+
 - Verify profile-carried WebAuthn audit signatures with caller-trusted signer keys, origin and RP ID.
   Report explicit per-event signature status and key trust; add strict signature acceptance for
   single and bulk evidence. Audit signature checks do not replace full approval-receipt verification.
@@ -145,12 +150,11 @@ All notable changes to `@intyga/verify` are documented here. The format follows
   `requiredApprovals`" is satisfied vacuously by 0, so the minimum is now enforced explicitly
   instead of by an undocumented floor.
 
-## [1.0.0]
 
 Initial public release.
 
 - Offline approval-receipt verification (ES256 and WebAuthn) against a caller-supplied trust
-  anchor — no Intyga secret, no network. `AUTO_APPROVED` receipts are refused by default.
+  anchor — no INTYGA secret, no network. `AUTO_APPROVED` receipts are refused by default.
 - DIV canonical payload builders and verification codes, pinned by shared cross-language golden
   vectors.
 - DEWP ledger verification: inclusion proofs with mandatory bounds checks, §5.2 anchor signatures,
