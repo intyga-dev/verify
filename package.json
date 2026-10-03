@@ -1,6 +1,6 @@
 {
   "name": "@intyga/verify",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Independently verify INTYGA approval receipts — confirm a human cryptographically approved exactly the action about to run, with NO INTYGA secret. Zero npm runtime dependencies; optional OpenSSL 3 for timestamps.",
   "license": "Apache-2.0",
   "repository": {

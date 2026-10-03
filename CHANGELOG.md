@@ -5,6 +5,11 @@ All notable changes to `@intyga/verify` are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0]
+
+- No code change. The matched set moves together (`pnpm test:versions`); this release carries the
+  new `@intyga/sdk` CLI options and the `require-approval` Action update.
+
 ## [1.0.0]
 
 - Packaging: disable source maps in the workspace build and clean old output before compiling,
