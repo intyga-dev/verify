@@ -1,5 +1,7 @@
 # @intyga/verify
 
+[![Release gated by INTYGA](https://www.intyga.com/badges/release-gated-by-intyga.svg)](https://www.intyga.com/use-cases/package-publishing)
+
 **Independently confirm that a human cryptographically approved exactly the action you're about to run — with no INTYGA secret.**
 
 When INTYGA returns an approval, it hands you a **receipt**: the exact canonical payload the human's key signed, plus the signature and public key. This library lets your own code re-derive that payload from *your* parameters, check it byte-for-byte against what was signed, and verify the signature — entirely offline. You don't have to trust INTYGA's word that the approval is real; you check the math yourself.
