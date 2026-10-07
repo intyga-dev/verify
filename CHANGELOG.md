@@ -5,6 +5,11 @@ All notable changes to `@intyga/verify` are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0]
+
+- Export `parseRfc3339Ms`, the strict DIV §6.2 RFC 3339 parser the verifier already uses, so the SDK
+  checks trust-bundle timestamps with the same grammar instead of `Date.parse`.
+
 ## [1.1.0]
 
 - No code change. The matched set moves together (`pnpm test:versions`); this release carries the

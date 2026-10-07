@@ -337,7 +337,7 @@ const RFC3339_DATE_TIME =
  * the date must exist, hours 00–23, minutes and seconds 00–59 (no leap second — Go and ECMAScript
  * refuse `:60`), offset hours 00–23 and minutes 00–59.
  */
-function parseRfc3339Ms(value: unknown): number {
+export function parseRfc3339Ms(value: unknown): number {
   if (typeof value !== "string") return Number.NaN
   const m = RFC3339_DATE_TIME.exec(value)
   if (!m) return Number.NaN
