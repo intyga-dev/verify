@@ -4,23 +4,23 @@ import {
   type ExternalAnchorKeys,
   type SignedAnchor,
   verifyAnchorQuorum,
-} from "./ledger-anchor.js"
+} from "./ledger-anchor.ts"
 import {
   type AlgorithmRegistry,
   AUDIT_PROFILE,
   leafCountMismatch,
   supportedEnvelope,
   type TrustedCheckpoint,
-} from "./ledger-bundle.js"
+} from "./ledger-bundle.ts"
 import {
   verifyAuditSignature,
   uncheckedSignature,
   type AuditSignaturePolicy,
   type AuditSignatureCheck,
-} from "./ledger-signature.js"
-import { chainHash } from "./ledger-chain.js"
-import { type AuditLeaf, leafHash } from "./ledger-leaf.js"
-import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
+} from "./ledger-signature.ts"
+import { chainHash } from "./ledger-chain.ts"
+import { type AuditLeaf, leafHash } from "./ledger-leaf.ts"
+import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.ts"
 
 // Multi-entry auditor evidence bundle (date-range export from the console's Audit page). Each entry
 // carries its own two-hop inclusion proof. REDACTED entries (content removed by the retention

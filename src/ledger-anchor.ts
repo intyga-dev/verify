@@ -1,6 +1,6 @@
 import crypto from "node:crypto"
-import { verifyRfc3161Anchor, type Rfc3161Trust } from "./ledger-rfc3161.js"
-import { parseRekorEvidence, verifyRekorAnchor } from "./ledger-rekor.js"
+import { verifyRfc3161Anchor, type Rfc3161Trust } from "./ledger-rfc3161.ts"
+import { parseRekorEvidence, verifyRekorAnchor } from "./ledger-rekor.ts"
 
 // DEWP signed anchor objects (docs/DEWP.md §5.2/§5.3). A Daily Checkpoint Root becomes trustworthy
 // only when independent external parties SIGN it. This module computes the domain-separated anchor

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto"
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
-import { anchorDigest, isWellFormedAnchor, type SignedAnchor } from "./ledger-anchor.js"
+import { anchorDigest, isWellFormedAnchor, type SignedAnchor } from "./ledger-anchor.ts"
 
 /** Caller-owned TSA trust. Never populate this from an evidence bundle. Requires OpenSSL 3. */
 export interface Rfc3161Trust {

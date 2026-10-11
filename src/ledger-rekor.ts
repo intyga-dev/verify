@@ -17,7 +17,7 @@
 // same self-referential trap as verifying a receipt against the key inside it.
 
 import crypto from "node:crypto"
-import { type AnchorInput, anchorDigest } from "./ledger-anchor.js"
+import { type AnchorInput, anchorDigest } from "./ledger-anchor.ts"
 
 /** The parts of a Rekor log entry we need. Mirrors what packages/db persists as `evidence`. */
 export interface RekorEvidence {

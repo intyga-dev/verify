@@ -75,6 +75,7 @@ function anchor(...signers: Signer[]) {
 }
 
 function sealedAuthority(over: {
+  tenantId?: string
   requirement?: ReturnType<typeof requirement>
   signers?: Signer[]
   sealedAt?: string
@@ -84,6 +85,7 @@ function sealedAuthority(over: {
   parentReceiptHash?: string | null
 }): ApprovalReceipt {
   const canonical = canonicalAgentAuthorityPayload({
+    ...(over.tenantId !== undefined ? { tenantId: over.tenantId } : {}),
     target: TARGET,
     actionPatterns: over.actionPatterns ?? PATTERNS,
     display: "Payments agent — refunds under review",
@@ -162,6 +164,35 @@ it("binds delegated scope to a complete parent proof and refuses escalation", ()
   )
 })
 
+it("refuses an otherwise valid authority chain that crosses tenants", () => {
+  const root = sealedAuthority({ tenantId: "tenant-alpha", actionPatterns: ["payments."] })
+  const childDid = "did:intyga:agent:worker"
+  const child = sealedAuthority({
+    tenantId: "tenant-beta",
+    agentDid: childDid,
+    actionPatterns: ["payments.refund"],
+    parentReceiptHash: agentReceiptDigest(root),
+  })
+  const result = verifyAgentDelegationChain(
+    [
+      { receipt: root, expected: { ...EXPECTED, tenantId: "tenant-alpha" } },
+      {
+        receipt: child,
+        expected: { ...EXPECTED, tenantId: "tenant-beta", agentDid: childDid },
+      },
+    ],
+    {
+      tenantId: "tenant-alpha",
+      target: TARGET,
+      actionType: "payments.refund.issue",
+      agentDid: childDid,
+      delegatedBy: agentReceiptDigest(child),
+    },
+  )
+  assert.equal(result.ok, false)
+  assert.match(result.reason ?? "", /different tenants|tenant boundaries/)
+})
+
 describe("verifyAgentAuthority", () => {
   it("verifies a quorum-sealed authority and reports the deduplicated sorted scope", () => {
     const r = verifyAgentAuthority(sealedAuthority({}), EXPECTED)
@@ -169,6 +200,18 @@ describe("verifyAgentAuthority", () => {
     assert.deepEqual(r.authority?.signers, [ALICE.did, BOB.did].sort())
     assert.deepEqual(r.authority?.actionPatterns, [...PATTERNS].sort())
     assert.equal(r.authority?.agentDid, AGENT_DID)
+  })
+
+  it("returns the signed tenant and refuses a missing or different tenant expectation", () => {
+    const receipt = sealedAuthority({ tenantId: "tenant-alpha" })
+    const good = verifyAgentAuthority(receipt, { ...EXPECTED, tenantId: "tenant-alpha" })
+    assert.equal(good.ok, true, good.reason)
+    assert.equal(good.authority?.tenantId, "tenant-alpha")
+    assert.match(verifyAgentAuthority(receipt, EXPECTED).reason ?? "", /tenantId is required/)
+    assert.match(
+      verifyAgentAuthority(receipt, { ...EXPECTED, tenantId: "tenant-beta" }).reason ?? "",
+      /different tenant/,
+    )
   })
 
   it("refuses an unmet sealing quorum", () => {

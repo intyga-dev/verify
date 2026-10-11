@@ -15,6 +15,7 @@ import { verifyApprovalReceipt } from "@intyga/verify";
 
 // `receipt` came back from INTYGA when the human approved.
 const check = verifyApprovalReceipt(receipt, {
+  tenantId: process.env.INTYGA_TENANT_ID!,              // YOUR workspace, never from the receipt
   target: "prod-payments-eu",                           // YOUR service identifier — see below
   actionType: "wipe_production",
   params: { target: "prod-db-1", region: "eu-north-1" }, // what you're ACTUALLY about to do
@@ -46,6 +47,11 @@ your defense-in-depth even against a compromised INTYGA gateway.
 rejects an approval that was minted for a *different* service (DIV Target Isolation): if the verifier
 read the target out of the receipt, the receipt would be defining the scope it is checked against, and
 a proof harvested from another relying party would verify. Omitting it is refused rather than defaulted.
+
+New DIV v2 receipts also require `tenantId`, taken from your own configuration or independently
+trusted anchor. The verifier compares it byte-for-byte with the signed tenant. It never infers the
+expected tenant from the receipt. Historical DIV v1 receipts remain verifiable only when no tenant
+expectation is supplied; that compatibility path is for archived evidence, not new execution.
 
 ## Whose key? (the trust anchor)
 
@@ -185,10 +191,10 @@ verifyApprovalReceipt(receipt, expected, { allowAutoApproved: true }); // → { 
 `ok: true` without `allowAutoApproved` therefore always means **a real human signature verified**.
 
 ## API
-- `verifyApprovalReceipt(receipt, { approvers, target, actionType, params, nonce, requesterDid? }, { allowAutoApproved?, allowOffline?, delegation?, expectedOrigin?, expectedRpId?, requireUserVerification?, allowCrossOrigin?, allowExpired?, asOf?, clockSkewSeconds? })` → `{ ok, reason?, autoApproved?, signers? }` — `approvers`, `target` and `nonce` are all required and asserted from your own state, never read from the receipt
-- `verifyDelegation(receipt, { approvers, target, actionType, params }, opts?)` → `{ ok, reason?, delegation? }` — checks that the ORDINARY approvers signed away their entitlement (DIV §4.4.6). The result is an input to a later `verifyApprovalReceipt` via `delegation`, never a substitute for one.
-- `verifyAgentAuthority(receipt, { approvers, target, agentDid }, opts?)` → `{ ok, reason?, authority? }` — a sealed §5b scope grant, not an approval. Revocation is authoritative online only, so treat a seal like a certificate, not a bearer token.
-- `canonicalIntentPayload({ target, actionType, display, params, requester, requirement, nonce, expiresAt })` → the exact signed string (DIV v1). Also exported: `canonicalOfflineIntentPayload` (DIV §5a offline approval), `canonicalDelegationPayload` and `canonicalAgentAuthorityPayload` (DIV §5b). The pre-DIV `canonicalAuthorizationPayload`/`V3` builders were removed with the v2/v3 formats (ADR 005/014); `verifyApprovalReceipt` rejects anything where `v !== 1`.
+- `verifyApprovalReceipt(receipt, { tenantId?, approvers, target, actionType, params, nonce, requesterDid? }, { allowAutoApproved?, allowOffline?, delegation?, expectedOrigin?, expectedRpId?, requireUserVerification?, allowCrossOrigin?, allowExpired?, asOf?, clockSkewSeconds? })` → `{ ok, reason?, autoApproved?, signers? }` — `tenantId` is required for v2, while legacy v1 refuses it; every expectation comes from your own state, never the receipt.
+- `verifyDelegation(receipt, { tenantId?, approvers, target, actionType, params }, opts?)` → `{ ok, reason?, delegation? }` — checks that the ORDINARY approvers signed away their entitlement (DIV §4.4.6) and returns the signed tenant binding. The result is an input to a later `verifyApprovalReceipt` via `delegation`, never a substitute for one.
+- `verifyAgentAuthority(receipt, { tenantId?, approvers, target, agentDid }, opts?)` → `{ ok, reason?, authority? }` — a sealed §5b scope grant with the same tenant rule, not an approval. Revocation is authoritative online only, so treat a seal like a certificate, not a bearer token.
+- `canonicalIntentPayload({ tenantId?, target, actionType, display, params, requester, requirement, nonce, expiresAt })` → the exact signed string. Omitting `tenantId` preserves frozen DIV v1 bytes; supplying a non-empty opaque value emits tenant-bound DIV v2. The offline, delegation, agent-authority and platform builders follow the same version rule.
 - `verificationCode(canonical)` → the short `XXXX-XXXX` code shown on the approval screen
 - `verifyEcdsaP256(publicKeyB64, payload, signatureB64)` → `boolean`
 - `verifyWebAuthnWitness({ signedPayload, publicKey, authenticatorData, clientDataJSON, signature }, { expectedOrigin, expectedRpId, requireUserVerification?, allowCrossOrigin? })` → `{ ok, reason? }` — the DIV §4.4.5 checks on ONE assertion (e.g. a single stored ledger witness), under a COSE or SPKI P-256 key you supply from your own records. It checks the signature binding only: no quorum, window, payload type or signed requirement — verify an approval with `verifyApprovalReceipt`.

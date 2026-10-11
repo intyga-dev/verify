@@ -1,4 +1,4 @@
-import { hashLeaf, type ProofStep, verifyMerkleProof } from "./ledger-merkle.js"
+import { hashLeaf, type ProofStep, verifyMerkleProof } from "./ledger-merkle.ts"
 
 // The inclusion-proof shape and its two-hop verification. Mirrors the producer's `InclusionProof`
 // (packages/db/src/checkpoint.ts). An event is committed under a daily root via:

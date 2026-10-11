@@ -70,10 +70,19 @@ type KeyTable = Map<string, KeyFixture>
 function runApprovalCases(section: Section, keys: KeyTable) {
   for (const c of section.cases) {
     const raw = { ...section.expected, ...c.expected }
-    const ids = raw.approverKeyIds as string[]
+    const ids = (raw.approverKeyIds as string[] | undefined) ?? []
     // A WEBAUTHN witness verifies under the credential's COSE_Key; such cases say so explicitly.
     const encoding = c.approverKeyEncoding === "cose" ? "coseB64" : "spkiB64"
-    const expected = { ...raw, approvers: { publicKeys: ids.map((id) => keys.get(id)![encoding]!) } }
+    const table = raw.approverDids as Record<string, string[]> | undefined
+    const coseDids = new Set((raw.approverCoseDids as string[] | undefined) ?? [])
+    const approvers = table
+      ? {
+          dids: Object.keys(table),
+          resolveKey: (did: string) =>
+            (table[did] ?? []).map((id) => keys.get(id)![coseDids.has(did) ? "coseB64" : "spkiB64"]!),
+        }
+      : { publicKeys: ids.map((id) => keys.get(id)![encoding]!) }
+    const expected = { ...raw, approvers }
     const result = verifyApprovalReceipt(
       c.receipt as unknown as ApprovalReceipt,
       expected as never,

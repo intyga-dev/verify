@@ -1,4 +1,4 @@
-import { hashLeaf } from "./ledger-merkle.js"
+import { hashLeaf } from "./ledger-merkle.ts"
 
 /**
  * JCS (RFC 8785) serialization of the `metadata` value — every object key sorted recursively by

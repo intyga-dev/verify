@@ -360,6 +360,8 @@ export function parseRfc3339Ms(value: unknown): number {
 
 /** DIV protocol version and type discriminator — identical to mcp-schemas. */
 export const DIV_VERSION = 1
+/** Tenant-bound DIV payload version. v1 remains supported only when no tenant expectation is supplied. */
+export const DIV_TENANT_VERSION = 2
 export const DIV_INTENT_TYPE = "div-intent-verification"
 
 /**
@@ -561,6 +563,7 @@ function parseEvidence(canonical: string): { ok: true } | { ok: false; reason: s
  * key sorted recursively by UTF-16 code unit via `stableStringify`. Do NOT hand-order keys.
  */
 export function canonicalIntentPayload(input: {
+  tenantId?: string
   target: string
   actionType: string
   display: string
@@ -572,8 +575,10 @@ export function canonicalIntentPayload(input: {
   agentContext?: AgentIntentContext
 }): string {
   if (input.agentContext) validateAgentIntentContext(input.agentContext, input.expiresAt)
+  const tenant = tenantBinding(input.tenantId)
   return stableStringify({
-    v: DIV_VERSION,
+    v: tenant.v,
+    ...tenant.field,
     type: DIV_INTENT_TYPE,
     target: input.target,
     actionType: input.actionType,
@@ -629,6 +634,17 @@ function commonSignedFields(requester: RequesterIdentity, requirement: ApprovalR
   }
 }
 
+/** Select v1 or tenant-bound v2 while preserving the opaque tenant identifier exactly. */
+function tenantBinding(tenantId: string | undefined): {
+  v: typeof DIV_VERSION | typeof DIV_TENANT_VERSION
+  field: {} | { tenantId: string }
+} {
+  if (tenantId === undefined) return { v: DIV_VERSION, field: {} }
+  if (typeof tenantId !== "string" || tenantId.length === 0)
+    throw new NonCanonicalValue("tenantId must be a non-empty string for DIV v2")
+  return { v: DIV_TENANT_VERSION, field: { tenantId } }
+}
+
 /**
  * Canonical OFFLINE INTENT payload (DIV §5a.2). Deliberately a separate function rather than a `type`
  * parameter on `canonicalIntentPayload`.
@@ -643,6 +659,7 @@ function commonSignedFields(requester: RequesterIdentity, requirement: ApprovalR
  * correctly minted one at verification time.
  */
 export function canonicalOfflineIntentPayload(input: {
+  tenantId?: string
   target: string
   actionType: string
   display: string
@@ -653,8 +670,10 @@ export function canonicalOfflineIntentPayload(input: {
   challengedAt: string
   expiresAt: string
 }): string {
+  const tenant = tenantBinding(input.tenantId)
   return stableStringify({
-    v: DIV_VERSION,
+    v: tenant.v,
+    ...tenant.field,
     type: DIV_OFFLINE_INTENT_TYPE,
     target: input.target,
     actionType: input.actionType,
@@ -683,6 +702,7 @@ export function canonicalOfflineIntentPayload(input: {
  * incident time — two different quorums, which is why both are in the signed bytes.
  */
 export function canonicalDelegationPayload(input: {
+  tenantId?: string
   target: string
   actionType: string
   display: string
@@ -695,8 +715,10 @@ export function canonicalDelegationPayload(input: {
   sealedAt: string
   expiresAt: string
 }): string {
+  const tenant = tenantBinding(input.tenantId)
   return stableStringify({
-    v: DIV_VERSION,
+    v: tenant.v,
+    ...tenant.field,
     type: DIV_DELEGATION_TYPE,
     target: input.target,
     actionType: input.actionType,
@@ -722,6 +744,7 @@ export function canonicalDelegationPayload(input: {
  * exactly as `allowedAaguids` is.
  */
 export function canonicalAgentAuthorityPayload(input: {
+  tenantId?: string
   target: string
   actionPatterns: string[]
   display: string
@@ -733,8 +756,10 @@ export function canonicalAgentAuthorityPayload(input: {
   sealedAt: string
   expiresAt: string
 }): string {
+  const tenant = tenantBinding(input.tenantId)
   return stableStringify({
-    v: DIV_VERSION,
+    v: tenant.v,
+    ...tenant.field,
     type: DIV_AGENT_AUTHORITY_TYPE,
     target: input.target,
     actionPatterns: [...input.actionPatterns].sort(),
@@ -755,6 +780,7 @@ export function canonicalAgentAuthorityPayload(input: {
  * lowercase-hex rule on the RELYING PARTY's expected value instead.
  */
 export function canonicalPlatformIntentPayload(input: {
+  tenantId?: string
   payloadHash: string
   rpId: string
   subjectExternalId: string
@@ -762,8 +788,10 @@ export function canonicalPlatformIntentPayload(input: {
   expiresAt: string
   nonce: string
 }): string {
+  const tenant = tenantBinding(input.tenantId)
   return stableStringify({
-    v: DIV_VERSION,
+    v: tenant.v,
+    ...tenant.field,
     type: DIV_PLATFORM_INTENT_TYPE,
     hashAlg: "SHA-256",
     payloadHash: input.payloadHash,
@@ -836,6 +864,31 @@ function parseNonce(canonical: string): string {
 function parseVersion(canonical: string): number {
   const v = parseField<unknown>(canonical, "v")
   return typeof v === "number" ? v : 0
+}
+
+type TenantBindingCheck = { ok: true; tenantId?: string } | { ok: false; reason: string }
+
+/** Apply the v1 compatibility rule or the v2 independently-asserted tenant binding. */
+function checkTenantBinding(
+  canonical: string,
+  version: number,
+  expectedTenantId: unknown,
+): TenantBindingCheck {
+  if (version === DIV_VERSION) {
+    if (expectedTenantId !== undefined)
+      return { ok: false, reason: "legacy DIV v1 payload cannot be verified with an expected tenantId" }
+    return { ok: true }
+  }
+  if (version !== DIV_TENANT_VERSION)
+    return { ok: false, reason: `unsupported DIV payload version (${version || "unparseable"})` }
+  if (typeof expectedTenantId !== "string" || expectedTenantId.length === 0)
+    return { ok: false, reason: "expected.tenantId is required for tenant-bound DIV v2 payloads" }
+  const signedTenantId = parseField<unknown>(canonical, "tenantId")
+  if (typeof signedTenantId !== "string" || signedTenantId.length === 0)
+    return { ok: false, reason: "tenant-bound DIV v2 payload is missing a non-empty tenantId" }
+  if (signedTenantId !== expectedTenantId)
+    return { ok: false, reason: "receipt was signed for a different tenant" }
+  return { ok: true, tenantId: expectedTenantId }
 }
 
 /** Default clock-skew tolerance for expiry validation (DIV §6.2 RECOMMENDED ±30s). */
@@ -973,6 +1026,8 @@ export function selfCertifyingDid(publicKeyB64: string): string {
 
 /** What you assert the receipt must say. `target`, `nonce` and `approvers` are required. */
 export interface ReceiptExpectation {
+  /** Required for v2. Omit only while verifying a legacy v1 receipt. Never derive it from the receipt. */
+  tenantId?: string
   /**
    * REQUIRED. The approvers you trust — see ApproverTrustAnchor. There is deliberately no default:
    * a receipt cannot be permitted to vouch for its own signer.
@@ -1011,6 +1066,7 @@ export interface VerifyReceiptOptions {
   agentAuthorityChain?: Array<{
     receipt: ApprovalReceipt
     expected: {
+      tenantId?: string
       approvers: ApproverTrustAnchor
       target: string
       agentDid: string
@@ -1178,12 +1234,28 @@ function candidateKeys(
  * DIDs (an export bug, or one person enrolled under two identifiers) would otherwise let that key's
  * holder count as two approvers, since quorum counts distinct identities. So a key already counted
  * for one identity cannot count for another: distinct keys AND distinct identities are required.
- * Keys are compared by their decoded bytes, so padded/unpadded and base64/base64url spellings of one
- * encoding match; the same key in a different encoding (COSE vs SPKI) is not detected.
+ * Keys are compared by their P-256 public point when recognized (so COSE and SPKI encodings match),
+ * otherwise by decoded bytes. Padded/unpadded and base64/base64url spellings also match.
  * Records the key when it is free; returns the refusal reason when it is not.
  */
 function sharedKeyProblem(counted: Map<string, string>, key: string, identity: string): string | null {
-  const fingerprint = Buffer.from(key, "base64").toString("hex")
+  const decoded = Buffer.from(key, "base64")
+  let fingerprint = decoded.toString("hex")
+  try {
+    let point: { x: string; y: string }
+    if (decoded[0] === 0x30) {
+      const jwk = crypto
+        .createPublicKey({ key: decoded, format: "der", type: "spki" })
+        .export({ format: "jwk" })
+      if (jwk.kty !== "EC" || jwk.crv !== "P-256" || !jwk.x || !jwk.y) throw new Error("not P-256")
+      point = { x: jwk.x, y: jwk.y }
+    } else {
+      point = parseCosePublicKey(decoded)
+    }
+    fingerprint = `p256:${point.x}:${point.y}`
+  } catch {
+    // Invalid or unsupported encodings remain byte-fingerprinted; signature verification fails closed.
+  }
   const owner = counted.get(fingerprint)
   if (owner !== undefined && owner !== identity)
     return `signer ${identity} verified under a key already counted for ${owner}; two approver identities sharing one key count once (DIV §4.4.6)`
@@ -1504,8 +1576,8 @@ export function verifyApprovalReceipt(
   opts: VerifyReceiptOptions = {},
 ): { ok: boolean; reason?: string; autoApproved?: boolean; signers?: string[] } {
   const version = parseVersion(receipt.canonicalPayload)
-  if (version !== DIV_VERSION)
-    return { ok: false, reason: `unsupported DIV payload version (${version || "unparseable"})` }
+  const tenant = checkTenantBinding(receipt.canonicalPayload, version, expected.tenantId)
+  if (!tenant.ok) return tenant
   // Which KIND of proof is this? The type is inside the signed bytes, so this is not spoofable
   // without breaking the signature — and the kinds rebuild through different canonical builders,
   // so none can ever be mistaken for another further down.
@@ -1559,6 +1631,11 @@ export function verifyApprovalReceipt(
   // are taken from the receipt and MUST byte-match the signed bytes below — a forged value changes the
   // string and fails the comparison, so trusting the receipt for them is not circular.
   if (!receipt.requester) return { ok: false, reason: "receipt missing requester" }
+  if (opts.delegation && receipt.requester.did !== opts.delegation.requesterDid)
+    return {
+      ok: false,
+      reason: "offline approval was requested by a different principal than the delegation",
+    }
   const embeddedAgent = parseField<unknown>(receipt.canonicalPayload, "agent")
   const agentIntent = embeddedAgent !== undefined
   if (agentIntent && !expected.agentContext)
@@ -1598,6 +1675,7 @@ export function verifyApprovalReceipt(
           actionType: expected.actionType,
           agentDid: expected.requesterDid,
           delegatedBy: context.agent.delegatedBy,
+          tenantId: tenant.tenantId,
         },
         opts,
       )
@@ -1702,6 +1780,8 @@ export function verifyApprovalReceipt(
   let delegatedQuorum: number | undefined
   if (opts.delegation) {
     const d = opts.delegation
+    if (d.tenantId !== tenant.tenantId)
+      return { ok: false, reason: "delegation and approval belong to different tenants" }
     // A successful seal check can be cached or precede a long signing ceremony. Its expiry must
     // still hold at USE time (DIV §5a.6), under the same clock/forensic policy as this approval.
     const delegationExpiryMs = parseRfc3339Ms(d.expiresAt)
@@ -1743,6 +1823,7 @@ export function verifyApprovalReceipt(
   }
 
   const rebuild = {
+    ...(tenant.tenantId !== undefined ? { tenantId: tenant.tenantId } : {}),
     target: expected.target,
     actionType: expected.actionType,
     display: receipt.actionDescription,
@@ -1949,6 +2030,8 @@ export interface PlatformReceipt {
 }
 
 export interface PlatformReceiptExpectation {
+  /** Required for v2. Omit only while verifying a legacy v1 receipt. Never derive it from the receipt. */
+  tenantId?: string
   /** REQUIRED. The subject keys you trust — same modes as ReceiptExpectation.approvers. */
   approvers: ApproverTrustAnchor
   /**
@@ -1982,8 +2065,8 @@ export function verifyPlatformReceipt(
   opts: VerifyReceiptOptions = {},
 ): { ok: boolean; reason?: string; signers?: string[] } {
   const version = parseVersion(receipt.canonicalPayload)
-  if (version !== DIV_VERSION)
-    return { ok: false, reason: `unsupported DIV payload version (${version || "unparseable"})` }
+  const tenant = checkTenantBinding(receipt.canonicalPayload, version, expected.tenantId)
+  if (!tenant.ok) return tenant
   const payloadType = parseField(receipt.canonicalPayload, "type")
   if (payloadType !== DIV_PLATFORM_INTENT_TYPE) {
     return {
@@ -2046,6 +2129,7 @@ export function verifyPlatformReceipt(
   let recomputed: string
   try {
     recomputed = canonicalPlatformIntentPayload({
+      ...(tenant.tenantId !== undefined ? { tenantId: tenant.tenantId } : {}),
       payloadHash: expected.payloadHash,
       rpId: expected.rpId,
       subjectExternalId,
@@ -2142,6 +2226,10 @@ export function verifyPlatformReceipt(
 
 /** A delegation whose own signature, quorum and window have been verified by `verifyDelegation`. */
 export interface VerifiedDelegation {
+  /** Signed tenant binding. Absent only on a legacy v1 delegation. */
+  tenantId?: string
+  /** Requester DID frozen by the delegation seal and required on the offline approval it authorizes. */
+  requesterDid: string
   /** Identities permitted to approve at incident time. Enforced against the witness DIDs. */
   delegatedTo: string[]
   /** How many distinct members of `delegatedTo` must sign. */
@@ -2173,6 +2261,10 @@ export interface VerifiedDelegation {
 export function verifyDelegation(
   receipt: ApprovalReceipt,
   expected: {
+    /** Required for v2. Omit only for a legacy v1 delegation. */
+    tenantId?: string
+    /** Optionally pin which requester may use this delegation; never infer it from the seal. */
+    requesterDid?: string
     /** The ORDINARY approvers entitled to delegate. Resolved from your own trust policy. */
     approvers: ApproverTrustAnchor
     /** YOUR target identifier, asserted independently of the delegation (DIV Target Isolation). */
@@ -2189,8 +2281,8 @@ export function verifyDelegation(
   opts: VerifyReceiptOptions = {},
 ): { ok: boolean; reason?: string; delegation?: VerifiedDelegation } {
   const version = parseVersion(receipt.canonicalPayload)
-  if (version !== DIV_VERSION)
-    return { ok: false, reason: `unsupported DIV payload version (${version || "unparseable"})` }
+  const tenant = checkTenantBinding(receipt.canonicalPayload, version, expected.tenantId)
+  if (!tenant.ok) return tenant
   if (parseField(receipt.canonicalPayload, "type") !== DIV_DELEGATION_TYPE)
     return { ok: false, reason: "payload is not a div-delegation" }
 
@@ -2251,6 +2343,8 @@ export function verifyDelegation(
   // produce, so the byte comparison happens here and the CRYPTO happens there.
   const nonce = parseNonce(receipt.canonicalPayload)
   if (!receipt.requester) return { ok: false, reason: "delegation missing requester" }
+  if (expected.requesterDid !== undefined && receipt.requester.did !== expected.requesterDid)
+    return { ok: false, reason: "approval was requested by a different principal" }
   const requirement = parseField<Partial<ApprovalRequirementAttestation>>(
     receipt.canonicalPayload,
     "requirement",
@@ -2278,6 +2372,7 @@ export function verifyDelegation(
   let recomputed: string
   try {
     recomputed = canonicalDelegationPayload({
+      ...(tenant.tenantId !== undefined ? { tenantId: tenant.tenantId } : {}),
       target: expected.target,
       actionType: expected.actionType,
       display: receipt.actionDescription,
@@ -2413,6 +2508,8 @@ export function verifyDelegation(
   return {
     ok: true,
     delegation: {
+      ...(tenant.tenantId !== undefined ? { tenantId: tenant.tenantId } : {}),
+      requesterDid: receipt.requester.did,
       // The DEDUPLICATED set: this is what gets enforced against witness DIDs later, and a duplicate
       // entry must not create the illusion of a larger eligible pool.
       delegatedTo: distinctDelegates,
@@ -2429,6 +2526,8 @@ export function verifyDelegation(
 
 /** An agent authority whose sealing signatures, quorum and window verified (`verifyAgentAuthority`). */
 export interface VerifiedAgentAuthority {
+  /** Signed tenant binding. Absent only on a legacy v1 authority. */
+  tenantId?: string
   /** The agent the authority is ABOUT — from the signed bytes, asserted by the caller. */
   agentDid: string
   target: string
@@ -2466,6 +2565,8 @@ export interface VerifiedAgentAuthority {
 export function verifyAgentAuthority(
   receipt: ApprovalReceipt,
   expected: {
+    /** Required for v2. Omit only for a legacy v1 authority. */
+    tenantId?: string
     /** The sealing approvers entitled to grant. Resolved from your own trust policy. */
     approvers: ApproverTrustAnchor
     /** YOUR target identifier, asserted independently of the artifact (DIV Target Isolation). */
@@ -2482,8 +2583,8 @@ export function verifyAgentAuthority(
   opts: VerifyReceiptOptions = {},
 ): { ok: boolean; reason?: string; authority?: VerifiedAgentAuthority } {
   const version = parseVersion(receipt.canonicalPayload)
-  if (version !== DIV_VERSION)
-    return { ok: false, reason: `unsupported DIV payload version (${version || "unparseable"})` }
+  const tenant = checkTenantBinding(receipt.canonicalPayload, version, expected.tenantId)
+  if (!tenant.ok) return tenant
   if (parseField(receipt.canonicalPayload, "type") !== DIV_AGENT_AUTHORITY_TYPE)
     return { ok: false, reason: "payload is not a div-agent-authority" }
 
@@ -2557,6 +2658,7 @@ export function verifyAgentAuthority(
   let recomputed: string
   try {
     recomputed = canonicalAgentAuthorityPayload({
+      ...(tenant.tenantId !== undefined ? { tenantId: tenant.tenantId } : {}),
       target: expected.target,
       actionPatterns: actionPatterns as string[],
       display: receipt.actionDescription,
@@ -2682,6 +2784,7 @@ export function verifyAgentAuthority(
   return {
     ok: true,
     authority: {
+      ...(tenant.tenantId !== undefined ? { tenantId: tenant.tenantId } : {}),
       agentDid: expected.agentDid,
       target: expected.target,
       // Deduplicated + sorted: a duplicate pattern must not suggest a wider scope, and every port
@@ -2727,13 +2830,14 @@ export function verifyAgentDelegationChain(
   chain: Array<{
     receipt: ApprovalReceipt
     expected: {
+      tenantId?: string
       approvers: ApproverTrustAnchor
       target: string
       agentDid: string
       requirement?: RequirementFloor
     }
   }>,
-  action: { target: string; actionType: string; agentDid: string; delegatedBy: string },
+  action: { target: string; actionType: string; agentDid: string; delegatedBy: string; tenantId?: string },
   opts: VerifyReceiptOptions = {},
 ): { ok: boolean; reason?: string } {
   if (chain.length < 2 || !AGENT_DIGEST.test(action.delegatedBy))
@@ -2747,10 +2851,14 @@ export function verifyAgentDelegationChain(
     if (!proof.ok || !proof.authority)
       return { ok: false, reason: `authority link ${index + 1}: ${proof.reason}` }
     const authority = proof.authority
+    if (authority.tenantId !== action.tenantId)
+      return { ok: false, reason: "authority chain and action belong to different tenants" }
     if (authority.target !== action.target) return { ok: false, reason: "delegated authority changes target" }
     if (authority.parentReceiptHash !== parentHash)
       return { ok: false, reason: "delegated authority has a missing or different parent receipt" }
     if (parent) {
+      if (authority.tenantId !== parent.tenantId)
+        return { ok: false, reason: "authority chain crosses tenant boundaries" }
       if (
         parseRfc3339Ms(authority.sealedAt) < parseRfc3339Ms(parent.sealedAt) ||
         parseRfc3339Ms(authority.expiresAt) > parseRfc3339Ms(parent.expiresAt)
@@ -2894,7 +3002,7 @@ export {
   verifyBundle,
   verifyEmbeddedSignature,
   type VerifyOptions,
-} from "./ledger-bundle.js"
+} from "./ledger-bundle.ts"
 export {
   EVIDENCE_BUNDLE_KIND,
   type EvidenceAnchorSet,
@@ -2904,7 +3012,7 @@ export {
   type EvidenceVerifyOptions,
   type RedactionRecord,
   verifyEvidenceBundle,
-} from "./ledger-evidence.js"
+} from "./ledger-evidence.ts"
 export {
   ANCHOR_ALGORITHMS,
   ANCHOR_CLOCK_SKEW_SECONDS,
@@ -2924,7 +3032,7 @@ export {
   type SignedAnchor,
   verifyAnchorQuorum,
   verifyAnchorSignature,
-} from "./ledger-anchor.js"
+} from "./ledger-anchor.ts"
 export {
   type ChainInput,
   type ChainVerification,
@@ -2933,15 +3041,15 @@ export {
   GENESIS_PREV_CHAIN_HASH,
   type RootsChainEntry,
   verifyRootsChain,
-} from "./ledger-chain.js"
+} from "./ledger-chain.ts"
 export {
   parseRekorEvidence,
   type RekorEvidence,
   type RekorVerification,
   rekorPayloadHashFor,
   verifyRekorAnchor,
-} from "./ledger-rekor.js"
-export { type AuditLeaf, canonicalPreimage, leafHash } from "./ledger-leaf.js"
+} from "./ledger-rekor.ts"
+export { type AuditLeaf, canonicalPreimage, leafHash } from "./ledger-leaf.ts"
 export {
   hashLeaf,
   hashPair,
@@ -2950,8 +3058,8 @@ export {
   type ProofStep,
   sha256Hex,
   verifyMerkleProof,
-} from "./ledger-merkle.js"
-export { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
+} from "./ledger-merkle.ts"
+export { type InclusionProof, verifyInclusionProof } from "./ledger-proof.ts"
 
 export {
   verifyRfc3161Anchor,
@@ -2959,10 +3067,10 @@ export {
   verifyRfc3161TimestampAsync,
   type Rfc3161Trust,
   type Rfc3161Verification,
-} from "./ledger-rfc3161.js"
+} from "./ledger-rfc3161.ts"
 
 export {
   verifyAuditSignature,
   type AuditSignaturePolicy,
   type AuditSignatureCheck,
-} from "./ledger-signature.js"
+} from "./ledger-signature.ts"

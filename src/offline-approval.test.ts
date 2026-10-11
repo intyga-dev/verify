@@ -107,6 +107,7 @@ function receiptFor(
 /** Build an offline proof. `windowMinutes` and `requirement` are the knobs the tests turn. */
 function offlineProof(
   opts: {
+    tenantId?: string
     windowMinutes?: number
     req?: ReturnType<typeof requirement>
     signers?: Signer[]
@@ -120,6 +121,7 @@ function offlineProof(
   const challengedAt = opts.challengedAt ?? new Date()
   const nonce = `off_${crypto.randomUUID()}`
   const canonical = canonicalOfflineIntentPayload({
+    ...(opts.tenantId !== undefined ? { tenantId: opts.tenantId } : {}),
     target: opts.target ?? TARGET,
     actionType: opts.actionType ?? ACTION_TYPE,
     display: DISPLAY,
@@ -153,6 +155,7 @@ function expectation(nonce: string, over: Record<string, unknown> = {}) {
 /** Build a delegation naming `delegates`, signed by the ordinary approvers `signers`. */
 function delegationProof(
   opts: {
+    tenantId?: string
     delegates?: string[]
     quorum?: number
     windowHours?: number
@@ -162,16 +165,18 @@ function delegationProof(
     target?: string
     actionType?: string
     params?: Record<string, unknown>
+    requester?: { did: string; attestation: null }
   } = {},
 ) {
   const sealedAt = opts.sealedAt ?? new Date()
   const nonce = `dlg_${crypto.randomUUID()}`
   const canonical = canonicalDelegationPayload({
+    ...(opts.tenantId !== undefined ? { tenantId: opts.tenantId } : {}),
     target: opts.target ?? TARGET,
     actionType: opts.actionType ?? ACTION_TYPE,
     display: DISPLAY,
     params: opts.params ?? PARAMS,
-    requester: REQUESTER,
+    requester: opts.requester ?? REQUESTER,
     requirement: opts.req ?? requirement({ requiredApprovals: 2 }),
     delegatedTo: opts.delegates ?? [CAROL.did, MALLORY.did],
     delegatedQuorum: opts.quorum ?? 1,
@@ -183,6 +188,7 @@ function delegationProof(
     target: opts.target ?? TARGET,
     actionType: opts.actionType ?? ACTION_TYPE,
     params: opts.params ?? PARAMS,
+    requester: opts.requester ?? REQUESTER,
   })
   return { nonce, canonical, receipt }
 }
@@ -210,6 +216,19 @@ describe("offline approval", () => {
     const r = verifyApprovalReceipt(receipt, expectation(nonce), { allowOffline: true })
     assert.equal(r.ok, true, r.reason)
     assert.deepEqual(r.signers, [ALICE.did])
+  })
+
+  it("verifies a tenant-bound v2 proof only under the exact expected tenant", () => {
+    const tenantId = "tenant-alpha"
+    const { receipt, nonce } = offlineProof({ tenantId })
+    assert.equal(
+      verifyApprovalReceipt(receipt, expectation(nonce, { tenantId }), { allowOffline: true }).ok,
+      true,
+    )
+    assert.match(
+      verifyApprovalReceipt(receipt, expectation(nonce), { allowOffline: true }).reason ?? "",
+      /tenantId is required/,
+    )
   })
 
   it("allowOffline does NOT let a normal approval through as offline, or the reverse", () => {
@@ -433,6 +452,46 @@ describe("delegation", () => {
     assert.equal(r.ok, true, r.reason)
     assert.equal(r.delegation?.delegatedQuorum, 1)
     assert.deepEqual(r.delegation?.delegatedTo, [CAROL.did, MALLORY.did])
+    assert.equal(r.delegation?.requesterDid, REQUESTER.did)
+  })
+
+  it("binds delegation use to the requester frozen by the seal", () => {
+    const sealed = delegationProof()
+    const wrongPin = verifyDelegation(sealed.receipt, {
+      ...delegationExpectation,
+      requesterDid: "did:intyga:service:other",
+    })
+    assert.equal(wrongPin.ok, false)
+    assert.match(wrongPin.reason ?? "", /different principal/)
+
+    const verified = verifyDelegation(sealed.receipt, delegationExpectation)
+    assert.equal(verified.ok, true, verified.reason)
+    const offline = offlineProof({ requester: { did: "did:intyga:service:other", attestation: null } })
+    const result = verifyApprovalReceipt(offline.receipt, expectation(offline.nonce), {
+      allowOffline: true,
+      delegation: verified.delegation,
+    })
+    assert.equal(result.ok, false)
+    assert.match(result.reason ?? "", /different principal/)
+  })
+
+  it("carries a tenant binding and cannot authorize an approval from another tenant", () => {
+    const sealed = delegationProof({ tenantId: "tenant-beta" })
+    const verified = verifyDelegation(sealed.receipt, {
+      ...delegationExpectation,
+      tenantId: "tenant-beta",
+    })
+    assert.equal(verified.ok, true, verified.reason)
+    assert.equal(verified.delegation?.tenantId, "tenant-beta")
+
+    const approval = offlineProof({ tenantId: "tenant-alpha", signers: [CAROL] })
+    const result = verifyApprovalReceipt(
+      approval.receipt,
+      expectation(approval.nonce, { tenantId: "tenant-alpha", approvers: anchor(CAROL) }),
+      { allowOffline: true, delegation: verified.delegation },
+    )
+    assert.equal(result.ok, false)
+    assert.match(result.reason ?? "", /different tenants/)
   })
 
   it("refuses a delegation the ordinary quorum did not sign", () => {

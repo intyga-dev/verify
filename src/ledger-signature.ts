@@ -1,6 +1,6 @@
-import { verifyWebAuthnWitness } from "./index.js"
-import type { AuditLeaf } from "./ledger-leaf.js"
-import { verifyEmbeddedSignature } from "./ledger-bundle.js"
+import { verifyWebAuthnWitness } from "./index.ts"
+import type { AuditLeaf } from "./ledger-leaf.ts"
+import { verifyEmbeddedSignature } from "./ledger-bundle.ts"
 
 /** Caller-owned identity/key mapping. WebAuthn keys use base64 COSE_Key; ES256 keys use SPKI. */
 export interface AuditSignaturePolicy {

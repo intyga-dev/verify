@@ -50,6 +50,17 @@ function cose(p: Pair): string {
     Buffer.from(jwk.y, "base64url"),
   ]).toString("base64")
 }
+function coseAlias(p: Pair): string {
+  const jwk = p.publicKey.export({ format: "jwk" }) as { x: string; y: string }
+  // Same COSE_Key members and P-256 point as cose(), in a different legal map order.
+  return Buffer.concat([
+    Buffer.from([0xa5, 0x22, 0x58, 0x20]),
+    Buffer.from(jwk.y, "base64url"),
+    Buffer.from([0x21, 0x58, 0x20]),
+    Buffer.from(jwk.x, "base64url"),
+    Buffer.from([0x20, 0x01, 0x03, 0x26, 0x01, 0x02]),
+  ]).toString("base64")
+}
 const sha256 = (b: Buffer | string): Buffer => crypto.createHash("sha256").update(b).digest()
 
 export function buildVerifierInputHardening() {
@@ -69,6 +80,12 @@ export function buildVerifierInputHardening() {
     { id: "ih-alice", did: "did:intyga:alice", spkiB64: spki(alice) },
     { id: "ih-bob", did: "did:intyga:bob", spkiB64: spki(bob) },
     { id: "ih-passkey", did: "did:intyga:passkey-holder", spkiB64: spki(passkey), coseB64: cose(passkey) },
+    {
+      id: "ih-passkey-cose-alias",
+      did: "did:intyga:passkey-alias",
+      spkiB64: spki(passkey),
+      coseB64: coseAlias(passkey),
+    },
     { id: "ih-subject", did: "did:intyga:subject:42", spkiB64: spki(subject), coseB64: cose(subject) },
     { id: "ih-anchor-es256", issuer: ANCHOR_ISSUER, spkiB64: spki(anchorEc) },
     { id: "ih-anchor-rsa-2048", issuer: RSA_ISSUER, spkiB64: spki(rsa2048) },
@@ -217,8 +234,80 @@ export function buildVerifierInputHardening() {
       ...assertion(base.canonicalPayload, passkey, WEBAUTHN_RP, WEBAUTHN_ORIGIN, extra, 0x05),
     }
   }
+  const sharedKeyQuorumReceipt = (): ApprovalReceipt => {
+    const requiredApprovals = 2
+    const canonicalPayload = canonicalIntentPayload({
+      target: TARGET,
+      actionType: ACTION,
+      display: DISPLAY,
+      params: PARAMS,
+      requester,
+      requirement: {
+        requiredApprovals,
+        requireHardwareKey: false,
+        allowedAaguids: [],
+        requesterCannotApprove: false,
+        signerClass: "human",
+      },
+      nonce: NONCE,
+      expiresAt: "2027-09-01T12:00:00.000Z",
+    })
+    const clientDataJSON = Buffer.from(
+      JSON.stringify({
+        type: "webauthn.get",
+        challenge: Buffer.from(canonicalPayload).toString("base64url"),
+        origin: WEBAUTHN_ORIGIN,
+        crossOrigin: false,
+      }),
+    ).toString("base64url")
+    const authenticatorData = Buffer.concat([sha256(WEBAUTHN_RP), Buffer.from([0x05, 0, 0, 0, 1])]).toString(
+      "base64url",
+    )
+    const signature = crypto
+      .sign(
+        "sha256",
+        Buffer.concat([
+          Buffer.from(authenticatorData, "base64url"),
+          sha256(Buffer.from(clientDataJSON, "base64url")),
+        ]),
+        { key: passkey.privateKey, dsaEncoding: "der" },
+      )
+      .toString("base64url")
+    const witness = (signerDid: string, signerPublicKey: string) => ({
+      signerDid,
+      signerPublicKey,
+      signature,
+      sigAlg: "WEBAUTHN",
+      authenticatorData,
+      clientDataJSON,
+    })
+    const base = approvalWith("2027-09-01T12:00:00.000Z")
+    return {
+      ...base,
+      canonicalPayload,
+      signatures: [
+        witness("did:intyga:passkey-holder", cose(passkey)),
+        witness("did:intyga:passkey-alias", coseAlias(passkey)),
+      ],
+      verificationCode: verificationCode(canonicalPayload),
+    }
+  }
   const webauthnOptions = { expectedOrigin: WEBAUTHN_ORIGIN, expectedRpId: WEBAUTHN_RP }
   const webauthnCases = [
+    {
+      name: "same-p256-key-cose-map-aliases-cannot-fill-quorum",
+      receipt: sharedKeyQuorumReceipt(),
+      expected: {
+        approverDids: {
+          "did:intyga:passkey-holder": ["ih-passkey"],
+          "did:intyga:passkey-alias": ["ih-passkey-cose-alias"],
+        },
+        approverCoseDids: ["did:intyga:passkey-holder", "did:intyga:passkey-alias"],
+      },
+      options: webauthnOptions,
+      ok: false,
+      reasonIncludes: "quorum not met",
+    },
     {
       name: "webauthn-top-origin-equal-accepted",
       receipt: webauthnApproval({ topOrigin: WEBAUTHN_ORIGIN }),

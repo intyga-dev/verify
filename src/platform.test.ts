@@ -40,11 +40,13 @@ function makeReceipt(
     flags?: number
     sigAlg?: string
     signWith?: crypto.KeyPairKeyObjectResult
+    tenantId?: string
   } = {},
 ): PlatformReceipt {
   const canonical =
     over.canonical ??
     canonicalPlatformIntentPayload({
+      ...(over.tenantId !== undefined ? { tenantId: over.tenantId } : {}),
       payloadHash: PAYLOAD_HASH,
       rpId: RP_ID,
       subjectExternalId: SUBJECT,
@@ -104,6 +106,16 @@ describe("verifyPlatformReceipt", () => {
     const verdict = verifyPlatformReceipt(makeReceipt(), EXPECTED, OPTS)
     assert.equal(verdict.ok, true, verdict.reason)
     assert.equal(verdict.signers?.length, 1)
+  })
+
+  it("binds a v2 platform receipt to the caller's exact tenant expectation", () => {
+    const receipt = makeReceipt({ tenantId: "tenant-alpha" })
+    assert.equal(verifyPlatformReceipt(receipt, { ...EXPECTED, tenantId: "tenant-alpha" }, OPTS).ok, true)
+    assert.match(verifyPlatformReceipt(receipt, EXPECTED, OPTS).reason ?? "", /tenantId is required/)
+    assert.match(
+      verifyPlatformReceipt(receipt, { ...EXPECTED, tenantId: "tenant-beta" }, OPTS).reason ?? "",
+      /different tenant/,
+    )
   })
 
   it("refuses a digest that does not match what was signed", () => {

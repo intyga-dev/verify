@@ -7,6 +7,7 @@ import {
   type RequesterIdentity,
   SELF_CERTIFYING_DID_PREFIX,
   selfCertifyingDid,
+  stableStringify,
   verificationCode,
   verifyApprovalReceipt,
 } from "./index.ts"
@@ -35,6 +36,7 @@ const APPROVER_SPKI_B64 = APPROVER.publicKey.export({ format: "der", type: "spki
 const APPROVER_JWK = APPROVER.publicKey.export({ format: "jwk" }) as { x: string; y: string }
 
 function divPayload(input: {
+  tenantId?: string
   actionType: string
   actionDescription: string
   params: Record<string, unknown>
@@ -43,6 +45,7 @@ function divPayload(input: {
   requirement?: typeof DEFAULT_REQUIREMENT
 }): string {
   return canonicalIntentPayload({
+    ...(input.tenantId !== undefined ? { tenantId: input.tenantId } : {}),
     target: TARGET,
     actionType: input.actionType,
     display: input.actionDescription,
@@ -56,6 +59,7 @@ function divPayload(input: {
 
 // Build a genuinely-signed ES256 receipt the way the gateway would.
 function es256Receipt(input: {
+  tenantId?: string
   actionType: string
   actionDescription: string
   params: Record<string, unknown>
@@ -116,6 +120,42 @@ test("verifies a genuine ES256 approval receipt", () => {
     ...ACTION,
   })
   assert.equal(verifyApprovalReceipt(receipt, EXPECTED).ok, true)
+})
+
+test("tenant binding requires an independent exact expectation while preserving legacy v1", () => {
+  const tenantId = "tenant-alpha "
+  const { receipt } = es256Receipt({
+    tenantId,
+    actionDescription: "Wipe production database",
+    ...ACTION,
+  })
+  assert.equal(verifyApprovalReceipt(receipt, { ...EXPECTED, tenantId }).ok, true)
+  assert.match(verifyApprovalReceipt(receipt, EXPECTED).reason ?? "", /tenantId is required/)
+  assert.match(
+    verifyApprovalReceipt(receipt, { ...EXPECTED, tenantId: "tenant-alpha" }).reason ?? "",
+    /different tenant/,
+  )
+
+  const legacy = es256Receipt({ actionDescription: "Wipe production database", ...ACTION }).receipt
+  assert.equal(verifyApprovalReceipt(legacy, EXPECTED).ok, true)
+  assert.match(verifyApprovalReceipt(legacy, { ...EXPECTED, tenantId }).reason ?? "", /legacy DIV v1 payload/)
+
+  // A signed v2 payload cannot be made legacy by deleting its tenant: an expected tenant causes the
+  // compatibility path to fail closed even when an attacker re-signs the downgraded bytes.
+  const downgradedFields = JSON.parse(receipt.canonicalPayload) as Record<string, unknown>
+  downgradedFields.v = 1
+  delete downgradedFields.tenantId
+  const downgraded = stableStringify(downgradedFields)
+  const signature = crypto
+    .sign("sha256", Buffer.from(downgraded), { key: APPROVER.privateKey, dsaEncoding: "ieee-p1363" })
+    .toString("base64")
+  assert.match(
+    verifyApprovalReceipt(
+      { ...receipt, canonicalPayload: downgraded, signature, verificationCode: verificationCode(downgraded) },
+      { ...EXPECTED, tenantId },
+    ).reason ?? "",
+    /legacy DIV v1 payload/,
+  )
 })
 
 // ── signerClass registry (DIV §4.3.2 / §5-step-3a) ──────────────────────────

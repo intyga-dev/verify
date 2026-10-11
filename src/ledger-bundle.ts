@@ -4,16 +4,16 @@ import {
   uncheckedSignature,
   type AuditSignaturePolicy,
   type AuditSignatureCheck,
-} from "./ledger-signature.js"
-import type { ExternalAnchorKeys } from "./ledger-anchor.js"
+} from "./ledger-signature.ts"
+import type { ExternalAnchorKeys } from "./ledger-anchor.ts"
 import {
   type AnchorKeyResolver,
   type AnchorPolicy,
   type SignedAnchor,
   verifyAnchorQuorum,
-} from "./ledger-anchor.js"
-import { type AuditLeaf, leafHash } from "./ledger-leaf.js"
-import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.js"
+} from "./ledger-anchor.ts"
+import { type AuditLeaf, leafHash } from "./ledger-leaf.ts"
+import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.ts"
 
 // The downloadable proof bundle a member exports (GET /api/audit/proof/:seq) and what it means to
 // verify one. A verdict is only as strong as the daily root you check against: use a root you

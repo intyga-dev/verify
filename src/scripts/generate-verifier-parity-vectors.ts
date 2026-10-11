@@ -1809,12 +1809,3 @@ writeFileSync(
   fileURLToPath(new URL("../../vectors/verifier-parity-vectors.json", import.meta.url)),
   `${JSON.stringify(out, null, 2)}\n`,
 )
-writeFileSync(
-  fileURLToPath(
-    new URL(
-      "../../../../apps/marketing/public/specs/v1.0/vectors/verifier-parity-vectors.json",
-      import.meta.url,
-    ),
-  ),
-  `${JSON.stringify(out, null, 2)}\n`,
-)

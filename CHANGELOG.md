@@ -5,6 +5,19 @@ All notable changes to `@intyga/verify` are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0]
+
+- Bind delegation verification to the independently expected requester; a workload cannot reuse
+  another workload's otherwise valid delegation.
+
+- **Breaking: tenant-bound DIV v2 receipts.** All five payload kinds bind an independently
+  supplied, nonempty tenant identifier. A tenant expectation refuses v1; omitting it permits
+  historical v1 verification only. Upgrade before the gateway begins issuing v2 receipts.
+- Reconstruct v2 signing bytes without a JSON parse/serialize round trip. Shared vectors pin
+  fractional parameters, requester mismatches, legacy-kind refusal and tenant-bound authority chains.
+- Count quorum by distinct public-key value as well as identity, including equivalent supported
+  key encodings. Delegated-agent receipt digests use UTF-16 witness ordering in every port.
+
 ## [1.2.0]
 
 - Export `parseRfc3339Ms`, the strict DIV §6.2 RFC 3339 parser the verifier already uses, so the SDK
