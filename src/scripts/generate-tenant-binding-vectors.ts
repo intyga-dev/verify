@@ -295,8 +295,9 @@ const authorityWitness = {
   signature: authorityRoot.signature,
   sigAlg: authorityRoot.sigAlg,
 }
-const explicitMissingWitnessDid = { ...authorityRoot, signatures: [{ ...authorityWitness }] }
-delete explicitMissingWitnessDid.signatures[0]!.signerDid
+const missingWitnessDid = { ...authorityWitness }
+delete missingWitnessDid.signerDid
+const explicitMissingWitnessDid = { ...authorityRoot, signatures: [missingWitnessDid] }
 const explicitNullWitnessDid = { ...authorityRoot, signatures: [{ ...authorityWitness, signerDid: null }] }
 const explicitEmptyWitnessDid = { ...authorityRoot, signatures: [{ ...authorityWitness, signerDid: "" }] }
 // These deliberately malformed JSON fixtures model inputs from outside TypeScript's type system.

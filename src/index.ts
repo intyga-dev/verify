@@ -637,7 +637,7 @@ function commonSignedFields(requester: RequesterIdentity, requirement: ApprovalR
 /** Select v1 or tenant-bound v2 while preserving the opaque tenant identifier exactly. */
 function tenantBinding(tenantId: string | undefined): {
   v: typeof DIV_VERSION | typeof DIV_TENANT_VERSION
-  field: {} | { tenantId: string }
+  field: Record<string, never> | { tenantId: string }
 } {
   if (tenantId === undefined) return { v: DIV_VERSION, field: {} }
   if (typeof tenantId !== "string" || tenantId.length === 0)
