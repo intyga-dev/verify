@@ -7,6 +7,12 @@ import {
 } from "./ledger-signature.ts"
 import type { ExternalAnchorKeys } from "./ledger-anchor.ts"
 import {
+  checkExecutionEvidenceLeaf,
+  type ExecutionEvidenceCheck,
+  type ExecutionEvidencePolicy,
+  isExecutionEvidenceLeaf,
+} from "./ledger-execution.ts"
+import {
   type AnchorKeyResolver,
   type AnchorPolicy,
   type SignedAnchor,
@@ -161,6 +167,11 @@ export type VerificationLevel =
 
 export interface BundleVerification {
   signature: AuditSignatureCheck
+  /**
+   * DEWP §4.7.3 for an Evidence Record, null for any other leaf. A single proof carries no dispatch
+   * or approval record, so a statement here is at best `unbound`, never `verified` (§4.7.3).
+   */
+  execution: ExecutionEvidenceCheck | null
   /** Overall verdict. Only true when the caller supplied the root AND every applicable check passed. */
   ok: boolean
   dailyRoot: string | null
@@ -244,6 +255,8 @@ export function deriveVerificationLevel(p: VerificationProperties, hasSigner: bo
 
 export interface VerifyOptions {
   signaturePolicy?: AuditSignaturePolicy
+  /** Evidence-source trust for DEWP §4.7, kept separate from approver trust (§4.7.5). */
+  evidencePolicy?: ExecutionEvidencePolicy
   /** Require every selected event to have a valid signature under caller-trusted keys. */
   requireSignatures?: boolean
   /**
@@ -549,12 +562,22 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
   // DEWP §7.1 independent properties.
   const commitmentVerified = inclusion.pass === true && rootConsistency.pass === true
   const contentVerified = commitmentVerified && leafBinding.pass === true && headerBinding.pass !== false
-  const signature =
+  // DEWP §4.7: the signature and statement checks run once the anchored time is known (§4.7.5) — a
+  // caller key with a validity interval is placed in time by the counted anchors' external witness,
+  // never by the statement's own timestamps. With no counting anchor it has no anchored time.
+  const signatureFor = (anchoredTimeMs: number | null) =>
     contentVerified && bundle.event.canonical
-      ? verifyAuditSignature(bundle.event.canonical, opts.signaturePolicy)
+      ? verifyAuditSignature(
+          bundle.event.canonical,
+          opts.signaturePolicy,
+          opts.evidencePolicy,
+          anchoredTimeMs,
+        )
       : uncheckedSignature()
-  const signatureVerified = signature.status === "verified"
-  const hasSigner = signature.status !== "not_applicable"
+  const executionFor = (anchoredTimeMs: number | null) =>
+    contentVerified && bundle.event.canonical && isExecutionEvidenceLeaf(bundle.event.canonical)
+      ? checkExecutionEvidenceLeaf(bundle.event.canonical, opts.evidencePolicy, anchoredTimeMs)
+      : null
   // Anchor verification (DEWP §5.3). If signed anchors + a policy are supplied, require a real quorum
   // over the daily root. Otherwise fall back to the weaker signal: the checkpoint root was handed to
   // us by the caller (not the bundle's own self-asserted flag).
@@ -576,6 +599,7 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
   const divergenceAnchors = opts.anchors ?? []
   let anchorVerified: boolean
   let witnessTimes: Record<string, number> = {}
+  let anchoredTimeMs: number | null = null
   // Gated on the CALLER having asked (policy + resolver), never on candidates existing: a bundle
   // shipped with its anchors stripped must evaluate to "quorum not met (0/N)" under a supplied
   // policy — falling back to the weaker caller-supplied-root signal there would let the prover switch
@@ -604,6 +628,11 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     )
     anchorVerified = commitmentVerified && q.ok
     witnessTimes = q.witnessTimes
+    // The earliest external witness time among the issuers that COUNTED (a SELF anchor has none).
+    const counted = q.verifiedIssuers
+      .map((i) => q.witnessTimes[i])
+      .filter((t): t is number => typeof t === "number")
+    if (anchorVerified && counted.length > 0) anchoredTimeMs = Math.min(...counted) * 1000
     if (q.divergence) {
       notes.push(`ANCHOR DIVERGENCE — ${q.reason}. Treating as INVALID.`)
     } else if (!q.ok && q.reason) {
@@ -615,16 +644,18 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
     if (q.note) notes.push(q.note)
     // A divergent anchor is fatal regardless of inclusion.
     if (q.divergence) {
+      const signature = signatureFor(null)
       return {
         ok: false,
         signature,
+        execution: executionFor(null),
         dailyRoot,
         rootSource,
         witnessTimes,
         properties: {
           commitmentVerified,
           contentVerified,
-          signatureVerified,
+          signatureVerified: signature.status === "verified",
           anchorVerified: false,
         },
         verificationLevel: "INVALID",
@@ -651,6 +682,9 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
       )
     }
   }
+  const signature = signatureFor(anchorVerified ? anchoredTimeMs : null)
+  const signatureVerified = signature.status === "verified"
+  const hasSigner = signature.status !== "not_applicable"
   const properties: VerificationProperties = {
     commitmentVerified,
     contentVerified,
@@ -661,6 +695,7 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
   // semantics apply to, so it reports INVALID rather than a level derived from checks we should not
   // have run at all.
   const verificationLevel = kindRejected ? "INVALID" : deriveVerificationLevel(properties, hasSigner)
+  const execution = executionFor(anchorVerified ? anchoredTimeMs : null)
 
   return {
     // A configured policy is an applicable check even when its anchors or resolver are missing.
@@ -669,6 +704,7 @@ export function verifyBundle(bundle: ProofBundle, opts: VerifyOptions = {}): Bun
       (!opts.anchorPolicy || anchorVerified) &&
       (!opts.requireSignatures || (signatureVerified && signature.trusted)),
     signature,
+    execution,
     dailyRoot,
     rootSource,
     witnessTimes,

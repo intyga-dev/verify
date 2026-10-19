@@ -1,6 +1,11 @@
 import { verifyWebAuthnWitness } from "./index.ts"
 import type { AuditLeaf } from "./ledger-leaf.ts"
 import { verifyEmbeddedSignature } from "./ledger-bundle.ts"
+import {
+  type ExecutionEvidencePolicy,
+  isExecutionEvidenceLeaf,
+  verifyEvidenceSignature,
+} from "./ledger-execution.ts"
 
 /** Caller-owned identity/key mapping. WebAuthn keys use base64 COSE_Key; ES256 keys use SPKI. */
 export interface AuditSignaturePolicy {
@@ -20,8 +25,23 @@ export const uncheckedSignature = (): AuditSignatureCheck => ({
   trusted: false,
 })
 
-/** Signature over the committed payload only — never a quorum, authorization or hardware verdict. */
-export function verifyAuditSignature(c: AuditLeaf, policy?: AuditSignaturePolicy): AuditSignatureCheck {
+/**
+ * Signature over the committed payload only — never a quorum, authorization or hardware verdict.
+ *
+ * An Evidence Record (DEWP §4.7) is checked against evidence-source trust only, and only once the
+ * caller supplies any trust: an approver key never vouches for a statement and a source key never
+ * vouches for an approval (§4.7.5). With no trust at all, §4.6.1's embedded-key check is unchanged.
+ */
+export function verifyAuditSignature(
+  c: AuditLeaf,
+  policy?: AuditSignaturePolicy,
+  evidencePolicy?: ExecutionEvidencePolicy,
+  /**
+   * The record's anchored time (DEWP §4.7.5), for an evidence-source key that carries a validity
+   * interval: null or absent means no counting anchor covers it, and such a key establishes nothing.
+   */
+  anchoredTimeMs?: number | null,
+): AuditSignatureCheck {
   const result = (
     status: AuditSignatureCheck["status"],
     reason: string,
@@ -35,6 +55,12 @@ export function verifyAuditSignature(c: AuditLeaf, policy?: AuditSignaturePolicy
     return result("not_checked", "Unsupported signature algorithm.")
   if (!c.signature || !c.signedPayload)
     return result("not_checked", "Signature or signed payload is missing.")
+  if ((policy || evidencePolicy) && isExecutionEvidenceLeaf(c)) {
+    if (c.sigAlg !== "ES256") return result("not_checked", "Evidence statements are signed with ES256 only.")
+    if (!evidencePolicy) return result("not_checked", "No caller-trusted key for this evidence source.")
+    const evidence = verifyEvidenceSignature(c, evidencePolicy, anchoredTimeMs ?? null)
+    return result(evidence.status, evidence.reason, evidence.trusted)
+  }
   // Preserve the legacy ES256 mathematical check, but never mistake an embedded key for trust.
   if (!policy && c.sigAlg === "ES256") {
     if (!c.signerPublicKey) return result("not_checked", "Signer public key is missing.")

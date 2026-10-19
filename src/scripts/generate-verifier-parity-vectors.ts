@@ -19,6 +19,7 @@ import { BUNDLE_KIND, type ProofBundle } from "../ledger-bundle.js"
 import { hashLeaf, merkleProof, merkleRoot } from "../ledger-merkle.js"
 import { rekorPayloadHashFor } from "../ledger-rekor.js"
 import { buildDewpEvidenceHardening } from "./dewp-evidence-hardening-vectors.js"
+import { buildExecutionEvidenceVectors } from "./execution-evidence-vectors.js"
 import { buildVerifierInputHardening } from "./verifier-input-hardening-vectors.js"
 
 interface Pair {
@@ -1804,8 +1805,12 @@ const out = {
   dewpEvidenceHardening: buildDewpEvidenceHardening(),
   // Self-contained like the section above (2026-09-27 review L15-L18, I7, I8).
   verifierInputHardening: buildVerifierInputHardening(),
+  // DEWP §4.7 (version 1.1). Self-contained; generate-execution-evidence-vectors.ts regenerates it alone.
+  executionEvidence: buildExecutionEvidenceVectors(),
 }
 writeFileSync(
   fileURLToPath(new URL("../../vectors/verifier-parity-vectors.json", import.meta.url)),
   `${JSON.stringify(out, null, 2)}\n`,
 )
+// Published specification editions are immutable: scripts/specifications/build.py copies this file
+// into the source edition. This script used to overwrite public/specs/v1.0/ as well.

@@ -5,6 +5,46 @@ All notable changes to `@intyga/verify` are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.1.0]
+
+- **DEWP 1.1 §4.7 execution evidence.** `verifyEvidenceBundle` reports `execution` — a check per
+  Evidence Record and an Execution Status per approval nonce (`confirmed`, `contradicted`,
+  `unconfirmed`, `pending`, `not_reported`) — under caller-supplied `evidencePolicy`, with
+  `requireExecutionConfirmed`, `executionNow` and `evidenceSkewSeconds`. `verifyBundle` reports a
+  single proof's statement check. New exports: `parseExecutionEvidenceStatement`,
+  `canonicalExecutionEvidenceStatement`, `evaluateExecutionEvidence`, `parseSignedPayload` and friends.
+- **Trust separation:** once any trust is supplied, `verifyAuditSignature` checks an Evidence Record
+  only against evidence-source trust (third argument) and never against approver trust, and the
+  reverse. With no trust at all the embedded-key check is unchanged.
+- `verifyApprovalReceipt` refuses a `dewp-execution-evidence` statement with its own reason.
+- **Pre-publication review of §4.7** (DEWP 1.1 was unpublished, so these are in-place changes):
+  a statement binds to any Dispatch Record whose `payloadSha256` matches, so an early record with
+  another hash cannot unbind a trusted `contradicted` and is reported as a dispatch conflict
+  (`byNonce[n].dispatchConflict`, `dispatchConflicts`); the evidence window is bounded by
+  `maxEvidenceWindowSeconds` (default 86 400) — `byNonce[n].effectiveDeadline` / `windowCapped`;
+  every Approval Record's nonce is reported, so a silent approval is `not_reported`; a trusted
+  `contradicted` sampled after the deadline is a `lateContradiction` / `lateContradicted` alert;
+  statements carry `sampledAt` (the window is evaluated on it) and a per-source gapless `sequence`,
+  and `execution.sources` reports each source's `first`/`last`/`gaps`/`divergent`;
+  `ExecutionEvidencePolicy` keys may be `{ key, notBefore?, notAfter? }`, placed in time by the
+  record's anchored time (the counted anchors' earliest external witness over its checkpoint), never
+  by the statement's own timestamps; `DEFAULT_EVIDENCE_SKEW_SECONDS` is 30 (clock error only);
+  `requireExecutionConfirmed` also fails on a conflict, a gap, a divergence, a late contradiction or
+  an untrusted contradiction (`byNonce[n].untrustedContradiction` / `untrustedContradicted`: a
+  contradiction under a provisioned key that established no trust). Checks carry `source` and
+  `sequence`. The seven-member draft statement is now malformed. A record's anchored time comes only
+  from its own checkpoint and the range its anchors were held to, and a bundle listing one root twice
+  with differing fields is refused; a key entry with an unknown member or a non-string bound verifies
+  but never trusts; `verifyAuditSignature` takes the anchored time as a fourth argument, and the
+  evidence-bundle and single-proof verifiers run the signature check after the anchor quorum so
+  `signatures.checks` and `execution.checks` agree on a bounded key; non-finite or negative skew and
+  window options fall back to the defaults.
+- Envelope `"1.0"` and the `trust.intyga.audit.v1` profile are unchanged: 1.1.0 verifiers still verify
+  the commitment and content of every new leaf.
+- Keep bound, late contradictions signed by caller-provisioned keys as untrusted-contradiction
+  findings when key trust is not established. Requiring confirmed execution rejects them even
+  alongside a trusted confirmation; execution status and trust are unchanged.
+
 ## [2.0.0]
 
 - Bind delegation verification to the independently expected requester; a workload cannot reuse

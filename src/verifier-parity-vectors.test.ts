@@ -13,6 +13,13 @@ import {
 import { verifyBundle, type ProofBundle, type TrustedCheckpoint } from "./ledger-bundle.js"
 import { verifyEvidenceBundle, type EvidenceBundle, type EvidenceVerifyOptions } from "./ledger-evidence.js"
 import { verifyRootsChain, type RootsChainEntry } from "./ledger-chain.js"
+import {
+  canonicalExecutionEvidenceStatement,
+  type ExecutionEvidencePolicy,
+  type ExecutionVerdict,
+  parseExecutionEvidenceStatement,
+} from "./ledger-execution.js"
+import type { AuditSignaturePolicy } from "./ledger-signature.js"
 import type { AnchorPolicy, SignedAnchor } from "./ledger-anchor.js"
 
 type Obj = Record<string, unknown>
@@ -42,6 +49,12 @@ interface Fixtures {
   evidence: { cases: Case[] }
   rootsChain: { cases: Case[] }
   dewpEvidenceHardening: { keys: KeyFixture[]; bundles: { cases: Case[] }; evidence: { cases: Case[] } }
+  executionEvidence: {
+    cases: Case[]
+    proofs: Case[]
+    statements: Array<{ name: string; bytes: string; ok: boolean }>
+    builder: Array<{ name: string; input: Obj; bytes: string }>
+  }
   verifierInputHardening: {
     keys: KeyFixture[]
     approvals: Section
@@ -237,5 +250,98 @@ test("shared checkpoint continuity vectors", () => {
     assert.equal(result.brokenAt, c.brokenAt, c.name)
     assert.equal(result.unchained, c.unchained, c.name)
     if (c.verifiedCount !== undefined) assert.equal(result.verifiedCount, c.verifiedCount, c.name)
+  }
+})
+
+test("shared DEWP §4.7 execution-evidence vectors (own keys)", () => {
+  const section = fixtures.executionEvidence
+  assert.ok(section.cases.length > 0 && section.proofs.length > 0)
+  for (const c of section.cases) {
+    const o = c.options ?? {}
+    const result = verifyEvidenceBundle(c.bundle as unknown as EvidenceBundle, {
+      trustedRoots: o.trustedRoots as string[],
+      evidencePolicy: o.evidencePolicy as ExecutionEvidencePolicy | undefined,
+      signaturePolicy: o.signaturePolicy as AuditSignaturePolicy | undefined,
+      executionNow: Date.parse(o.now as string),
+      evidenceSkewSeconds: o.skewSeconds as number | undefined,
+      maxEvidenceWindowSeconds: o.maxWindowSeconds as number | undefined,
+      requireExecutionConfirmed: o.requireExecutionConfirmed === true,
+      // The anchored-time cases (DEWP §4.7.5) carry a Rekor-witnessed anchor in the bundle's checkpoint
+      // and pin the log key inline: the section stays self-contained.
+      anchorPolicy: c.policy as unknown as AnchorPolicy | undefined,
+      externalKeys: typeof o.rekorSpki === "string" ? { rekor: o.rekorSpki } : undefined,
+    })
+    assert.equal(result.ok, c.ok, `${c.name}: ${result.failed.map((f) => f.reason).join("; ")}`)
+    const expected = c.execution as {
+      byNonce: Record<string, string>
+      checks: Obj[]
+      findings?: {
+        lateContradicted?: string[]
+        untrustedContradicted?: string[]
+        dispatchConflicts?: string[]
+        windowCapped?: Record<string, boolean>
+        sources?: Record<string, unknown>
+      }
+    }
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(result.execution.byNonce).map(([n, v]) => [n, v.status])),
+      expected.byNonce,
+      `${c.name}: byNonce`,
+    )
+    assert.deepEqual(
+      result.execution.checks.map(({ seq, status, trusted }) => ({ seq, status, trusted })),
+      expected.checks,
+      `${c.name}: checks ${result.execution.checks.map((k) => k.reason).join("; ")}`,
+    )
+    const f = expected.findings
+    if (f?.lateContradicted)
+      assert.deepEqual(result.execution.lateContradicted, f.lateContradicted, `${c.name}: late`)
+    if (f?.untrustedContradicted)
+      assert.deepEqual(
+        result.execution.untrustedContradicted,
+        f.untrustedContradicted,
+        `${c.name}: untrusted`,
+      )
+    if (f?.dispatchConflicts)
+      assert.deepEqual(result.execution.dispatchConflicts, f.dispatchConflicts, `${c.name}: conflicts`)
+    if (f?.sources) assert.deepEqual({ ...result.execution.sources }, f.sources, `${c.name}: sources`)
+    if (f?.windowCapped)
+      assert.deepEqual(
+        Object.fromEntries(Object.entries(result.execution.byNonce).map(([n, v]) => [n, v.windowCapped])),
+        f.windowCapped,
+        `${c.name}: windowCapped`,
+      )
+    if (c.signatures)
+      assert.deepEqual(
+        (result.signatures.checks ?? []).map(({ seq, status, trusted }) => ({ seq, status, trusted })),
+        c.signatures,
+        `${c.name}: signatures`,
+      )
+  }
+  for (const c of section.proofs) {
+    const o = c.options ?? {}
+    const result = verifyBundle(c.bundle as unknown as ProofBundle, {
+      trustedRoot: o.trustedRoot as string,
+      evidencePolicy: o.evidencePolicy as ExecutionEvidencePolicy | undefined,
+    })
+    assert.equal(result.properties.contentVerified, true, c.name)
+    const got = result.execution
+      ? { status: result.execution.status, trusted: result.execution.trusted }
+      : null
+    assert.deepEqual(got, c.execution, c.name)
+  }
+  for (const c of section.statements) assert.equal(parseExecutionEvidenceStatement(c.bytes).ok, c.ok, c.name)
+  for (const c of section.builder) {
+    const i = c.input as {
+      nonce: string
+      payloadSha256: string
+      source: string
+      verdict: ExecutionVerdict
+      observedAt: string
+      sampledAt: string
+      sequence: number
+      observation: Record<string, unknown>
+    }
+    assert.equal(canonicalExecutionEvidenceStatement(i), c.bytes, c.name)
   }
 })

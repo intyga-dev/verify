@@ -409,6 +409,9 @@ export const DIV_AGENT_AUTHORITY_TYPE = "div-agent-authority"
  */
 export const DIV_PLATFORM_INTENT_TYPE = "div-platform-intent"
 
+/** DEWP §4.7.2 statement type, refused by approval verification. Mirrors ledger-execution.ts. */
+const DEWP_EXECUTION_EVIDENCE_TYPE_FOR_REFUSAL = "dewp-execution-evidence"
+
 /**
  * Hard ceiling on an offline proof's validity window, enforced at verification and not only at mint.
  * An offline proof is created and redeemed within one incident, so the window is minutes — it exists
@@ -1607,6 +1610,14 @@ export function verifyApprovalReceipt(
     return {
       ok: false,
       reason: "this is a platform hash-only intent (DIV §5c) — verify it with verifyPlatformReceipt",
+    }
+  // A DEWP execution-evidence statement (DEWP §4.7) is a source's observation AFTER execution, not an
+  // approval. Refused with its own message, like the other non-approval kinds above.
+  if (payloadType === DEWP_EXECUTION_EVIDENCE_TYPE_FOR_REFUSAL)
+    return {
+      ok: false,
+      reason:
+        "this is a DEWP execution-evidence statement, which approves nothing — evaluate it with evaluateExecutionEvidence over an evidence bundle",
     }
   const offline = payloadType === DIV_OFFLINE_INTENT_TYPE
   if (!offline && payloadType !== DIV_INTENT_TYPE)
@@ -3074,3 +3085,33 @@ export {
   type AuditSignaturePolicy,
   type AuditSignatureCheck,
 } from "./ledger-signature.ts"
+export {
+  canonicalExecutionEvidenceStatement,
+  checkExecutionEvidenceLeaf,
+  DEFAULT_EVIDENCE_SKEW_SECONDS,
+  DEFAULT_MAX_EVIDENCE_WINDOW_SECONDS,
+  DEWP_EXECUTION_EVIDENCE_TYPE,
+  evaluateExecutionEvidence,
+  EXECUTION_CONFIRMED,
+  EXECUTION_CONTRADICTED,
+  EXECUTION_DISPATCHED,
+  EXECUTION_UNCONFIRMED,
+  type ExecutionEvaluationOptions,
+  type ExecutionEvidenceCheck,
+  type ExecutionEvidencePolicy,
+  type ExecutionEvidenceStatement,
+  type ExecutionNonceReport,
+  type ExecutionStatus,
+  type ExecutionVerdict,
+  type ExecutionVerification,
+  type SourceContinuity,
+  type TrustedSourceKey,
+  executionPayloadSha256,
+  isExecutionEvidenceLeaf,
+  isExecutionEvidencePayload,
+  MAX_EXECUTION_EVIDENCE_BYTES,
+  MAX_SIGNED_PAYLOAD_DEPTH,
+  parseExecutionEvidenceStatement,
+  parseSignedPayload,
+  verifyEvidenceSignature,
+} from "./ledger-execution.ts"

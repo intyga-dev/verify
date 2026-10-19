@@ -19,6 +19,11 @@ import {
   type AuditSignatureCheck,
 } from "./ledger-signature.ts"
 import { chainHash } from "./ledger-chain.ts"
+import {
+  type ExecutionEvidencePolicy,
+  type ExecutionVerification,
+  evaluateExecutionEvidence,
+} from "./ledger-execution.ts"
 import { type AuditLeaf, leafHash } from "./ledger-leaf.ts"
 import { type InclusionProof, verifyInclusionProof } from "./ledger-proof.ts"
 
@@ -159,6 +164,12 @@ export interface EvidenceVerification {
     invalid: { seq: string }[]
     notCheckable: number
   }
+  /**
+   * DEWP §4.7 execution evidence over the content-verified entries: one check per Evidence Record and
+   * a status per approval nonce. Reports what a caller-trusted source observed — not physical truth —
+   * and never changes the properties above. requireExecutionConfirmed turns it into a gate.
+   */
+  execution: ExecutionVerification
   notes: string[]
 }
 
@@ -176,6 +187,20 @@ export type EvidenceAnchorSet = SignedAnchor[] | Record<string, SignedAnchor[]>
 export interface EvidenceVerifyOptions {
   signaturePolicy?: AuditSignaturePolicy
   requireSignatures?: boolean
+  /** Evidence-source trust for DEWP §4.7, kept separate from approver trust (§4.7.5). */
+  evidencePolicy?: ExecutionEvidencePolicy
+  /** Fail the bundle unless it reports at least one approval nonce and every one is `confirmed`. */
+  requireExecutionConfirmed?: boolean
+  /** Evaluation time for §4.7.4 in epoch milliseconds. Defaults to the current time. */
+  executionNow?: number
+  /** §4.7.3 step 6 allowance before the dispatch time, in seconds (clock error only). Defaults to 30. */
+  evidenceSkewSeconds?: number
+  /**
+   * §4.7.3 step 6 maximum evidence window, in seconds: a Dispatch Record's `evidenceDeadline` is cut
+   * to `createdAt` plus this, so the executing party cannot keep a nonce `pending` forever. Defaults
+   * to 86 400.
+   */
+  maxEvidenceWindowSeconds?: number
   /**
    * Daily roots to verify against (root hex strings). When supplied, every entry must chain to one of
    * them. They are only as independent as their source: roots recorded earlier or taken from the
@@ -249,6 +274,10 @@ export function verifyEvidenceBundle(
   let signaturesVerified = 0
   let signaturesNotCheckable = 0
   const signaturesInvalid: { seq: string }[] = []
+  /** Leaf-bound entries, the only ones §4.7 may read. */
+  const contentEntries: Array<{ seq: string; leaf: AuditLeaf }> = []
+  /** Each content-verified entry's own checkpoint root, from its inclusion proof. */
+  const entryRootBySeq = new Map<string, string>()
 
   // DEWP §6.5: "a compliant verifier MUST reject any other value." A note let a container of one
   // type be fed to the verifier for another and still come back ok — the caller would be reading a
@@ -377,6 +406,32 @@ export function verifyEvidenceBundle(
     }
   }
 
+  // One root, one checkpoint. A second entry for a root the bundle already lists — with a wider seq
+  // range, or without the chain fields the first one is held to — would otherwise ride on the first
+  // one's anchor verdict: anchors are checked against the FIRST checkpoint for a root, but a record's
+  // anchored time (DEWP §4.7.5) would be looked up through whichever copy claimed to cover it.
+  {
+    const seen = new Map<string, string>()
+    const shape = (cp: EvidenceBundle["checkpoints"][number]) =>
+      JSON.stringify([
+        cp.id,
+        cp.seqStart,
+        cp.seqEnd,
+        cp.entryCount ?? null,
+        cp.anchoredAt,
+        cp.chainHash ?? null,
+        cp.prevChainHash ?? null,
+      ])
+    for (const cp of bundle.checkpoints) {
+      const prior = seen.get(cp.root)
+      if (prior === undefined) seen.set(cp.root, shape(cp))
+      else if (prior !== shape(cp))
+        failed.push({
+          seq: "-",
+          reason: `checkpoint ${cp.id} lists a root the bundle already states with different fields`,
+        })
+    }
+  }
   const knownRoots = new Map<string, string | null>()
   /** Root → the checkpoint that states it (first wins), for the anchors' expected position. */
   const checkpointByRoot = new Map<string, EvidenceBundle["checkpoints"][number]>()
@@ -546,14 +601,12 @@ export function verifyEvidenceBundle(
         })
         continue
       }
-      // §7.1 signatureVerified. Runs only once the leaf binding above passed, so the signature we
-      // check is provably the committed one rather than something the bundle attached.
+      // §7.1 signatureVerified is checked below, once the anchor quorum has run: the leaf binding
+      // above passed, so the signature is provably the committed one, and an evidence-source key with
+      // a validity interval needs the record's anchored time (DEWP §4.7.5) to be placed in time.
       const canonical = entry.event.canonical
-      const signature = verifyAuditSignature(canonical, opts.signaturePolicy)
-      signatureChecks.set(seq, signature)
-      if (signature.status === "verified") signaturesVerified++
-      else if (signature.status === "invalid") signaturesInvalid.push({ seq })
-      else signaturesNotCheckable++
+      contentEntries.push({ seq, leaf: canonical })
+      entryRootBySeq.set(seq, root)
       contentVerified++
     } else {
       failed.push({
@@ -758,6 +811,43 @@ export function verifyEvidenceBundle(
       witnessTimes: q.witnessTimes,
     }
   })
+  // DEWP §4.7.5: a record's anchored time is the earliest external witness time among the anchors
+  // that COUNTED toward quorum for the checkpoint ITS OWN inclusion proof names, and only when its
+  // seq lies within the range those anchors were held to. Only issuers in `verifiedIssuers` counted;
+  // a SELF/ES256 anchor has no witness time and contributes nothing. Never another checkpoint's time:
+  // a listed checkpoint claiming a wider range would otherwise backdate every record under it. Used
+  // solely to place a caller key's validity interval in time — never a self-claimed timestamp.
+  const anchoredRootMs = new Map<string, number>()
+  for (const r of roots) {
+    if (r.anchorVerified !== true) continue
+    const times = r.verifiedIssuers
+      .map((i) => r.witnessTimes[i])
+      .filter((t): t is number => typeof t === "number")
+    if (times.length > 0) anchoredRootMs.set(r.root, Math.min(...times) * 1000)
+  }
+  const seqNum = (v: string | null | undefined): bigint | null =>
+    typeof v === "string" && /^\d+$/.test(v) ? BigInt(v) : null
+  const anchoredTime = (seq: string): number | null => {
+    const root = entryRootBySeq.get(seq)
+    if (root === undefined) return null
+    const t = anchoredRootMs.get(root)
+    if (t === undefined) return null
+    const expected = effectiveCheckpoint(root, checkpointByRoot.get(root))
+    const s = seqNum(seq)
+    const lo = seqNum(expected.seqStart)
+    const hi = seqNum(expected.seqEnd)
+    if (s === null || lo === null || hi === null || s < lo || s > hi) return null
+    return t
+  }
+  // §7.1 signatureVerified per content-verified entry, with the anchored time now known, so the
+  // §4.6.1 report and the §4.7.3 statement check agree on a bounded evidence-source key.
+  for (const { seq, leaf } of contentEntries) {
+    const signature = verifyAuditSignature(leaf, opts.signaturePolicy, opts.evidencePolicy, anchoredTime(seq))
+    signatureChecks.set(seq, signature)
+    if (signature.status === "verified") signaturesVerified++
+    else if (signature.status === "invalid") signaturesInvalid.push({ seq })
+    else signaturesNotCheckable++
+  }
   if (usedBundleAnchors) {
     notes.push(
       "Anchor quorum was evaluated over the anchors carried in the bundle's checkpoints. They verify " +
@@ -818,6 +908,59 @@ export function verifyEvidenceBundle(
       if (check.status !== "verified" || !check.trusted)
         failed.push({ seq: check.seq, reason: `Required trusted signature: ${check.reason}` })
     }
+  const execution = evaluateExecutionEvidence(contentEntries, {
+    policy: opts.evidencePolicy,
+    now: opts.executionNow,
+    skewSeconds: opts.evidenceSkewSeconds,
+    maxWindowSeconds: opts.maxEvidenceWindowSeconds,
+    anchoredTime,
+  })
+  if (opts.requireExecutionConfirmed) {
+    const nonces = Object.entries(execution.byNonce)
+    if (nonces.length === 0)
+      failed.push({ seq: "-", reason: "Required confirmed execution: the bundle records no execution" })
+    for (const [nonce, entry] of nonces) {
+      if (entry.status !== "confirmed")
+        failed.push({
+          seq: entry.dispatchSeq ?? entry.evidenceSeqs[0] ?? "-",
+          reason: `Required confirmed execution: nonce ${nonce} is ${entry.status}`,
+        })
+      // §4.7.4: a dispatch conflict means the executing party wrote two accounts of what it sent.
+      if (entry.dispatchConflict.length > 0)
+        failed.push({
+          seq: entry.dispatchConflict[0] ?? "-",
+          reason: `Required confirmed execution: nonce ${nonce} has conflicting Dispatch Records (seq ${entry.dispatchConflict.join(", ")})`,
+        })
+      // §4.7.4: a registered source signed a contradiction the status could not count — after the
+      // window the executing party chose, or under a key the bundle cannot place in time. Neither may
+      // clear a policy that requires confirmation.
+      if (entry.lateContradiction.length > 0)
+        failed.push({
+          seq: entry.lateContradiction[0] ?? "-",
+          reason: `Required confirmed execution: nonce ${nonce} has a late contradiction (seq ${entry.lateContradiction.join(", ")})`,
+        })
+      if (entry.untrustedContradiction.length > 0)
+        failed.push({
+          seq: entry.untrustedContradiction[0] ?? "-",
+          reason: `Required confirmed execution: nonce ${nonce} has a contradiction under a provisioned key that established no trust (seq ${entry.untrustedContradiction.join(", ")})`,
+        })
+    }
+    // §4.7.3 source continuity: a gap or a divergence means the bundle does not carry the whole account.
+    for (const [source, c] of Object.entries(execution.sources)) {
+      if (c.gaps.length > 0)
+        failed.push({
+          seq: "-",
+          reason: `Required confirmed execution: source ${source} is missing statement(s) ${c.gaps
+            .map(([a, b]) => (a === b ? String(a) : `${a}–${b}`))
+            .join(", ")}`,
+        })
+      if (c.divergent.length > 0)
+        failed.push({
+          seq: "-",
+          reason: `Required confirmed execution: source ${source} signed two statements under sequence ${c.divergent.join(", ")}`,
+        })
+    }
+  }
   return {
     ok: ok && failed.length === 0,
     total: bundle.entries.length,
@@ -831,6 +974,7 @@ export function verifyEvidenceBundle(
       invalid: signaturesInvalid,
       notCheckable: signaturesNotCheckable,
     },
+    execution,
     notes,
   }
 }
