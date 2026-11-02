@@ -916,6 +916,11 @@ export function verifyEvidenceBundle(
     anchoredTime,
   })
   if (opts.requireExecutionConfirmed) {
+    if (commitmentOnly > 0)
+      failed.push({
+        seq: "-",
+        reason: "Required confirmed execution: COMMITMENT_ONLY entries may conceal execution evidence",
+      })
     const nonces = Object.entries(execution.byNonce)
     if (nonces.length === 0)
       failed.push({ seq: "-", reason: "Required confirmed execution: the bundle records no execution" })

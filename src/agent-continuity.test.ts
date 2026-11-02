@@ -76,7 +76,10 @@ function signedStep(seq: string, prev: string | null, amount: string, aggregate:
       actionType: "payment.wire",
       params: { supplier: "acme" },
       nonce,
-      approvers: { dids: ["did:intyga:owner"], resolveKey: () => publicKey },
+      approvers: {
+        dids: ["did:intyga:owner"],
+        resolveKey: (did: string) => (did === "did:intyga:owner" ? publicKey : null),
+      },
       agentContext,
     },
   }

@@ -254,6 +254,8 @@ function canonicalString(s: string): string {
 /** The requesting workload's identity, as bound into a DIV Intent Payload. Mirrors mcp-schemas. */
 export interface RequesterIdentity {
   did: string
+  /** Present for a credential issued by another human; absent historical bytes stay unchanged. */
+  credentialIssuerDid?: string
   attestation: { method: string; issuer: string; subject: string } | null
 }
 
@@ -494,6 +496,13 @@ export interface ApprovalRequirementAttestation {
   requesterCannotApprove: boolean
   /** Required signer class — `"human"` is the only value defined today. Unrecognized values are refused. */
   signerClass: string
+  /** Signed controller exclusion set; absence preserves historical requester-only semantics. */
+  excludedSignerDids?: string[]
+  /**
+   * DIV §4.3.2 "Enrolled approver devices": present only as the literal `true`. Mirrors mcp-schemas.
+   * Only an ES256 witness under one of the caller's `expected.enrolledDeviceKeys` counts toward it.
+   */
+  requireEnrolledDevice?: boolean
 }
 
 /**
@@ -501,6 +510,10 @@ export interface ApprovalRequirementAttestation {
  * DIV_VERSION — this package deliberately imports nothing from it.
  */
 export const SIGNER_CLASS_HUMAN = "human"
+
+/** Shared by every verifier port; `expected.nonce` is the one API name in it (see api-name-hints.json). */
+const EXPECTED_NONCE_REQUIRED_REASON =
+  "expected.nonce is required — it must be the challenge YOU issued (DIV §5 step 10)"
 
 /** The signer classes this verifier knows how to reason about (DIV §4.3.2). Mirrors mcp-schemas. */
 const KNOWN_SIGNER_CLASSES = new Set([SIGNER_CLASS_HUMAN])
@@ -513,7 +526,19 @@ const KNOWN_SIGNER_CLASSES = new Set([SIGNER_CLASS_HUMAN])
  */
 function parseSignerClass(
   requirement: Partial<ApprovalRequirementAttestation>,
+  requester: RequesterIdentity,
 ): { ok: true; signerClass: string } | { ok: false; reason: string } {
+  // The identity extensions first (DIV §4.3.2), in the order every port checks them. Each is refused
+  // explicitly here rather than left to the byte comparison: a repeated DID would otherwise fail as
+  // a params mismatch, and a malformed credentialIssuerDid as an uncanonicalizable expectation.
+  if (requester.credentialIssuerDid !== undefined && !validControllerDid(requester.credentialIssuerDid))
+    return { ok: false, reason: "signed requester.credentialIssuerDid must be a non-empty DID" }
+  if (requirement.excludedSignerDids !== undefined) {
+    if (!validSignerExclusions(requirement.excludedSignerDids))
+      return { ok: false, reason: "signed requirement.excludedSignerDids must be an array of valid DIDs" }
+    if (new Set(requirement.excludedSignerDids).size !== requirement.excludedSignerDids.length)
+      return { ok: false, reason: "signed requirement.excludedSignerDids must not contain duplicates" }
+  }
   const sc = requirement.signerClass
   if (typeof sc !== "string" || sc.length === 0)
     return { ok: false, reason: "the signed requirement is missing signerClass (DIV §4.3.2)" }
@@ -593,7 +618,7 @@ export function canonicalIntentPayload(input: {
     // absent from Object.keys, so stableStringify never sees it and never throws, and the omission
     // surfaces later as an unreproducible signature. Non-null values are a later spec version.
     evidence: null,
-    ...commonSignedFields(input.requester, input.requirement),
+    ...commonSignedFields(input.requester, input.requirement, true),
     nonce: input.nonce,
     // The four agent-extension keys by NAME, never a spread: a context object carrying any other
     // top-level key (`target`, `params`, …) would otherwise overwrite the signed fields above, so a
@@ -618,11 +643,39 @@ export function canonicalIntentPayload(input: {
  * builder but not the others is precisely the drift the cross-package vectors exist to catch. The
  * golden vectors pin the output, so this factoring is verified rather than assumed.
  */
-function commonSignedFields(requester: RequesterIdentity, requirement: ApprovalRequirementAttestation) {
+/** New DID metadata accepts existing DID spellings; it is not a DID-Core grammar migration. */
+export function validControllerDid(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.startsWith("did:") &&
+    value.length > 4 &&
+    new TextEncoder().encode(value).length <= 4096 &&
+    !value.split("").some((char) => char.charCodeAt(0) <= 0x20 || char.charCodeAt(0) === 0x7f) &&
+    !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(value)
+  )
+}
+
+export function validSignerExclusions(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(validControllerDid)
+}
+
+/** `ordinary` is true only for `div-intent-verification` (DIV §4.3.2). Mirrors mcp-schemas. */
+function commonSignedFields(
+  requester: RequesterIdentity,
+  requirement: ApprovalRequirementAttestation,
+  ordinary: boolean,
+) {
   const a = requester.attestation
+  if (requester.credentialIssuerDid !== undefined && !validControllerDid(requester.credentialIssuerDid))
+    throw new NonCanonicalValue("credentialIssuerDid must be a valid DID")
+  if (requirement.excludedSignerDids !== undefined && !validSignerExclusions(requirement.excludedSignerDids))
+    throw new NonCanonicalValue("excludedSignerDids must be a DID array")
   return {
     requester: {
       did: requester.did,
+      ...(requester.credentialIssuerDid !== undefined
+        ? { credentialIssuerDid: requester.credentialIssuerDid }
+        : {}),
       attestation: a ? { method: a.method, issuer: a.issuer, subject: a.subject } : null,
     },
     requirement: {
@@ -632,9 +685,70 @@ function commonSignedFields(requester: RequesterIdentity, requirement: ApprovalR
       // produce different bytes depending on how the rule happened to be written.
       allowedAaguids: [...requirement.allowedAaguids].sort(),
       requesterCannotApprove: requirement.requesterCannotApprove,
+      ...(requirement.excludedSignerDids !== undefined
+        ? { excludedSignerDids: [...new Set(requirement.excludedSignerDids)].sort() }
+        : {}),
+      ...enrolledDeviceField(requirement, ordinary),
       signerClass: requirement.signerClass,
     },
   }
+}
+
+/** The optional `requireEnrolledDevice` member, or nothing. Mirrors mcp-schemas' builder exactly. */
+function enrolledDeviceField(
+  requirement: ApprovalRequirementAttestation,
+  ordinary: boolean,
+): Record<string, never> | { requireEnrolledDevice: true } {
+  const value: unknown = requirement.requireEnrolledDevice
+  if (value === undefined || value === false) return {}
+  if (value !== true) throw new NonCanonicalValue("requireEnrolledDevice must be a boolean")
+  if (!ordinary) throw new NonCanonicalValue(ENROLLED_DEVICE_ORDINARY_ONLY_REASON)
+  if (requirement.requireHardwareKey || requirement.allowedAaguids.length > 0)
+    throw new NonCanonicalValue(ENROLLED_DEVICE_WITH_HARDWARE_REASON)
+  return { requireEnrolledDevice: true }
+}
+
+/** DIV §5 step 3e reasons. Identical text in every port (pinned by verifier-parity-vectors.json). */
+export const ENROLLED_DEVICE_MALFORMED_REASON =
+  "requirement.requireEnrolledDevice must be omitted or true (DIV §4.3.2)"
+export const ENROLLED_DEVICE_ORDINARY_ONLY_REASON =
+  "requireEnrolledDevice is defined only for ordinary approval intents (DIV §4.3.2)"
+export const ENROLLED_DEVICE_WITH_HARDWARE_REASON =
+  "requireEnrolledDevice cannot be combined with requireHardwareKey or allowedAaguids (DIV §4.3.2)"
+export const ENROLLED_DEVICE_KEYS_REQUIRED_REASON =
+  "the signed policy requires an enrolled approver device; supply expected.enrolledDeviceKeys from your own enrollment records (DIV §4.3.2)"
+export const ENROLLED_DEVICE_KEYS_MALFORMED_REASON =
+  "expected.enrolledDeviceKeys must be an array of base64 public keys"
+
+/**
+ * DIV §5 step 3e, structural half: the field is absent, or exactly `true` on an ordinary intent with
+ * no hardware requirement. `ordinary` is whether the payload type is `div-intent-verification`.
+ * Read from the parsed signed requirement, so `false` and `null` are refused rather than dropped.
+ */
+function enrolledDeviceStructureProblem(
+  requirement: Partial<ApprovalRequirementAttestation>,
+  ordinary: boolean,
+): string | null {
+  if (!Object.hasOwn(requirement, "requireEnrolledDevice")) return null
+  if (requirement.requireEnrolledDevice !== true) return ENROLLED_DEVICE_MALFORMED_REASON
+  if (!ordinary) return ENROLLED_DEVICE_ORDINARY_ONLY_REASON
+  if (requiresHardwareCredential(requirement)) return ENROLLED_DEVICE_WITH_HARDWARE_REASON
+  return null
+}
+
+/**
+ * DIV §5 step 3e, list half. Returns the caller's enrolled device keys as key fingerprints (so SPKI
+ * and COSE spellings of one key match, like the one-key-one-person rule), or a refusal reason. Only
+ * consulted under a signed `requireEnrolledDevice`; a malformed list is refused even then, never
+ * read as "no list".
+ */
+function enrolledDeviceFingerprints(expected: { enrolledDeviceKeys?: unknown }): Set<string> | string {
+  const keys = expected.enrolledDeviceKeys
+  if (keys === undefined) return ENROLLED_DEVICE_KEYS_REQUIRED_REASON
+  if (!Array.isArray(keys) || keys.some((k) => typeof k !== "string" || k.length === 0))
+    return ENROLLED_DEVICE_KEYS_MALFORMED_REASON
+  if (keys.length === 0) return ENROLLED_DEVICE_KEYS_REQUIRED_REASON
+  return new Set(keys.map((k: string) => signingKeyIdentity(k)))
 }
 
 /** Select v1 or tenant-bound v2 while preserving the opaque tenant identifier exactly. */
@@ -688,7 +802,7 @@ export function canonicalOfflineIntentPayload(input: {
     // absent from Object.keys, so stableStringify never sees it and never throws, and the omission
     // surfaces later as an unreproducible signature. Non-null values are a later spec version.
     evidence: null,
-    ...commonSignedFields(input.requester, input.requirement),
+    ...commonSignedFields(input.requester, input.requirement, false),
     nonce: input.nonce,
     challengedAt: input.challengedAt,
     expiresAt: input.expiresAt,
@@ -727,7 +841,7 @@ export function canonicalDelegationPayload(input: {
     actionType: input.actionType,
     display: input.display,
     params: input.params,
-    ...commonSignedFields(input.requester, input.requirement),
+    ...commonSignedFields(input.requester, input.requirement, false),
     delegatedTo: [...input.delegatedTo].sort(),
     delegatedQuorum: input.delegatedQuorum,
     nonce: input.nonce,
@@ -769,7 +883,7 @@ export function canonicalAgentAuthorityPayload(input: {
     display: input.display,
     agent: { did: input.agent.did },
     parentReceiptHash: input.parentReceiptHash ?? null,
-    ...commonSignedFields(input.requester, input.requirement),
+    ...commonSignedFields(input.requester, input.requirement, false),
     nonce: input.nonce,
     sealedAt: input.sealedAt,
     expiresAt: input.expiresAt,
@@ -926,6 +1040,10 @@ export interface RequirementFloor {
   requesterCannotApprove?: boolean
   /** When true, the signed requirement must also demand a hardware key. Defaults to false. */
   requireHardwareKey?: boolean
+  /** When true, the signed requirement must also demand an enrolled approver device. Defaults to false. */
+  requireEnrolledDevice?: boolean
+  /** Presence requires a signed exclusion set covering every supplied DID (even an empty floor). */
+  excludedSignerDids?: string[]
 }
 
 /** The reason stem every port uses when a signed requirement is below the caller's floor. */
@@ -945,9 +1063,17 @@ function requirementFloorProblem(
     typeof floor.requiredApprovals !== "number" ||
     !isValidQuorum(floor.requiredApprovals) ||
     (floor.requesterCannotApprove !== undefined && typeof floor.requesterCannotApprove !== "boolean") ||
-    (floor.requireHardwareKey !== undefined && typeof floor.requireHardwareKey !== "boolean")
+    (floor.requireHardwareKey !== undefined && typeof floor.requireHardwareKey !== "boolean") ||
+    (floor.requireEnrolledDevice !== undefined && typeof floor.requireEnrolledDevice !== "boolean") ||
+    (floor.excludedSignerDids !== undefined && !validSignerExclusions(floor.excludedSignerDids))
   )
     return "expected.requirement is malformed: requiredApprovals must be an integer of at least 1 and the flags booleans"
+  if (
+    floor.excludedSignerDids !== undefined &&
+    (!validSignerExclusions(signed.excludedSignerDids) ||
+      !floor.excludedSignerDids.every((did) => signed.excludedSignerDids?.includes(did)))
+  )
+    return `${WEAKER_REQUIREMENT_REASON}: it omits a required signer exclusion`
   const signedApprovals = signed.requiredApprovals ?? 0
   if (signedApprovals < floor.requiredApprovals)
     return `${WEAKER_REQUIREMENT_REASON}: it requires ${signedApprovals} approval(s), the policy ${floor.requiredApprovals} (DIV §5 step 3d)`
@@ -955,6 +1081,8 @@ function requirementFloorProblem(
     return `${WEAKER_REQUIREMENT_REASON}: it does not forbid the requester approving (DIV §5 step 3d)`
   if (floor.requireHardwareKey === true && signed.requireHardwareKey !== true)
     return `${WEAKER_REQUIREMENT_REASON}: it does not require a hardware key (DIV §5 step 3d)`
+  if (floor.requireEnrolledDevice === true && signed.requireEnrolledDevice !== true)
+    return `${WEAKER_REQUIREMENT_REASON}: it does not require an enrolled approver device (DIV §5 step 3d)`
   return null
 }
 
@@ -1060,6 +1188,15 @@ export interface ReceiptExpectation {
    * the ORDINARY rule: the delegated quorum must already be at least as strict (DIV §5a.5).
    */
   requirement?: RequirementFloor
+  /**
+   * The enrolled approver device keys YOU trust (base64 SPKI or COSE), from your own enrollment
+   * records — e.g. a console trust-anchor export's `enrolledDeviceKeys`. Consulted only when the
+   * signed requirement sets `requireEnrolledDevice`: then a witness counts only if it is ES256 and
+   * verified under one of these keys, and verification is refused without the list (DIV §4.3.2).
+   * Each key must ALSO be a trusted approver key for its signer in `approvers`; this list narrows,
+   * it never adds trust.
+   */
+  enrolledDeviceKeys?: string[]
 }
 
 /** Verification options. The WebAuthn expectations are mandatory for a WEBAUTHN receipt. */
@@ -1241,7 +1378,7 @@ function candidateKeys(
  * otherwise by decoded bytes. Padded/unpadded and base64/base64url spellings also match.
  * Records the key when it is free; returns the refusal reason when it is not.
  */
-function sharedKeyProblem(counted: Map<string, string>, key: string, identity: string): string | null {
+function signingKeyIdentity(key: string): string {
   const decoded = Buffer.from(key, "base64")
   let fingerprint = decoded.toString("hex")
   try {
@@ -1259,6 +1396,52 @@ function sharedKeyProblem(counted: Map<string, string>, key: string, identity: s
   } catch {
     // Invalid or unsupported encodings remain byte-fingerprinted; signature verification fails closed.
   }
+  return fingerprint
+}
+
+function excludedIdentityDids(
+  requirement: Partial<ApprovalRequirementAttestation>,
+  requester: RequesterIdentity,
+): Set<string> {
+  const dids = new Set(requirement.excludedSignerDids ?? [])
+  if (requirement.requesterCannotApprove) {
+    dids.add(requester.did)
+    if (requester.credentialIssuerDid) dids.add(requester.credentialIssuerDid)
+  }
+  return dids
+}
+
+/**
+ * Eligibility remains anchor.dids; the resolver may retain trusted keys for excluded identities.
+ *
+ * Returns a refusal reason when the resolver THROWS for an excluded identity. That fails closed: a
+ * lookup outage would otherwise drop the excluded identity's keys from the one-key-one-person check,
+ * so an eligible alias signing under one of them would count. A resolver that returns null or no
+ * keys for an excluded identity simply contributes none.
+ */
+function seedExcludedSigningKeys(
+  counted: Map<string, string>,
+  anchor: ApproverTrustAnchor,
+  requirement: Partial<ApprovalRequirementAttestation>,
+  requester: RequesterIdentity,
+): string | null {
+  if (!("dids" in anchor) || !anchor.resolveKey) return null
+  for (const did of excludedIdentityDids(requirement, requester)) {
+    let resolved: string | string[] | null
+    try {
+      resolved = anchor.resolveKey(did)
+    } catch {
+      return `could not resolve keys for excluded identity ${did}; refusing rather than ignoring its keys (DIV §4.4.6)`
+    }
+    const keys = typeof resolved === "string" ? [resolved] : Array.isArray(resolved) ? resolved : []
+    for (const key of keys)
+      if (typeof key === "string") counted.set(signingKeyIdentity(key), `excluded identity ${did}`)
+  }
+  return null
+}
+
+function sharedKeyProblem(counted: Map<string, string>, key: string, identity: string): string | null {
+  const fingerprint = signingKeyIdentity(key)
   const owner = counted.get(fingerprint)
   if (owner !== undefined && owner !== identity)
     return `signer ${identity} verified under a key already counted for ${owner}; two approver identities sharing one key count once (DIV §4.4.6)`
@@ -1633,7 +1816,11 @@ export function verifyApprovalReceipt(
   if (opts.delegation && !offline)
     return { ok: false, reason: "a delegation can only substitute the approver set for an offline approval" }
 
-  // Bind the receipt to the challenge the caller is redeeming, before anything else.
+  // Bind the receipt to the challenge the caller is redeeming, before anything else. Naming that
+  // challenge is the caller's job (DIV §5 steps 10-11): an omitted or empty nonce is refused rather
+  // than compared, or a payload signed over an empty nonce would satisfy a caller that issued none.
+  if (typeof expected.nonce !== "string" || expected.nonce.length === 0)
+    return { ok: false, reason: EXPECTED_NONCE_REQUIRED_REASON }
   if (parseNonce(receipt.canonicalPayload) !== expected.nonce)
     return { ok: false, reason: "receipt is for a different challenge" }
 
@@ -1722,8 +1909,12 @@ export function verifyApprovalReceipt(
   // §5 step 7 rejects unless the counted identities are AT LEAST this number — 0 is satisfied by
   // counting nothing, so an unenforced minimum attests an envelope with no valid witness signature.
   if (!isValidQuorum(requirement.requiredApprovals)) return { ok: false, reason: INVALID_QUORUM_REASON }
-  const signerClass = parseSignerClass(requirement)
+  const signerClass = parseSignerClass(requirement, receipt.requester)
   if (!signerClass.ok) return { ok: false, reason: signerClass.reason }
+  // DIV §5 step 3e, structural half: an offline intent cannot carry requireEnrolledDevice, and an
+  // ordinary one carries it only as `true` without a hardware requirement.
+  const deviceStructure = enrolledDeviceStructureProblem(requirement, !offline)
+  if (deviceStructure) return { ok: false, reason: deviceStructure }
   // DIV §5 step 3d: the signed requirement is authored by the signers, so it is compared against the
   // caller's own policy BEFORE anything is counted toward it.
   const weaker = requirementFloorProblem(requirement, expected.requirement)
@@ -1845,6 +2036,10 @@ export function verifyApprovalReceipt(
       requireHardwareKey: requirement.requireHardwareKey === true,
       allowedAaguids: Array.isArray(requirement.allowedAaguids) ? requirement.allowedAaguids : [],
       requesterCannotApprove: requirement.requesterCannotApprove === true,
+      ...(requirement.excludedSignerDids !== undefined
+        ? { excludedSignerDids: requirement.excludedSignerDids }
+        : {}),
+      ...(requirement.requireEnrolledDevice === true ? { requireEnrolledDevice: true } : {}),
       signerClass: signerClass.signerClass,
     },
     nonce: parseNonce(receipt.canonicalPayload),
@@ -1933,7 +2128,10 @@ export function verifyApprovalReceipt(
   if (requirement.requiredApprovals > 1 && "publicKeys" in expected.approvers) {
     return { ok: false, reason: "multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)" }
   }
-  if (requirement.requesterCannotApprove === true && "publicKeys" in expected.approvers) {
+  if (
+    (requirement.requesterCannotApprove === true || (requirement.excludedSignerDids?.length ?? 0) > 0) &&
+    "publicKeys" in expected.approvers
+  ) {
     return {
       ok: false,
       reason:
@@ -1941,8 +2139,24 @@ export function verifyApprovalReceipt(
     }
   }
 
+  // DIV §5 step 3e, list half: decided before counting, like the anchor-shape checks above, so a
+  // caller missing its enrollment records is told so instead of reading a quorum shortfall.
+  let enrolledDevices: Set<string> | null = null
+  if (requirement.requireEnrolledDevice === true) {
+    const fingerprints = enrolledDeviceFingerprints(expected)
+    if (typeof fingerprints === "string") return { ok: false, reason: fingerprints }
+    enrolledDevices = fingerprints
+  }
+
   const verifiedSigners = new Set<string>()
   const countedKeys = new Map<string, string>()
+  const excludedKeysProblem = seedExcludedSigningKeys(
+    countedKeys,
+    expected.approvers,
+    requirement,
+    receipt.requester,
+  )
+  if (excludedKeysProblem) return { ok: false, reason: excludedKeysProblem }
   const failures: string[] = []
   for (const witness of witnesses) {
     const candidates = candidateKeys(expected.approvers, witness, delegatedTo)
@@ -1983,8 +2197,24 @@ export function verifyApprovalReceipt(
       failures.push(synced)
       continue
     }
+    // DIV §5 step 7: under requireEnrolledDevice only an ES256 witness under one of the caller's
+    // enrolled device keys counts. The key compared is the TRUSTED one it verified under.
+    if (
+      enrolledDevices !== null &&
+      (witness.sigAlg === "WEBAUTHN" || !enrolledDevices.has(signingKeyIdentity(matchedKey)))
+    ) {
+      failures.push(
+        `signer ${witness.signerDid} did not sign with an enrolled approver device key, but the signed policy requires one`,
+      )
+      continue
+    }
     // Four-eyes, verified offline against the requester in the same signed payload.
-    if (requirement.requesterCannotApprove === true && witness.signerDid === receipt.requester.did) {
+    if (
+      (requirement.requesterCannotApprove === true &&
+        (witness.signerDid === receipt.requester.did ||
+          witness.signerDid === receipt.requester.credentialIssuerDid)) ||
+      requirement.excludedSignerDids?.includes(witness.signerDid)
+    ) {
       failures.push(`four-eyes: requester ${witness.signerDid} cannot approve their own action`)
       continue
     }
@@ -2089,6 +2319,8 @@ export function verifyPlatformReceipt(
     }
   }
 
+  if (typeof expected.nonce !== "string" || expected.nonce.length === 0)
+    return { ok: false, reason: EXPECTED_NONCE_REQUIRED_REASON }
   if (parseNonce(receipt.canonicalPayload) !== expected.nonce)
     return { ok: false, reason: "receipt is for a different challenge" }
 
@@ -2363,8 +2595,11 @@ export function verifyDelegation(
   if (!requirement || typeof requirement.requiredApprovals !== "number")
     return { ok: false, reason: "delegation payload is missing the signed approval requirement" }
   if (!isValidQuorum(requirement.requiredApprovals)) return { ok: false, reason: INVALID_QUORUM_REASON }
-  const signerClass = parseSignerClass(requirement)
+  const signerClass = parseSignerClass(requirement, receipt.requester)
   if (!signerClass.ok) return { ok: false, reason: signerClass.reason }
+  // DIV §5 step 3e: this payload kind can never carry requireEnrolledDevice.
+  const deviceStructure = enrolledDeviceStructureProblem(requirement, false)
+  if (deviceStructure) return { ok: false, reason: deviceStructure }
   const weaker = requirementFloorProblem(requirement, expected.requirement)
   if (weaker) return { ok: false, reason: weaker }
   if (typeof expected.target !== "string" || expected.target.length === 0)
@@ -2394,6 +2629,9 @@ export function verifyDelegation(
         requireHardwareKey: requirement.requireHardwareKey === true,
         allowedAaguids: Array.isArray(requirement.allowedAaguids) ? requirement.allowedAaguids : [],
         requesterCannotApprove: requirement.requesterCannotApprove === true,
+        ...(requirement.excludedSignerDids !== undefined
+          ? { excludedSignerDids: requirement.excludedSignerDids }
+          : {}),
         signerClass: signerClass.signerClass,
       },
       delegatedTo: delegatedTo as string[],
@@ -2446,7 +2684,10 @@ export function verifyDelegation(
   if (requirement.requiredApprovals > 1 && "publicKeys" in expected.approvers) {
     return { ok: false, reason: "multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)" }
   }
-  if (requirement.requesterCannotApprove === true && "publicKeys" in expected.approvers) {
+  if (
+    (requirement.requesterCannotApprove === true || (requirement.excludedSignerDids?.length ?? 0) > 0) &&
+    "publicKeys" in expected.approvers
+  ) {
     return {
       ok: false,
       reason:
@@ -2456,6 +2697,13 @@ export function verifyDelegation(
 
   const verifiedSigners = new Set<string>()
   const countedKeys = new Map<string, string>()
+  const excludedKeysProblem = seedExcludedSigningKeys(
+    countedKeys,
+    expected.approvers,
+    requirement,
+    receipt.requester,
+  )
+  if (excludedKeysProblem) return { ok: false, reason: excludedKeysProblem }
   const failures: string[] = []
   for (const witness of witnesses) {
     const candidates = candidateKeys(expected.approvers, witness)
@@ -2491,7 +2739,12 @@ export function verifyDelegation(
       failures.push(synced)
       continue
     }
-    if (requirement.requesterCannotApprove === true && witness.signerDid === receipt.requester.did) {
+    if (
+      (requirement.requesterCannotApprove === true &&
+        (witness.signerDid === receipt.requester.did ||
+          witness.signerDid === receipt.requester.credentialIssuerDid)) ||
+      requirement.excludedSignerDids?.includes(witness.signerDid)
+    ) {
       failures.push(`four-eyes: requester ${witness.signerDid} cannot delegate to themselves`)
       continue
     }
@@ -2642,8 +2895,11 @@ export function verifyAgentAuthority(
   if (!requirement || typeof requirement.requiredApprovals !== "number")
     return { ok: false, reason: "authority payload is missing the signed approval requirement" }
   if (!isValidQuorum(requirement.requiredApprovals)) return { ok: false, reason: INVALID_QUORUM_REASON }
-  const signerClass = parseSignerClass(requirement)
+  const signerClass = parseSignerClass(requirement, receipt.requester)
   if (!signerClass.ok) return { ok: false, reason: signerClass.reason }
+  // DIV §5 step 3e: this payload kind can never carry requireEnrolledDevice.
+  const deviceStructure = enrolledDeviceStructureProblem(requirement, false)
+  if (deviceStructure) return { ok: false, reason: deviceStructure }
   const weaker = requirementFloorProblem(requirement, expected.requirement)
   if (weaker) return { ok: false, reason: weaker }
   if (typeof expected.target !== "string" || expected.target.length === 0)
@@ -2681,6 +2937,9 @@ export function verifyAgentAuthority(
         requireHardwareKey: requirement.requireHardwareKey === true,
         allowedAaguids: Array.isArray(requirement.allowedAaguids) ? requirement.allowedAaguids : [],
         requesterCannotApprove: requirement.requesterCannotApprove === true,
+        ...(requirement.excludedSignerDids !== undefined
+          ? { excludedSignerDids: requirement.excludedSignerDids }
+          : {}),
         signerClass: signerClass.signerClass,
       },
       nonce,
@@ -2724,7 +2983,10 @@ export function verifyAgentAuthority(
   if (requirement.requiredApprovals > 1 && "publicKeys" in expected.approvers) {
     return { ok: false, reason: "multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)" }
   }
-  if (requirement.requesterCannotApprove === true && "publicKeys" in expected.approvers) {
+  if (
+    (requirement.requesterCannotApprove === true || (requirement.excludedSignerDids?.length ?? 0) > 0) &&
+    "publicKeys" in expected.approvers
+  ) {
     return {
       ok: false,
       reason:
@@ -2734,6 +2996,13 @@ export function verifyAgentAuthority(
 
   const verifiedSigners = new Set<string>()
   const countedKeys = new Map<string, string>()
+  const excludedKeysProblem = seedExcludedSigningKeys(
+    countedKeys,
+    expected.approvers,
+    requirement,
+    receipt.requester,
+  )
+  if (excludedKeysProblem) return { ok: false, reason: excludedKeysProblem }
   const failures: string[] = []
   for (const witness of witnesses) {
     const candidates = candidateKeys(expected.approvers, witness)
@@ -2769,7 +3038,12 @@ export function verifyAgentAuthority(
       failures.push(synced)
       continue
     }
-    if (requirement.requesterCannotApprove === true && witness.signerDid === receipt.requester.did) {
+    if (
+      (requirement.requesterCannotApprove === true &&
+        (witness.signerDid === receipt.requester.did ||
+          witness.signerDid === receipt.requester.credentialIssuerDid)) ||
+      requirement.excludedSignerDids?.includes(witness.signerDid)
+    ) {
       failures.push(`four-eyes: requester ${witness.signerDid} cannot seal their own request`)
       continue
     }

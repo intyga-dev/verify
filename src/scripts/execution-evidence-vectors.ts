@@ -365,6 +365,8 @@ export function buildExecutionEvidenceVectors() {
     skewSeconds?: number
     maxWindowSeconds?: number
     requireExecutionConfirmed?: boolean
+    contentVerified?: number
+    commitmentOnly?: number
     ok?: boolean
     byNonce: Record<string, string>
     checks: Array<{ index: number; status: string; trusted: boolean }>
@@ -389,6 +391,8 @@ export function buildExecutionEvidenceVectors() {
         ...(c.witnessedAt ? { rekorSpki: spki(rekorLog) } : {}),
       },
       ok: c.ok ?? true,
+      ...(c.contentVerified !== undefined ? { contentVerified: c.contentVerified } : {}),
+      ...(c.commitmentOnly !== undefined ? { commitmentOnly: c.commitmentOnly } : {}),
       execution: {
         byNonce: c.byNonce,
         checks: c.checks.map((k) => ({ seq: seqOf(k.index), status: k.status, trusted: k.trusted })),
@@ -408,6 +412,19 @@ export function buildExecutionEvidenceVectors() {
   const happy = () => [approval(), consumed(), dispatch(), evidence()]
   const big = "x".repeat(16_400)
   const noGaps = (first: number, last: number): SourceContinuity => ({ first, last, gaps: [], divergent: [] })
+
+  // Preserve the checkpoint, Merkle proofs, sequence range and anchors, but omit the final
+  // contradiction entry from the presented bundle. Tenant-sequence completeness must catch the gap.
+  const droppedContradiction = make({
+    name: "dropped-contradiction-required-fails",
+    rows: [...happy(), evidence({ verdict: "contradicted", sequence: 2 })],
+    now: NOW_AFTER,
+    requireExecutionConfirmed: true,
+    ok: false,
+    byNonce: { [N1]: "confirmed" },
+    checks: [{ index: 3, status: "verified", trusted: true }],
+  })
+  droppedContradiction.bundle.entries.splice(4, 1)
 
   const cases: Array<ReturnType<typeof make>> = [
     make({
@@ -430,6 +447,44 @@ export function buildExecutionEvidenceVectors() {
       requireExecutionConfirmed: true,
       byNonce: { [N1]: "confirmed" },
       checks: [{ index: 3, status: "verified", trusted: true }],
+    }),
+    droppedContradiction,
+    make({
+      // The contradiction remains anchored at seq 104 with its original leaf/proof, but its content
+      // is withheld. Inclusion-only verification may report the visible confirmation; the strict
+      // execution policy must not assume the hidden event was harmless.
+      name: "commitment-only-contradiction-required-fails",
+      rows: [...happy(), evidence({ verdict: "contradicted", sequence: 2 })],
+      redact: [4],
+      now: NOW_AFTER,
+      requireExecutionConfirmed: true,
+      ok: false,
+      contentVerified: 4,
+      commitmentOnly: 1,
+      byNonce: { [N1]: "confirmed" },
+      checks: [{ index: 3, status: "verified", trusted: true }],
+    }),
+    make({
+      name: "commitment-only-contradiction-inclusion-only-passes",
+      rows: [...happy(), evidence({ verdict: "contradicted", sequence: 2 })],
+      redact: [4],
+      now: NOW_AFTER,
+      contentVerified: 4,
+      commitmentOnly: 1,
+      byNonce: { [N1]: "confirmed" },
+      checks: [{ index: 3, status: "verified", trusted: true }],
+    }),
+    make({
+      name: "fully-redacted-required-fails",
+      rows: happy(),
+      redact: [0, 1, 2, 3],
+      now: NOW_AFTER,
+      requireExecutionConfirmed: true,
+      ok: false,
+      contentVerified: 0,
+      commitmentOnly: 4,
+      byNonce: {},
+      checks: [],
     }),
     make({
       name: "no-policy-embedded-key-is-not-trust",

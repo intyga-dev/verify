@@ -53,6 +53,11 @@ trusted anchor. The verifier compares it byte-for-byte with the signed tenant. I
 expected tenant from the receipt. Historical DIV v1 receipts remain verifiable only when no tenant
 expectation is supplied; that compatibility path is for archived evidence, not new execution.
 
+For DEWP execution evidence, `requireExecutionConfirmed` is deliberately stricter than inclusion
+verification: it rejects any covered bundle containing a `COMMITMENT_ONLY` entry, because withheld
+content could be an execution contradiction. Without that option, commitment-only inclusion remains
+valid and is reported through `commitmentOnly`; it is not proof that execution was confirmed.
+
 ## Whose key? (the trust anchor)
 
 `approvers` is **required**, and it is the single most important input. Everything else this library

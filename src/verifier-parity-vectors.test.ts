@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url"
 import {
   verifyAgentAuthority,
   verifyApprovalReceipt,
+  verifyDelegation,
+  verifyWebAuthnWitness,
   verifyPlatformReceipt,
   type ApprovalReceipt,
   type PlatformReceipt,
@@ -45,6 +47,8 @@ interface Fixtures {
   approvals: { expected: Obj; options: Obj; cases: Case[] }
   platform: { expected: Obj; options: Obj; cases: Case[] }
   agentAuthority: { expected: Obj; options: Obj; cases: Case[] }
+  delegation: { expected: Obj; options: Obj; cases: Case[] }
+  webauthnWitness: { cases: Case[] }
   bundles: { anchorPolicy: Obj; cases: Case[] }
   evidence: { cases: Case[] }
   rootsChain: { cases: Case[] }
@@ -62,6 +66,12 @@ interface Fixtures {
     agentAuthority: Section
     bundles: { cases: Case[] }
   }
+  enrolledDevice: {
+    keys: KeyFixture[]
+    approvals: Section
+    delegation: Section
+    agentAuthority: Section
+  }
 }
 interface Section {
   expected: Obj
@@ -75,6 +85,29 @@ const fixtures = JSON.parse(
     "utf8",
   ),
 ) as Fixtures
+/** api-name-hints.json: rewrite the TypeScript API names in an expected reason into this language's. */
+const HINTS = JSON.parse(
+  readFileSync(
+    fileURLToPath(new URL("../vectors/api-name-hints.json", import.meta.url)),
+    "utf8",
+  ),
+) as { tokens: string[]; typescript: Record<string, string> }
+assert.deepEqual(
+  Object.keys(HINTS.typescript).sort(),
+  [...HINTS.tokens].sort(),
+  "api-name-hints typescript map",
+)
+function localized(text: string): string {
+  const order = [...HINTS.tokens].sort((a, b) => b.length - a.length)
+  let out = text
+  order.forEach((token, i) => {
+    out = out.split(token).join(`\u0000${i}\u0000`)
+  })
+  order.forEach((token, i) => {
+    out = out.split(`\u0000${i}\u0000`).join(HINTS.typescript[token] ?? token)
+  })
+  return out
+}
 const keyById = new Map(fixtures.keys.map((k) => [k.id, k]))
 const opts = (o: Obj): Obj => ({ ...o, ...(typeof o.asOf === "string" ? { asOf: new Date(o.asOf) } : {}) })
 
@@ -88,14 +121,29 @@ function runApprovalCases(section: Section, keys: KeyTable) {
     const encoding = c.approverKeyEncoding === "cose" ? "coseB64" : "spkiB64"
     const table = raw.approverDids as Record<string, string[]> | undefined
     const coseDids = new Set((raw.approverCoseDids as string[] | undefined) ?? [])
-    const approvers = table
-      ? {
-          dids: Object.keys(table),
-          resolveKey: (did: string) =>
-            (table[did] ?? []).map((id) => keys.get(id)![coseDids.has(did) ? "coseB64" : "spkiB64"]!),
-        }
-      : { publicKeys: ids.map((id) => keys.get(id)![encoding]!) }
-    const expected = { ...raw, approvers }
+    const throwsFor = new Set((raw.resolverThrowsFor as string[] | undefined) ?? [])
+    const approvers =
+      table && raw.resolverOmitted === true
+        ? { dids: Object.keys(table) }
+        : table
+          ? {
+              dids: Object.keys(table),
+              resolveKey: (did: string) => {
+                if (throwsFor.has(did)) throw new Error(`resolver unavailable for ${did}`)
+                return (table[did] ?? []).map(
+                  (id) => keys.get(id)![coseDids.has(did) ? "coseB64" : "spkiB64"]!,
+                )
+              },
+            }
+          : { publicKeys: ids.map((id) => keys.get(id)![encoding]!) }
+    // enrolledDevice section: key ids map to SPKI; a literal list passes through verbatim.
+    const deviceIds = raw.enrolledDeviceKeyIds as string[] | undefined
+    const { enrolledDeviceKeyIds: _deviceIds, ...rest } = raw
+    const expected = {
+      ...rest,
+      approvers,
+      ...(deviceIds ? { enrolledDeviceKeys: deviceIds.map((id) => keys.get(id)!.spkiB64) } : {}),
+    }
     const result = verifyApprovalReceipt(
       c.receipt as unknown as ApprovalReceipt,
       expected as never,
@@ -103,7 +151,13 @@ function runApprovalCases(section: Section, keys: KeyTable) {
     )
     assert.equal(result.ok, c.ok, `${c.name}: ${result.reason}`)
     if (c.signers) assert.deepEqual(result.signers, c.signers, c.name)
-    if (c.reasonIncludes) assert.match(result.reason ?? "", new RegExp(String(c.reasonIncludes)), c.name)
+    if (c.reasonIncludes)
+      assert.ok(
+        (result.reason ?? "").includes(localized(String(c.reasonIncludes))),
+        `${c.name}: ${result.reason}`,
+      )
+    if (c.reason !== undefined)
+      assert.equal(result.reason, localized(String(c.reason)), `${c.name}: exact reason`)
   }
 }
 
@@ -119,7 +173,13 @@ function runPlatformCases(section: Section, keys: KeyTable) {
     )
     assert.equal(result.ok, c.ok, `${c.name}: ${result.reason}`)
     if (c.signers) assert.deepEqual(result.signers, c.signers, c.name)
-    if (c.reasonIncludes) assert.match(result.reason ?? "", new RegExp(String(c.reasonIncludes)), c.name)
+    if (c.reasonIncludes)
+      assert.ok(
+        (result.reason ?? "").includes(localized(String(c.reasonIncludes))),
+        `${c.name}: ${result.reason}`,
+      )
+    if (c.reason !== undefined)
+      assert.equal(result.reason, localized(String(c.reason)), `${c.name}: exact reason`)
   }
 }
 
@@ -146,9 +206,65 @@ function runAuthorityCases(section: Section, keys: KeyTable) {
     assert.equal(result.ok, c.ok, `${c.name}: ${result.reason}`)
     if (c.signers) assert.deepEqual(result.authority?.signers, c.signers, c.name)
     if (c.actionPatterns) assert.deepEqual(result.authority?.actionPatterns, c.actionPatterns, c.name)
-    if (c.reasonIncludes) assert.match(result.reason ?? "", new RegExp(String(c.reasonIncludes)), c.name)
+    if (c.reasonIncludes)
+      assert.ok(
+        (result.reason ?? "").includes(localized(String(c.reasonIncludes))),
+        `${c.name}: ${result.reason}`,
+      )
+    if (c.reason !== undefined)
+      assert.equal(result.reason, localized(String(c.reason)), `${c.name}: exact reason`)
   }
 }
+
+test("shared standalone WebAuthn witness vectors", () => {
+  const cases = fixtures.webauthnWitness.cases
+  assert.ok(cases.length > 0)
+  for (const c of cases) {
+    const result = verifyWebAuthnWitness(c.witness as never, c.expectation as never)
+    assert.equal(result.ok, c.ok, `${c.name}: ${result.ok ? "" : result.reason}`)
+    const reason = result.ok ? undefined : result.reason
+    if (c.reason !== undefined) assert.equal(reason, localized(String(c.reason)), `${c.name}: exact reason`)
+    if (c.reasonPrefix !== undefined)
+      assert.ok(reason?.startsWith(localized(String(c.reasonPrefix))), `${c.name}: ${reason}`)
+  }
+})
+
+function runDelegationCases(section: Section, keys: KeyTable) {
+  assert.ok(section.cases.length > 0)
+  for (const c of section.cases) {
+    const raw = { ...section.expected, ...c.expected }
+    const table = raw.approverDids as Record<string, string[]>
+    const approvers = {
+      dids: Object.keys(table),
+      resolveKey: (did: string) => (table[did] ?? []).map((id) => keys.get(id)!.spkiB64),
+    }
+    const result = verifyDelegation(
+      c.receipt as unknown as ApprovalReceipt,
+      { ...raw, approvers } as never,
+      opts({ ...section.options, ...c.options }) as never,
+    )
+    assert.equal(result.ok, c.ok, `${c.name}: ${result.reason}`)
+    if (c.signers) assert.deepEqual(result.delegation?.signers, c.signers, c.name)
+    if (c.delegatedTo) assert.deepEqual(result.delegation?.delegatedTo, c.delegatedTo, c.name)
+    if (c.delegatedQuorum !== undefined)
+      assert.equal(result.delegation?.delegatedQuorum, c.delegatedQuorum, c.name)
+    if (c.reason !== undefined)
+      assert.equal(result.reason, localized(String(c.reason)), `${c.name}: exact reason`)
+  }
+}
+
+test("shared delegation (seal) vectors", () => {
+  runDelegationCases(fixtures.delegation, keyById)
+})
+
+test("shared enrolled approver device vectors (own keys, DIV §4.3.2)", () => {
+  const section = fixtures.enrolledDevice
+  const keys: KeyTable = new Map(section.keys.map((k) => [k.id, k]))
+  assert.ok(section.approvals.cases.length > 0)
+  runApprovalCases(section.approvals, keys)
+  runDelegationCases(section.delegation, keys)
+  runAuthorityCases(section.agentAuthority, keys)
+})
 
 test("shared approval signature-algorithm and four-eyes vectors", () => {
   runApprovalCases(fixtures.approvals, keyById)
@@ -210,6 +326,8 @@ function runEvidenceCases(cases: Case[], keys: KeyTable) {
       externalKeys: externalKeysFor(keys, o),
     })
     assert.equal(result.ok, c.ok, `${c.name}: ${result.failed.map((f) => f.reason).join("; ")}`)
+    if (c.contentVerified !== undefined) assert.equal(result.contentVerified, c.contentVerified, c.name)
+    if (c.commitmentOnly !== undefined) assert.equal(result.commitmentOnly, c.commitmentOnly, c.name)
     if (c.total !== undefined) assert.equal(result.total, c.total, c.name)
     if (c.contentVerified !== undefined) assert.equal(result.contentVerified, c.contentVerified, c.name)
     if (c.commitmentOnly !== undefined) assert.equal(result.commitmentOnly, c.commitmentOnly, c.name)

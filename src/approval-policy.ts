@@ -6,6 +6,9 @@ export interface PolicyRule {
   requireHardwareKey?: boolean
   allowedAaguids?: string[]
   requesterCannotApprove?: boolean
+  excludedSignerDids?: string[]
+  /** DIV §4.3.2 "Enrolled approver devices". Absent means false. */
+  requireEnrolledDevice?: boolean
   requireAttestedRequester?: boolean
   allowedIssuers?: string[]
   approverGroupIds?: string[]
@@ -110,7 +113,12 @@ function windowKey(r: PolicyRule): string {
 export function lostApprovalConstraints(selected: PolicyRule, other: PolicyRule): string[] {
   const lost: string[] = []
   if (selected.requiredApprovals < other.requiredApprovals) lost.push("requiredApprovals")
-  for (const field of ["requireHardwareKey", "requesterCannotApprove", "requireAttestedRequester"] as const) {
+  for (const field of [
+    "requireHardwareKey",
+    "requesterCannotApprove",
+    "requireAttestedRequester",
+    "requireEnrolledDevice",
+  ] as const) {
     if (other[field] && !selected[field]) lost.push(field)
   }
   for (const field of ["allowedAaguids", "allowedIssuers"] as const) {
@@ -118,6 +126,12 @@ export function lostApprovalConstraints(selected: PolicyRule, other: PolicyRule)
       b = other[field] ?? []
     if (b.length && (!a.length || !subset(a, b))) lost.push(field)
   }
+  if (
+    other.excludedSignerDids !== undefined &&
+    (selected.excludedSignerDids === undefined ||
+      !subset(other.excludedSignerDids, selected.excludedSignerDids))
+  )
+    lost.push("excludedSignerDids")
   // Different unresolved groups cannot be compared safely. DB callers expand them first.
   if (!sameSet(selected.approverGroupIds ?? [], other.approverGroupIds ?? [])) lost.push("approverGroups")
   const a = selected.approverDids,
@@ -135,6 +149,7 @@ export function lostApprovalConstraints(selected: PolicyRule, other: PolicyRule)
       windowKey(selected) !== windowKey(other) ||
       selected.requiredApprovals !== other.requiredApprovals ||
       selected.requireHardwareKey !== other.requireHardwareKey ||
+      (selected.requireEnrolledDevice ?? false) !== (other.requireEnrolledDevice ?? false) ||
       selected.requesterCannotApprove !== other.requesterCannotApprove ||
       selected.requireAttestedRequester !== other.requireAttestedRequester ||
       !sameSet(a, b) ||

@@ -39,13 +39,18 @@ interface PayloadInput {
   actionType: string
   actionDescription: string
   params: Record<string, unknown>
-  requester: { did: string; attestation: { method: string; issuer: string; subject: string } | null }
+  requester: {
+    did: string
+    credentialIssuerDid?: string
+    attestation: { method: string; issuer: string; subject: string } | null
+  }
   requirement: {
     requiredApprovals: number
     requireHardwareKey: boolean
     allowedAaguids: string[]
     requesterCannotApprove: boolean
     signerClass: string
+    excludedSignerDids?: string[]
   }
   expiresAt: string
   challengedAt?: string

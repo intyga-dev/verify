@@ -1,6 +1,6 @@
 {
   "name": "@intyga/verify",
-  "version": "2.1.0",
+  "version": "2.3.0",
   "description": "Independently verify INTYGA approval receipts — confirm a human cryptographically approved exactly the action about to run, with NO INTYGA secret. Zero npm runtime dependencies; optional OpenSSL 3 for timestamps.",
   "license": "Apache-2.0",
   "repository": {
@@ -55,7 +55,7 @@
     "test:coverage": "tsx --test --experimental-test-coverage --test-coverage-lines=94 --test-coverage-branches=80 --test-coverage-functions=98 --test-coverage-exclude='../**' --test-coverage-exclude='src/**/*.test.ts' 'src/**/*.test.ts'"
   },
   "devDependencies": {
-    "@types/node": "^26.6.4",
+    "@types/node": "^26.6.5",
     "ajv": "^8.20.0",
     "tsx": "4.23.15",
     "typescript": "^5.9.3"

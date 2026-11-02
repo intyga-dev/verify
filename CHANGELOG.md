@@ -3,7 +3,47 @@
 All notable changes to `@intyga/verify` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [2.3.0]
+
+- DIV 1.3.0 enrolled approver devices (§4.3.2, ADR 027). The signed requirement may carry
+  `requireEnrolledDevice: true` (ordinary intents only, serialized only when true, never with a
+  hardware requirement). `verifyApprovalReceipt` refuses a malformed, misplaced or hardware-combined
+  value (§5 step 3e), takes a new `expected.enrolledDeviceKeys` (the RP's own enrolled device keys;
+  required under the field), and counts only an ES256 witness under one of those keys (step 7).
+  `RequirementFloor.requireEnrolledDevice` refuses a signed requirement without it (step 3d).
+  `verifyDelegation` and `verifyAgentAuthority` refuse the field. Every existing payload and receipt
+  keeps its exact bytes and verdict.
+- `approval-policy`: `lostApprovalConstraints` treats `requireEnrolledDevice` like
+  `requireHardwareKey`; `ruleStrictness` is unchanged.
+- `verifier-parity-vectors.json` gains a self-contained `enrolledDevice` section (own keys,
+  regenerated alone by `generate-enrolled-device-vectors.ts`).
+
+## [2.2.0]
+
+- `verifier-parity-vectors.json` gains a `webauthnWitness` section that pins `verifyWebAuthnWitness`
+  (and its new Python, Go, Rust and Java counterparts) case by case, including DER-only signatures.
+- `verifyApprovalReceipt` and `verifyPlatformReceipt` refuse an omitted or empty `expected.nonce`
+  up front ("expected.nonce is required — it must be the challenge YOU issued (DIV §5 step 10)"),
+  immediately before the nonce comparison, as every port now does. Previously a payload signed over
+  an empty nonce verified against an empty expectation. Verdict change for that input only.
+- `verifier-parity-vectors.json` gains a `delegation` section (seal verification) and cases for an
+  empty expected nonce, a v2 receipt without an expected tenant, missing agent context, an empty key
+  allowlist, a DID-mode anchor without a resolver, a sub-second-over-cap offline window, a missing
+  `parentReceiptHash` and a platform verifier handed an ordinary intent. API names inside reasons are
+  rewritten per language through the new `api-name-hints.json`.
+- Signed identity extensions are refused explicitly, in one fixed position shared by all five
+  verifiers (after the quorum minimum, before the signer class): a malformed
+  `requester.credentialIssuerDid` ("signed requester.credentialIssuerDid must be a non-empty DID"), a
+  malformed `excludedSignerDids` ("signed requirement.excludedSignerDids must be an array of valid
+  DIDs") and, new, a repeated DID ("signed requirement.excludedSignerDids must not contain
+  duplicates"). Previously a duplicate and a malformed issuer surfaced only as a byte mismatch or an
+  uncanonicalizable expectation. Verdicts are unchanged; canonical bytes are unchanged.
+- `verifier-parity-vectors.json` cases may carry `reason`, the exact refusal text every port must
+  produce; new cases pin the identity-extension order and the shared-key alias refusal text.
+- A DID-mode resolver that throws while resolving an EXCLUDED identity's keys now refuses the
+  verification instead of contributing no keys; returning no keys is unchanged.
+- `requireExecutionConfirmed` now fails closed when a covered evidence bundle contains any
+  `COMMITMENT_ONLY` entry; inclusion-only verification remains unchanged and reports redaction.
 
 ## [2.1.0]
 

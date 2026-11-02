@@ -1,15 +1,18 @@
 import crypto from "node:crypto"
-import { writeFileSync } from "node:fs"
+import { readFileSync, writeFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import {
   canonicalAgentAuthorityPayload,
+  canonicalDelegationPayload,
   canonicalIntentPayload,
   canonicalOfflineIntentPayload,
   canonicalPlatformIntentPayload,
   selfCertifyingDid,
   verificationCode,
+  verifyWebAuthnWitness,
   type ApprovalReceipt,
   type PlatformReceipt,
+  type WebAuthnWitness,
 } from "../index.js"
 import { anchorDigest, signAnchor, type SignedAnchor } from "../ledger-anchor.js"
 import { chainHash, type RootsChainEntry } from "../ledger-chain.js"
@@ -19,6 +22,7 @@ import { BUNDLE_KIND, type ProofBundle } from "../ledger-bundle.js"
 import { hashLeaf, merkleProof, merkleRoot } from "../ledger-merkle.js"
 import { rekorPayloadHashFor } from "../ledger-rekor.js"
 import { buildDewpEvidenceHardening } from "./dewp-evidence-hardening-vectors.js"
+import { buildEnrolledDeviceVectors } from "./enrolled-device-vectors.js"
 import { buildExecutionEvidenceVectors } from "./execution-evidence-vectors.js"
 import { buildVerifierInputHardening } from "./verifier-input-hardening-vectors.js"
 
@@ -156,18 +160,25 @@ const approvalParams = { amount: 4200, currency: "USD" }
 const approvalNonce = "parity-approval-nonce"
 function approvalReceipt(input: {
   requesterDid: string
+  credentialIssuerDid?: string
   signerDid: string
   signer: Pair
   requesterCannotApprove?: boolean
+  excludedSignerDids?: string[]
 }): ApprovalReceipt {
   const requirement = {
     requiredApprovals: 1,
     requireHardwareKey: false,
     allowedAaguids: [],
     requesterCannotApprove: input.requesterCannotApprove ?? false,
+    ...(input.excludedSignerDids !== undefined ? { excludedSignerDids: input.excludedSignerDids } : {}),
     signerClass: "human",
   }
-  const requester = { did: input.requesterDid, attestation: null }
+  const requester = {
+    did: input.requesterDid,
+    ...(input.credentialIssuerDid !== undefined ? { credentialIssuerDid: input.credentialIssuerDid } : {}),
+    attestation: null,
+  }
   const canonical = canonicalIntentPayload({
     target: approvalTarget,
     actionType: approvalActionType,
@@ -282,6 +293,243 @@ const requesterKeyLabelledMallory = approvalReceipt({
   signer: alice,
   requesterCannotApprove: true,
 })
+const issuerCannotApprove = approvalReceipt({
+  requesterDid: "did:intyga:subject",
+  credentialIssuerDid: "did:intyga:alice",
+  signerDid: "did:intyga:alice",
+  signer: alice,
+  requesterCannotApprove: true,
+})
+const independentApprover = approvalReceipt({
+  requesterDid: "did:intyga:subject",
+  credentialIssuerDid: "did:intyga:alice",
+  signerDid: "did:intyga:bob",
+  signer: bob,
+  requesterCannotApprove: true,
+})
+const explicitlyExcludedApprover = approvalReceipt({
+  requesterDid: "did:intyga:agent:payments",
+  signerDid: "did:intyga:alice",
+  signer: alice,
+  excludedSignerDids: ["did:intyga:alice"],
+})
+// Bob signs while Mallory is an excluded identity. When the relying party's resolver THROWS for
+// Mallory, every verifier refuses rather than silently dropping her keys from the one-key-one-person
+// check (a lookup outage must not let an aliased excluded key count); a resolver that merely knows
+// no keys for her still verifies.
+const excludedIdentityResolverFailure = approvalReceipt({
+  requesterDid: "did:intyga:agent:payments",
+  signerDid: "did:intyga:bob",
+  signer: bob,
+  excludedSignerDids: ["did:intyga:mallory"],
+})
+const signedEmptyExclusions = approvalReceipt({
+  requesterDid: "did:intyga:agent:payments",
+  signerDid: "did:intyga:alice",
+  signer: alice,
+  excludedSignerDids: [],
+})
+// Alice and Bob are distinct claimed identities backed by the SAME P-256 key. Four-eyes is about
+// independent key control, so relabelling Alice's key as Bob must not evade a requester/controller
+// exclusion. The ordinary solo control below deliberately permits the alias when no independence
+// rule was signed.
+const controllerKeyAlias = approvalReceipt({
+  requesterDid: "did:intyga:agent:payments",
+  signerDid: "did:intyga:bob",
+  signer: alice,
+  excludedSignerDids: ["did:intyga:alice"],
+})
+const requesterKeyAlias = approvalReceipt({
+  requesterDid: "did:intyga:alice",
+  signerDid: "did:intyga:bob",
+  signer: alice,
+  requesterCannotApprove: true,
+})
+const issuerKeyAlias = approvalReceipt({
+  requesterDid: "did:intyga:subject",
+  credentialIssuerDid: "did:intyga:alice",
+  signerDid: "did:intyga:bob",
+  signer: alice,
+  requesterCannotApprove: true,
+})
+const ordinarySoloKeyAlias = approvalReceipt({
+  requesterDid: "did:intyga:alice",
+  signerDid: "did:intyga:bob",
+  signer: alice,
+})
+const SHARED_KEY_ALIAS_REASON = `quorum not met: 0 of 1 required approver signatures verified (signer did:intyga:bob verified under a key already counted for excluded identity did:intyga:alice; two approver identities sharing one key count once (DIV §4.4.6))`
+/** Re-sign `base` after a textual edit of its canonical bytes the builder would refuse to emit. */
+function mutatedApproval(
+  base: ApprovalReceipt,
+  edits: [string, string][],
+  signer: Pair,
+  requester?: ApprovalReceipt["requester"],
+): ApprovalReceipt {
+  let canonical = base.canonicalPayload
+  for (const [from, to] of edits) {
+    const next = canonical.replace(from, to)
+    if (next === canonical) throw new Error(`parity fixture edit did not apply: ${from}`)
+    canonical = next
+  }
+  return {
+    ...base,
+    canonicalPayload: canonical,
+    ...(requester ? { requester } : {}),
+    signature: sign(signer, canonical),
+    verificationCode: verificationCode(canonical),
+  }
+}
+// Identity extensions (DIV §4.3.2), checked in one fixed position by every port: after the quorum
+// minimum, before the signer class — credentialIssuerDid, then a malformed exclusion set, then a
+// repeated DID. Each case below carries two faults and pins which one is reported.
+const duplicateExclusions = mutatedApproval(
+  excludedIdentityResolverFailure,
+  [
+    [
+      '"excludedSignerDids":["did:intyga:mallory"]',
+      '"excludedSignerDids":["did:intyga:mallory","did:intyga:mallory"]',
+    ],
+  ],
+  bob,
+)
+const duplicateExclusionsUnknownClass = mutatedApproval(
+  duplicateExclusions,
+  [['"signerClass":"human"', '"signerClass":"agent"']],
+  bob,
+)
+const duplicateExclusionsZeroQuorum = mutatedApproval(
+  duplicateExclusions,
+  [['"requiredApprovals":1', '"requiredApprovals":0']],
+  bob,
+)
+const malformedIssuerAndDuplicates = mutatedApproval(
+  approvalReceipt({
+    requesterDid: "did:intyga:subject",
+    credentialIssuerDid: "did:intyga:alice",
+    signerDid: "did:intyga:bob",
+    signer: bob,
+    requesterCannotApprove: true,
+    excludedSignerDids: ["did:intyga:mallory"],
+  }),
+  [
+    ['"credentialIssuerDid":"did:intyga:alice"', '"credentialIssuerDid":"did:intyga:bad issuer"'],
+    [
+      '"excludedSignerDids":["did:intyga:mallory"]',
+      '"excludedSignerDids":["did:intyga:mallory","did:intyga:mallory"]',
+    ],
+  ],
+  bob,
+  { did: "did:intyga:subject", credentialIssuerDid: "did:intyga:bad issuer", attestation: null },
+)
+const malformedAndDuplicateExclusions = mutatedApproval(
+  excludedIdentityResolverFailure,
+  [
+    [
+      '"excludedSignerDids":["did:intyga:mallory"]',
+      '"excludedSignerDids":["did:intyga:bad signer","did:intyga:bad signer"]',
+    ],
+  ],
+  bob,
+)
+// Present-but-null is malformed, not absent (DIV §4.3.2). Statically typed ports read an explicit
+// JSON null into the same nil/None/null as an absent field unless they track presence, so these pin
+// that every port refuses — with the reference's reason — instead of verifying as if it were absent.
+// The issuer case leaves the signed bytes untouched: the null lives only in the envelope's requester,
+// which is exactly where a port that dropped it would reconstruct issuer-free bytes and accept.
+const nullCredentialIssuer = {
+  ...approvalGood,
+  requester: { did: "did:intyga:agent:payments", credentialIssuerDid: null, attestation: null },
+} as unknown as ApprovalReceipt
+const nullSignedExclusions = mutatedApproval(
+  excludedIdentityResolverFailure,
+  [['"excludedSignerDids":["did:intyga:mallory"]', '"excludedSignerDids":null']],
+  bob,
+)
+const DUPLICATE_EXCLUSIONS_REASON = "signed requirement.excludedSignerDids must not contain duplicates"
+const identityExtensionCases = [
+  {
+    name: "duplicate-excluded-signer-dids-refused",
+    receipt: duplicateExclusions,
+    expected: { approverDids: { "did:intyga:bob": ["bob"] } },
+    ok: false,
+    reason: DUPLICATE_EXCLUSIONS_REASON,
+  },
+  {
+    name: "duplicate-excluded-signer-dids-reported-before-signer-class",
+    receipt: duplicateExclusionsUnknownClass,
+    expected: { approverDids: { "did:intyga:bob": ["bob"] } },
+    ok: false,
+    reason: DUPLICATE_EXCLUSIONS_REASON,
+  },
+  {
+    name: "invalid-quorum-reported-before-identity-extensions",
+    receipt: duplicateExclusionsZeroQuorum,
+    expected: { approverDids: { "did:intyga:bob": ["bob"] } },
+    ok: false,
+    reason: "signed requirement.requiredApprovals must be an integer of at least 1 (DIV §4.3.2)",
+  },
+  {
+    name: "malformed-credential-issuer-reported-before-exclusions",
+    receipt: malformedIssuerAndDuplicates,
+    expected: { approverDids: { "did:intyga:bob": ["bob"] } },
+    ok: false,
+    reason: "signed requester.credentialIssuerDid must be a non-empty DID",
+  },
+  {
+    name: "null-credential-issuer-refused-not-dropped",
+    receipt: nullCredentialIssuer,
+    expected: { approverDids: { "did:intyga:alice": ["alice"] } },
+    ok: false,
+    reason: "signed requester.credentialIssuerDid must be a non-empty DID",
+  },
+  {
+    name: "null-signed-excluded-signer-dids-refused-not-dropped",
+    receipt: nullSignedExclusions,
+    expected: { approverDids: { "did:intyga:bob": ["bob"] } },
+    ok: false,
+    reason: "signed requirement.excludedSignerDids must be an array of valid DIDs",
+  },
+  {
+    name: "malformed-exclusions-reported-before-duplicates",
+    receipt: malformedAndDuplicateExclusions,
+    expected: { approverDids: { "did:intyga:bob": ["bob"] } },
+    ok: false,
+    reason: "signed requirement.excludedSignerDids must be an array of valid DIDs",
+  },
+]
+const malformedCredentialIssuer = (() => {
+  const canonical = issuerCannotApprove.canonicalPayload.replace(
+    '"credentialIssuerDid":"did:intyga:alice"',
+    '"credentialIssuerDid":"did:intyga:bad issuer"',
+  )
+  if (canonical === issuerCannotApprove.canonicalPayload)
+    throw new Error("credential issuer parity fixture was not changed")
+  return {
+    ...issuerCannotApprove,
+    canonicalPayload: canonical,
+    requester: {
+      did: "did:intyga:subject",
+      credentialIssuerDid: "did:intyga:bad issuer",
+      attestation: null,
+    },
+    signature: sign(alice, canonical),
+    verificationCode: verificationCode(canonical),
+  }
+})()
+const malformedSignerExclusions = (() => {
+  const canonical = explicitlyExcludedApprover.canonicalPayload.replace(
+    '"excludedSignerDids":["did:intyga:alice"]',
+    '"excludedSignerDids":["did:intyga:bad signer"]',
+  )
+  if (canonical === explicitlyExcludedApprover.canonicalPayload)
+    throw new Error("signer exclusion parity fixture was not changed")
+  return {
+    ...explicitlyExcludedApprover,
+    canonicalPayload: canonical,
+    signature: sign(alice, canonical),
+    verificationCode: verificationCode(canonical),
+  }
+})()
 // Mutate the canonical string directly and re-sign: the builder cannot emit these shapes, which is
 // the point — they are what a non-conformant or future producer would send. The one exception is the
 // post-signing mutation, which deliberately keeps the original signature.
@@ -386,6 +634,148 @@ const offlineApprovalCases = [
   },
 ]
 
+// Harness-shape cases (2026-10-26 parity round). Reasons are exact; API names in them are rewritten
+// per language through api-name-hints.json.
+const v2ApprovalCanonical = canonicalIntentPayload({
+  tenantId: "11111111-1111-4111-8111-111111111111",
+  target: approvalTarget,
+  actionType: approvalActionType,
+  display: "Wire USD 4,200",
+  params: approvalParams,
+  requester: { did: "did:intyga:agent:payments", attestation: null },
+  requirement: {
+    requiredApprovals: 1,
+    requireHardwareKey: false,
+    allowedAaguids: [],
+    requesterCannotApprove: false,
+    signerClass: "human",
+  },
+  nonce: approvalNonce,
+  expiresAt: EXPIRES,
+})
+const v2Approval: ApprovalReceipt = {
+  ...approvalGood,
+  canonicalPayload: v2ApprovalCanonical,
+  signature: sign(alice, v2ApprovalCanonical),
+  verificationCode: verificationCode(v2ApprovalCanonical),
+}
+const subSecondOverCap = mutatedApproval(
+  offlineApproval([]),
+  [
+    ['"challengedAt":"2026-09-01T12:00:00.000Z"', '"challengedAt":"2026-09-01T11:59:59.900Z"'],
+    ['"expiresAt":"2026-09-01T12:30:00.000Z"', '"expiresAt":"2026-09-01T13:00:00.000Z"'],
+  ],
+  alice,
+)
+const windowTie = mutatedApproval(
+  offlineApproval([]),
+  [['"expiresAt":"2026-09-01T12:30:00.000Z"', '"expiresAt":"2026-09-01T13:00:15.000Z"']],
+  alice,
+)
+const unknownVersion = mutatedApproval(approvalGood, [['"v":1', '"v":3']], alice)
+const harnessShapeCases = [
+  {
+    name: "v2-receipt-for-another-tenant-refused",
+    receipt: v2Approval,
+    expected: { tenantId: "22222222-2222-4222-8222-222222222222" },
+    ok: false,
+    reason: "receipt was signed for a different tenant",
+  },
+  {
+    name: "v1-receipt-with-expected-tenant-refused",
+    receipt: approvalGood,
+    expected: { tenantId: "11111111-1111-4111-8111-111111111111" },
+    ok: false,
+    reason: "legacy DIV v1 payload cannot be verified with an expected tenantId",
+  },
+  {
+    name: "unparseable-payload-refused",
+    receipt: { ...approvalGood, canonicalPayload: "not json" },
+    ok: false,
+    reason: "unsupported DIV payload version (unparseable)",
+  },
+  {
+    name: "unknown-payload-version-refused",
+    receipt: unknownVersion,
+    ok: false,
+    reason: "unsupported DIV payload version (3)",
+  },
+  {
+    name: "offline-window-rounds-like-tofixed",
+    receipt: windowTie,
+    options: { asOf: "2026-09-01T12:01:00.000Z", allowOffline: true },
+    ok: false,
+    reason: "offline window is 60.3 minutes, over the 60-minute maximum",
+  },
+  {
+    name: "malformed-requirement-floor-refused",
+    receipt: approvalGood,
+    expected: { requirement: { requiredApprovals: 0 } },
+    ok: false,
+    reason:
+      "expected.requirement is malformed: requiredApprovals must be an integer of at least 1 and the flags booleans",
+  },
+  {
+    name: "floor-exclusion-reported-before-quorum",
+    receipt: approvalGood,
+    expected: { requirement: { requiredApprovals: 2, excludedSignerDids: ["did:intyga:mallory"] } },
+    ok: false,
+    reason:
+      "signed requirement is weaker than the relying party's policy: it omits a required signer exclusion",
+  },
+  {
+    name: "expected-nonce-empty-refused",
+    receipt: approvalGood,
+    expected: { nonce: "" },
+    ok: false,
+    reason: "expected.nonce is required — it must be the challenge YOU issued (DIV §5 step 10)",
+  },
+  {
+    name: "v2-receipt-without-expected-tenant-refused",
+    receipt: v2Approval,
+    ok: false,
+    reason: "expected.tenantId is required for tenant-bound DIV v2 payloads",
+  },
+  {
+    name: "v2-receipt-with-expected-tenant-verifies",
+    receipt: v2Approval,
+    expected: { tenantId: "11111111-1111-4111-8111-111111111111" },
+    ok: true,
+    signers: [spki(alice)],
+  },
+  {
+    name: "agent-context-expected-but-absent-refused",
+    receipt: approvalGood,
+    expected: { agentContext },
+    ok: false,
+    reason: "agent context was expected but is absent from the signed payload",
+  },
+  {
+    name: "empty-key-allowlist-refused",
+    receipt: approvalGood,
+    expected: { approverKeyIds: [] },
+    ok: false,
+    reason:
+      "quorum not met: 0 of 1 required approver signatures verified (trusted approver allowlist is empty)",
+  },
+  {
+    name: "did-mode-anchor-without-resolver-refused",
+    receipt: approvalGood,
+    // Harness instruction: build a DID-mode anchor over these DIDs with NO resolver at all.
+    expected: { approverDids: { "did:intyga:alice": ["alice"] }, resolverOmitted: true },
+    ok: false,
+    reason:
+      "quorum not met: 0 of 1 required approver signatures verified (did:intyga:alice is not self-certifying (did:intyga:key:…) and the trust anchor provides no resolveKey)",
+  },
+  {
+    name: "offline-window-subsecond-over-cap-refused",
+    receipt: subSecondOverCap,
+    options: { asOf: "2026-09-01T12:01:00.000Z", allowOffline: true },
+    ok: false,
+    reason: "offline window is 60.0 minutes, over the 60-minute maximum",
+  },
+]
+
 const approvals = {
   expected: {
     approverKeyIds: ["alice"],
@@ -450,6 +840,109 @@ const approvals = {
       ok: false,
       reasonIncludes: "requesterCannotApprove requires a DID-mode trust anchor",
     },
+    {
+      name: "credential-issuer-cannot-approve-under-four-eyes",
+      receipt: issuerCannotApprove,
+      expected: { approverDids: { "did:intyga:alice": ["alice"] } },
+      ok: false,
+      reasonIncludes: "four-eyes",
+    },
+    {
+      name: "independent-approver-remains-eligible-with-credential-issuer",
+      receipt: independentApprover,
+      expected: {
+        approverDids: { "did:intyga:alice": ["alice"], "did:intyga:bob": ["bob"] },
+      },
+      ok: true,
+      signers: ["did:intyga:bob"],
+    },
+    {
+      name: "controller-key-alias-cannot-evade-signed-exclusion",
+      receipt: controllerKeyAlias,
+      expected: {
+        approverDids: { "did:intyga:alice": ["alice"], "did:intyga:bob": ["alice"] },
+      },
+      ok: false,
+      // Exact text: every port reports the alias as the shared-key refusal (DIV §4.4.6).
+      reason: SHARED_KEY_ALIAS_REASON,
+    },
+    {
+      name: "requester-key-alias-cannot-approve-under-four-eyes",
+      receipt: requesterKeyAlias,
+      expected: {
+        approverDids: { "did:intyga:alice": ["alice"], "did:intyga:bob": ["alice"] },
+      },
+      ok: false,
+      // Exact text: every port reports the alias as the shared-key refusal (DIV §4.4.6).
+      reason: SHARED_KEY_ALIAS_REASON,
+    },
+    {
+      name: "credential-issuer-key-alias-cannot-approve-under-four-eyes",
+      receipt: issuerKeyAlias,
+      expected: {
+        approverDids: { "did:intyga:alice": ["alice"], "did:intyga:bob": ["alice"] },
+      },
+      ok: false,
+      // Exact text: every port reports the alias as the shared-key refusal (DIV §4.4.6).
+      reason: SHARED_KEY_ALIAS_REASON,
+    },
+    {
+      name: "ordinary-solo-allows-same-key-alias-without-four-eyes",
+      receipt: ordinarySoloKeyAlias,
+      expected: {
+        approverDids: { "did:intyga:alice": ["alice"], "did:intyga:bob": ["alice"] },
+      },
+      ok: true,
+      signers: ["did:intyga:bob"],
+    },
+    {
+      name: "explicit-controller-exclusion-refuses-matching-did",
+      receipt: explicitlyExcludedApprover,
+      expected: { approverDids: { "did:intyga:alice": ["alice"] } },
+      ok: false,
+      reasonIncludes: "four-eyes",
+    },
+    {
+      name: "explicit-controller-exclusion-refuses-key-only-trust",
+      receipt: explicitlyExcludedApprover,
+      ok: false,
+      reasonIncludes: "requesterCannotApprove requires a DID-mode trust anchor",
+    },
+    {
+      name: "excluded-identity-resolver-failure-refused",
+      receipt: excludedIdentityResolverFailure,
+      expected: {
+        approverDids: { "did:intyga:bob": ["bob"] },
+        // Harness instruction, not verifier input: the DID-mode resolver throws (raises, panics)
+        // when asked for any DID listed here.
+        resolverThrowsFor: ["did:intyga:mallory"],
+      },
+      ok: false,
+      reasonIncludes: "could not resolve keys for excluded identity did:intyga:mallory",
+    },
+    {
+      name: "excluded-identity-without-resolved-keys-accepted",
+      receipt: excludedIdentityResolverFailure,
+      expected: { approverDids: { "did:intyga:bob": ["bob"] } },
+      ok: true,
+      signers: ["did:intyga:bob"],
+    },
+    {
+      name: "malformed-credential-issuer-did-refused",
+      receipt: malformedCredentialIssuer,
+      expected: { approverDids: { "did:intyga:alice": ["alice"] } },
+      ok: false,
+      reasonIncludes: "credentialIssuerDid",
+      reason: "signed requester.credentialIssuerDid must be a non-empty DID",
+    },
+    {
+      name: "malformed-excluded-signer-did-refused",
+      receipt: malformedSignerExclusions,
+      expected: { approverDids: { "did:intyga:alice": ["alice"] } },
+      ok: false,
+      reasonIncludes: "excludedSignerDids",
+      reason: "signed requirement.excludedSignerDids must be an array of valid DIDs",
+    },
     // The reserved `evidence` field (DIV §4.3.4 / §5-step-3c). These live in `approvals` rather than
     // a new section on purpose: `reasonIncludes` is already asserted by every port's harness here, so
     // they pin the REASON as well as the verdict with no harness change. A refusal landing for the
@@ -457,6 +950,8 @@ const approvals = {
     // divergence these vectors exist to catch.
     ...evidenceApprovalCases,
     ...offlineApprovalCases,
+    ...identityExtensionCases,
+    ...harnessShapeCases,
   ],
 }
 
@@ -1656,6 +2151,35 @@ const floor = (requiredApprovals: number, requesterCannotApprove = false, requir
   requirement: { requiredApprovals, requesterCannotApprove, requireHardwareKey },
 })
 const deviceBound = required(webauthnHardwareCases[0], "device-bound WebAuthn case")
+// A WebAuthn ES256 assertion signature is ASN.1 DER; the same signature re-encoded as raw r||s must
+// not verify (a bare-key ES256 witness accepts both, a WebAuthn witness does not).
+function derToRaw(der: Buffer): Buffer {
+  let i = 2
+  const part = () => {
+    if (der[i] !== 0x02) throw new Error("not a DER INTEGER")
+    const len = der[i + 1] ?? 0
+    const value = der.subarray(i + 2, i + 2 + len)
+    i += 2 + len
+    const trimmed = value[0] === 0 ? value.subarray(1) : value
+    return Buffer.concat([Buffer.alloc(32 - trimmed.length), trimmed])
+  }
+  return Buffer.concat([part(), part()])
+}
+const webauthnRawSignatureCase = {
+  name: "webauthn-raw-signature-refused",
+  receipt: {
+    ...deviceBound.receipt,
+    signature: derToRaw(Buffer.from(String(deviceBound.receipt.signature), "base64url")).toString(
+      "base64url",
+    ),
+  },
+  approverKeyEncoding: "cose",
+  expected: { approverKeyIds: ["passkey-holder"] },
+  options: deviceBound.options,
+  ok: false,
+  reason:
+    "quorum not met: 0 of 1 required approver signatures verified (WebAuthn signature does not verify against the trusted signer key)",
+}
 const requirementFloorCases = [
   {
     name: "requirement-floor-absent-proves-only-signed-quorum",
@@ -1692,6 +2216,20 @@ const requirementFloorCases = [
     signers: [spki(alice)],
   },
   {
+    name: "requirement-floor-empty-exclusions-requires-signed-presence",
+    receipt: approvalGood,
+    expected: { requirement: { ...floor(1).requirement, excludedSignerDids: [] } },
+    ok: false,
+    reasonIncludes: WEAKER,
+  },
+  {
+    name: "requirement-floor-empty-exclusions-presence-accepted",
+    receipt: signedEmptyExclusions,
+    expected: { requirement: { ...floor(1).requirement, excludedSignerDids: [] } },
+    ok: true,
+    signers: [spki(alice)],
+  },
+  {
     name: "requirement-floor-hardware-equal-accepted",
     receipt: deviceBound.receipt,
     approverKeyEncoding: "cose",
@@ -1701,7 +2239,202 @@ const requirementFloorCases = [
     signers: [cose(passkeyHolder)],
   },
 ]
+// The same identity-extension gate on the agent-authority verifier (DIV §5b).
+const authorityDuplicateExclusions = (() => {
+  const canonical = authorityGood.canonicalPayload.replace(
+    '"allowedAaguids":[],',
+    '"allowedAaguids":[],"excludedSignerDids":["did:intyga:mallory","did:intyga:mallory"],',
+  )
+  if (canonical === authorityGood.canonicalPayload)
+    throw new Error("authority exclusion fixture did not apply")
+  return {
+    ...authorityGood,
+    canonicalPayload: canonical,
+    signatures: [
+      {
+        signerDid: "did:intyga:alice",
+        signerPublicKey: spki(alice),
+        signature: sign(alice, canonical),
+        sigAlg: "ES256",
+      },
+      {
+        signerDid: "did:intyga:bob",
+        signerPublicKey: spki(bob),
+        signature: sign(bob, canonical),
+        sigAlg: "ES256",
+      },
+    ],
+    verificationCode: verificationCode(canonical),
+  }
+})()
+const platformExtraCases = [
+  {
+    name: "platform-expected-nonce-empty-refused",
+    receipt: platformGood,
+    expected: { nonce: "" },
+    ok: false,
+    reason: "expected.nonce is required — it must be the challenge YOU issued (DIV §5 step 10)",
+  },
+  {
+    name: "platform-given-ordinary-intent-refused",
+    receipt: approvalGood,
+    ok: false,
+    reason: "this is an ordinary approval receipt — verify it with verifyApprovalReceipt",
+  },
+]
+const authorityWithoutParent = (() => {
+  const canonical = authorityGood.canonicalPayload.replace(',"parentReceiptHash":null', "")
+  if (canonical === authorityGood.canonicalPayload) throw new Error("authority parent fixture did not apply")
+  return {
+    ...authorityGood,
+    canonicalPayload: canonical,
+    signatures: [
+      {
+        signerDid: "did:intyga:alice",
+        signerPublicKey: spki(alice),
+        signature: sign(alice, canonical),
+        sigAlg: "ES256",
+      },
+      {
+        signerDid: "did:intyga:bob",
+        signerPublicKey: spki(bob),
+        signature: sign(bob, canonical),
+        sigAlg: "ES256",
+      },
+    ],
+    verificationCode: verificationCode(canonical),
+  }
+})()
+// DIV §5a.6 seal verification, run with verifyDelegation (a section of its own: no other section
+// exercises the delegation verifier directly).
+const delegationTenant = "11111111-1111-4111-8111-111111111111"
+function delegationReceipt(delegatedTo: string[], delegatedQuorum: number, editTo?: string): ApprovalReceipt {
+  const requester = { did: "did:intyga:agent:payments", attestation: null }
+  let canonical = canonicalDelegationPayload({
+    tenantId: delegationTenant,
+    target: approvalTarget,
+    actionType: approvalActionType,
+    display: "Wire USD 4,200",
+    params: approvalParams,
+    requester,
+    requirement: {
+      requiredApprovals: 2,
+      requireHardwareKey: false,
+      allowedAaguids: [],
+      requesterCannotApprove: false,
+      signerClass: "human",
+    },
+    delegatedTo,
+    delegatedQuorum,
+    nonce: "parity-delegation-nonce",
+    sealedAt: AS_OF,
+    expiresAt: "2026-09-02T12:00:00.000Z",
+  })
+  if (editTo !== undefined) {
+    const next = canonical.replace(
+      `"delegatedTo":${JSON.stringify([...delegatedTo].sort())}`,
+      `"delegatedTo":${editTo}`,
+    )
+    if (next === canonical) throw new Error("delegation fixture edit did not apply")
+    canonical = next
+  }
+  return {
+    canonicalPayload: canonical,
+    target: approvalTarget,
+    actionType: approvalActionType,
+    actionDescription: "Wire USD 4,200",
+    params: approvalParams,
+    requester,
+    signatures: [
+      {
+        signerDid: "did:intyga:alice",
+        signerPublicKey: spki(alice),
+        signature: sign(alice, canonical),
+        sigAlg: "ES256",
+      },
+      {
+        signerDid: "did:intyga:bob",
+        signerPublicKey: spki(bob),
+        signature: sign(bob, canonical),
+        sigAlg: "ES256",
+      },
+    ],
+    verificationCode: verificationCode(canonical),
+  }
+}
+const delegation = {
+  expected: {
+    approverDids: { "did:intyga:alice": ["alice"], "did:intyga:bob": ["bob"] },
+    tenantId: delegationTenant,
+    target: approvalTarget,
+    actionType: approvalActionType,
+    params: approvalParams,
+  },
+  options: { asOf: "2026-09-01T12:01:00.000Z" },
+  cases: [
+    {
+      name: "valid-two-person-seal",
+      receipt: delegationReceipt(["did:intyga:carol", "did:intyga:dave"], 2),
+      ok: true,
+      signers: ["did:intyga:alice", "did:intyga:bob"],
+      delegatedTo: ["did:intyga:carol", "did:intyga:dave"],
+      delegatedQuorum: 2,
+    },
+    {
+      name: "empty-delegated-to-refused",
+      receipt: delegationReceipt(["did:intyga:carol"], 1, "[]"),
+      ok: false,
+      reason:
+        "delegation names 0 distinct operator(s) but delegates a quorum of 1 — it can never be satisfied",
+    },
+  ],
+}
+const authorityWithoutParentOrPatterns = (() => {
+  const canonical = authorityWithoutParent.canonicalPayload.replace(
+    '"actionPatterns":["payments.","refund"]',
+    '"actionPatterns":[]',
+  )
+  if (canonical === authorityWithoutParent.canonicalPayload)
+    throw new Error("authority patterns fixture did not apply")
+  return {
+    ...authorityWithoutParent,
+    canonicalPayload: canonical,
+    signatures: [
+      {
+        signerDid: "did:intyga:alice",
+        signerPublicKey: spki(alice),
+        signature: sign(alice, canonical),
+        sigAlg: "ES256",
+      },
+      {
+        signerDid: "did:intyga:bob",
+        signerPublicKey: spki(bob),
+        signature: sign(bob, canonical),
+        sigAlg: "ES256",
+      },
+    ],
+    verificationCode: verificationCode(canonical),
+  }
+})()
 const authorityFloorCases = [
+  {
+    name: "authority-parent-commitment-reported-before-patterns",
+    receipt: authorityWithoutParentOrPatterns,
+    ok: false,
+    reason: "authority is missing a valid parent receipt commitment",
+  },
+  {
+    name: "authority-missing-parent-receipt-hash-refused",
+    receipt: authorityWithoutParent,
+    ok: false,
+    reason: "authority is missing a valid parent receipt commitment",
+  },
+  {
+    name: "authority-duplicate-excluded-signer-dids-refused",
+    receipt: authorityDuplicateExclusions,
+    ok: false,
+    reason: "signed requirement.excludedSignerDids must not contain duplicates",
+  },
   {
     name: "authority-requirement-floor-downgrade-refused",
     receipt: authorityGood,
@@ -1757,6 +2490,115 @@ const evidenceBase = required(
   "contiguous-tenant-sequence evidence case",
 )
 
+// The standalone WebAuthn witness verifier (DIV §4.4.5), pinned in every port. Built from the
+// committed golden assertion, so only the alternative keys below are fresh per run. Each reason is
+// what the reference returns; a reason embedding a library's message pins only its authored prefix.
+function buildWebAuthnWitnessVectors() {
+  const golden = JSON.parse(
+    readFileSync(
+      fileURLToPath(new URL("../../vectors/webauthn-vector.json", import.meta.url)),
+      "utf8",
+    ),
+  ) as { rpId: string; origin: string; receipt: ApprovalReceipt }
+  const r = golden.receipt
+  const base: WebAuthnWitness = {
+    signedPayload: r.canonicalPayload,
+    publicKey: String(r.signerPublicKey),
+    authenticatorData: String(r.authenticatorData),
+    clientDataJSON: String(r.clientDataJSON),
+    signature: String(r.signature),
+  }
+  const coseKey = Buffer.from(base.publicKey, "base64")
+  const spkiOfGolden = crypto
+    .createPublicKey({
+      format: "jwk",
+      key: {
+        kty: "EC",
+        crv: "P-256",
+        x: coseKey.subarray(10, 42).toString("base64url"),
+        y: coseKey.subarray(45, 77).toString("base64url"),
+      },
+    })
+    .export({ format: "der", type: "spki" })
+    .toString("base64")
+  const tampered = Buffer.from(base.signature, "base64url")
+  tampered.writeUInt8((tampered[tampered.length - 1] ?? 0) ^ 0x01, tampered.length - 1)
+  const expect = { expectedOrigin: golden.origin, expectedRpId: golden.rpId }
+  const cases: { name: string; witness: Record<string, unknown>; expectation: Record<string, unknown> }[] = [
+    { name: "valid-cose-key", witness: { ...base }, expectation: expect },
+    { name: "valid-spki-key", witness: { ...base, publicKey: spkiOfGolden }, expectation: expect },
+    {
+      name: "valid-origin-list",
+      witness: { ...base },
+      expectation: { ...expect, expectedOrigin: ["https://other.example", golden.origin] },
+    },
+    {
+      name: "valid-without-user-verification-requirement",
+      witness: { ...base },
+      expectation: { ...expect, requireUserVerification: false },
+    },
+    {
+      name: "payload-mismatch",
+      witness: { ...base, signedPayload: `${base.signedPayload} ` },
+      expectation: expect,
+    },
+    { name: "other-p256-key", witness: { ...base, publicKey: spki(ec()) }, expectation: expect },
+    { name: "rsa-key", witness: { ...base, publicKey: spki(rsa()) }, expectation: expect },
+    {
+      name: "wrong-origin",
+      witness: { ...base },
+      expectation: { ...expect, expectedOrigin: "https://evil.example.com" },
+    },
+    {
+      name: "wrong-rp-id",
+      witness: { ...base },
+      expectation: { ...expect, expectedRpId: "evil.example.com" },
+    },
+    {
+      name: "tampered-signature",
+      witness: { ...base, signature: tampered.toString("base64url") },
+      expectation: expect,
+    },
+    {
+      name: "raw-signature-refused",
+      witness: {
+        ...base,
+        signature: derToRaw(Buffer.from(base.signature, "base64url")).toString("base64url"),
+      },
+      expectation: expect,
+    },
+    { name: "empty-expected-origin", witness: { ...base }, expectation: { ...expect, expectedOrigin: "" } },
+    {
+      name: "empty-expected-origin-list",
+      witness: { ...base },
+      expectation: { ...expect, expectedOrigin: [] },
+    },
+    { name: "empty-expected-rp-id", witness: { ...base }, expectation: { ...expect, expectedRpId: "" } },
+    { name: "no-expectations", witness: { ...base }, expectation: {} },
+    ...(["signedPayload", "publicKey", "authenticatorData", "clientDataJSON", "signature"] as const).map(
+      (field) => ({
+        name: `missing-${field}`,
+        witness: { ...base, [field]: "" },
+        expectation: expect,
+      }),
+    ),
+    {
+      name: "short-authenticator-data",
+      witness: { ...base, authenticatorData: Buffer.from("short").toString("base64url") },
+      expectation: expect,
+    },
+  ]
+  return {
+    note: "Standalone WebAuthn witness verification (verifyWebAuthnWitness and its ports). `expectation` fields absent mean omitted; `requireUserVerification` defaults to true. Assert ok and the exact `reason` (API names rewritten per api-name-hints.json), or `reasonPrefix` where the text embeds a library message.",
+    cases: cases.map((c) => {
+      const result = verifyWebAuthnWitness(c.witness as unknown as WebAuthnWitness, c.expectation as never)
+      if (!result.ok && result.reason.startsWith("WebAuthn verification failed: "))
+        return { ...c, ok: false, reasonPrefix: "WebAuthn verification failed: " }
+      return { ...c, ok: result.ok, ...(result.ok ? {} : { reason: result.reason }) }
+    }),
+  }
+}
+
 const out = {
   version: 1,
   generated: new Date().toISOString(),
@@ -1766,14 +2608,22 @@ const out = {
   // test must assert EVERY optional field a case carries, not just the verdict. This is how Go came
   // to report a wrong-shaped trust anchor as a quorum shortfall while its vectors stayed green.
   mustAssert:
-    "Besides `ok`, assert every optional field present on a case: signers, reasonIncludes, actionPatterns, verificationLevel, properties, witnessTimes, total, contentVerified, commitmentOnly, brokenAt, unchained, verifiedCount. Bundle options may carry rekorSubmitterKeyIds (map to the pinned Rekor submitter keys); a policy may carry maxAnchorLagSeconds.",
+    "Besides `ok`, assert every optional field present on a case: signers, reasonIncludes, reason (the exact refusal text, with API names rewritten per api-name-hints.json), delegatedTo, delegatedQuorum, actionPatterns, verificationLevel, properties, witnessTimes, total, contentVerified, commitmentOnly, brokenAt, unchained, verifiedCount. Bundle options may carry rekorSubmitterKeyIds (map to the pinned Rekor submitter keys); a policy may carry maxAnchorLagSeconds. An approval case's expected.resolverOmitted means a DID-mode anchor over the approverDids keys with no resolver at all. The delegation section runs the delegation (seal) verifier with a DID-mode anchor built from expected.approverDids.",
   keys,
   approvals: {
     ...approvals,
-    cases: [...approvals.cases, ...extraApprovalCases, ...webauthnHardwareCases, ...requirementFloorCases],
+    cases: [
+      ...approvals.cases,
+      ...extraApprovalCases,
+      ...webauthnHardwareCases,
+      webauthnRawSignatureCase,
+      ...requirementFloorCases,
+    ],
   },
-  platform,
+  platform: { ...platform, cases: [...platform.cases, ...platformExtraCases] },
   agentAuthority: { ...agentAuthority, cases: [...agentAuthority.cases, ...authorityFloorCases] },
+  delegation,
+  webauthnWitness: buildWebAuthnWitnessVectors(),
   bundles: {
     ...bundles,
     cases: [
@@ -1807,6 +2657,9 @@ const out = {
   verifierInputHardening: buildVerifierInputHardening(),
   // DEWP §4.7 (version 1.1). Self-contained; generate-execution-evidence-vectors.ts regenerates it alone.
   executionEvidence: buildExecutionEvidenceVectors(),
+  // DIV §4.3.2 enrolled approver devices. Self-contained; generate-enrolled-device-vectors.ts
+  // regenerates it alone.
+  enrolledDevice: buildEnrolledDeviceVectors(),
 }
 writeFileSync(
   fileURLToPath(new URL("../../vectors/verifier-parity-vectors.json", import.meta.url)),
