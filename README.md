@@ -210,7 +210,7 @@ verifyApprovalReceipt(receipt, expected, { allowAutoApproved: true }); // → { 
 ## DIV / DEWP conformance
 
 This is the reference verifier with the broadest surface of the five ports. Beyond the **DEWP Core
-Profile** ([`docs/DEWP.md`](../../docs/DEWP.md) §9.1) it implements single-anchor **and**
+Profile** ([DEWP specification](https://www.intyga.com/specs/dewp) §9.1) it implements single-anchor **and**
 multi-anchor quorum verification (§5.2/§5.3, including `requiredAnchors`, issuer trust and
 divergence detection), the §5.4 checkpoint continuity chain (`0x04` domain tag), proof-bundle
 parsing with the §7.1 verification levels, evidence bundles, and gapless `tenantSeq` completeness
@@ -221,8 +221,8 @@ in `packages/mcp-schemas/vectors/`.
 
 It does **not** implement NDJSON evidence streaming (§6.4), so — like every port, this one
 included — it does not claim the §9.2 **Extended Profile**. The narrower ports state their own
-limits: [`verify-go`](../verify-go/README.md), [`verify-rust`](../verify-rust/README.md),
-[`verify-java`](../verify-java/README.md), [`sdk-python`](../sdk-python/README.md).
+limits: [`verify-go`](https://github.com/intyga-dev/verify-go), [`verify-rust`](https://github.com/intyga-dev/verify-rust),
+[`verify-java`](https://github.com/intyga-dev/verify-java), [`sdk-python`](https://github.com/intyga-dev/sdk-python).
 
 Requires Node ≥18 (`node:crypto`).
 

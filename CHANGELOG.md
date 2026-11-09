@@ -3,6 +3,20 @@
 All notable changes to `@intyga/verify` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
+## [2.4.0]
+
+- Malformed witnesses are a refusal, never an exception (audit A-04, 6 Nov 2026). `signatures` that
+  is not an array, an element that is `null`, not an object or an array, a missing, empty or
+  non-string `signature`, or a non-string `signerDid` / `signerPublicKey` / `sigAlg` /
+  `authenticatorData` / `clientDataJSON` now returns `{ ok: false, reason: "receipt carries a
+  malformed witness…" }` (`delegation …` / `authority …` on those paths) from every entry point
+  before any witness is counted; a valid witness beside a malformed one refuses the whole artifact.
+  `signatures: [null]` previously threw `TypeError`.
+- Three shared `tenant-binding-vectors.json` cases pin behaviour across all five ports:
+  `tenant-v2-authority-expires-before-sealed-subsecond`,
+  `tenant-v2-authority-chain-child-outlives-parent-subsecond` and
+  `tenant-v2-intent-malformed-witness-beside-valid` / `…-empty-signature-beside-valid`.
+
 ## [2.3.0]
 
 - DIV 1.3.0 enrolled approver devices (§4.3.2, ADR 027). The signed requirement may carry

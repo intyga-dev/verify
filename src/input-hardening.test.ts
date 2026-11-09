@@ -88,6 +88,31 @@ describe("L19: malformed inputs refuse instead of throwing", () => {
       true,
     )
   })
+  // Audit 2026-11-06 A-04: `signatures: [null]` threw `TypeError … reading 'sigAlg'` out of the
+  // verifier. Offline artifacts are untrusted JSON; a malformed element is a refusal, never a throw.
+  it("a null or non-object witness is a refusal, not a TypeError", () => {
+    const anchor = { approvers: { publicKeys: [spki(signer.publicKey)] } }
+    for (const signatures of [[null], [{}], ["x"], [42], [[]], [{ signature: 1 }], [{ sigAlg: {} }]]) {
+      const malformed = { ...receipt, signatures } as unknown as ApprovalReceipt
+      const result = verifyApprovalReceipt(malformed, { ...expected, ...anchor })
+      assert.equal(result.ok, false, JSON.stringify(signatures))
+      assert.match(result.reason ?? "", /malformed witness/, JSON.stringify(signatures))
+    }
+    // A valid witness beside a null one is still a refusal: the array is one artifact.
+    const mixed = {
+      ...receipt,
+      signatures: [
+        {
+          signerDid: receipt.signerDid,
+          signerPublicKey: receipt.signerPublicKey,
+          signature: receipt.signature,
+          sigAlg: "ES256",
+        },
+        null,
+      ],
+    } as unknown as ApprovalReceipt
+    assert.equal(verifyApprovalReceipt(mixed, { ...expected, ...anchor }).ok, false)
+  })
   it("agentReceiptDigest projects an absent signerPublicKey to null (DIV §4.3.6)", () => {
     const witness = { signerDid: "did:intyga:alice", signature: "c2ln", sigAlg: "ES256" }
     const without = { canonicalPayload: canonical, signatures: [witness] } as unknown as ApprovalReceipt

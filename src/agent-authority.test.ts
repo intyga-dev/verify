@@ -255,6 +255,50 @@ describe("verifyAgentAuthority", () => {
     assert.match(r.reason!, /expires before it was sealed/)
   })
 
+  // Audit 2026-11-06 A-02: intervals compare to the millisecond. The Rust port truncated both
+  // instants to the second, so an interval inverted inside one second, and a child outliving its
+  // parent by 800 ms, verified there alone. Pinned here and in tenant-binding-vectors.json.
+  it("refuses an interval inverted inside one second, and accepts one ordered by 100 ms", () => {
+    const inverted = verifyAgentAuthority(
+      sealedAuthority({ sealedAt: "2026-07-01T00:00:00.900Z", expiresAt: "2026-07-01T00:00:00.100Z" }),
+      EXPECTED,
+      { asOf: new Date("2026-07-01T00:01:00.000Z") },
+    )
+    assert.equal(inverted.ok, false)
+    assert.match(inverted.reason!, /expires before it was sealed/)
+    const ordered = verifyAgentAuthority(
+      sealedAuthority({ sealedAt: "2026-07-01T00:00:00.100Z", expiresAt: "2027-07-01T00:00:00.200Z" }),
+      EXPECTED,
+      { asOf: new Date("2026-07-01T00:01:00.000Z") },
+    )
+    assert.equal(ordered.ok, true, ordered.reason)
+  })
+
+  it("refuses a child that outlives its parent by 800 ms", () => {
+    const root = sealedAuthority({ actionPatterns: ["payments."], expiresAt: "2027-07-01T00:00:00.100Z" })
+    const childDid = "did:intyga:agent:worker"
+    const child = sealedAuthority({
+      agentDid: childDid,
+      actionPatterns: ["payments.refund"],
+      parentReceiptHash: agentReceiptDigest(root),
+      expiresAt: "2027-07-01T00:00:00.900Z",
+    })
+    const r = verifyAgentDelegationChain(
+      [
+        { receipt: root, expected: EXPECTED },
+        { receipt: child, expected: { ...EXPECTED, agentDid: childDid } },
+      ],
+      {
+        target: TARGET,
+        actionType: "payments.refund.issue",
+        agentDid: childDid,
+        delegatedBy: agentReceiptDigest(child),
+      },
+    )
+    assert.equal(r.ok, false)
+    assert.match(r.reason!, /outlives or predates its parent/)
+  })
+
   it("refuses a seal dated after the evaluation time, audit override or not", () => {
     // DIV §5b.2/§5b.3: the evidence claim is that the grant was LIVE at the evaluation time, so a
     // seal that has not happened yet cannot support it. `allowExpired` covers the opposite case —

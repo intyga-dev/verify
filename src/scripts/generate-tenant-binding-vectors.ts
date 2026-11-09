@@ -99,6 +99,26 @@ const intentInput = {
 }
 const intentV2 = approvalReceipt(canonicalIntentPayload({ tenantId: TENANT, ...intentInput }))
 const intentV1 = approvalReceipt(canonicalIntentPayload(intentInput))
+// Audit A-04: the witness array is one artifact — a null beside a valid witness is malformed, never
+// "one non-verifying witness". Built from intentV2's own witness so the valid half really verifies.
+const intentMalformedWitness = (() => {
+  const { signerDid, signerPublicKey, signature, sigAlg, ...rest } = intentV2
+  return {
+    ...rest,
+    signatures: [{ signerDid, signerPublicKey, signature, sigAlg }, null],
+  } as unknown as typeof intentV2
+})()
+// The same artifact rule for an element a lenient parser ADMITS: a witness whose signature is the
+// empty string beside the valid one. Rust's serde took it where TS's witnessProblem did not.
+function withEmptySignatureWitness<T extends ApprovalReceipt | PlatformReceipt>(receipt: T): T {
+  const { signerDid, signerPublicKey, signature, sigAlg, authenticatorData, clientDataJSON, ...rest } =
+    receipt
+  const witness = { signerDid, signerPublicKey, signature, sigAlg, authenticatorData, clientDataJSON }
+  return {
+    ...rest,
+    signatures: [witness, { ...witness, signature: "" }],
+  } as unknown as T
+}
 const fractionalParams = { amount: 0.30000000000000004, currency: "USD" }
 const fractionalV2 = approvalReceipt(
   canonicalIntentPayload({
@@ -212,6 +232,27 @@ const authorityChildSameTenant = authorityReceipt(TENANT, {
   actionPatterns: ["payments.wire"],
   nonce: "tenant-authority-child-valid-nonce",
   parentReceiptHash: agentReceiptDigest(authorityRoot),
+})
+// Audit 2026-11-06 A-02: intervals are compared to the millisecond in every port. The Rust port
+// truncated signed instants to the second, so both of these verified there and nowhere else.
+const authorityInvertedSubsecond = authorityReceipt(TENANT, {
+  ...authorityInput,
+  nonce: "tenant-authority-inverted-nonce",
+  sealedAt: "2026-10-10T12:00:00.900Z",
+  expiresAt: "2026-10-10T12:00:00.100Z",
+})
+const authorityShortRoot = authorityReceipt(TENANT, {
+  ...authorityInput,
+  nonce: "tenant-authority-short-root-nonce",
+  expiresAt: "2027-10-10T12:00:00.100Z",
+})
+const authorityOutlivingChild = authorityReceipt(TENANT, {
+  ...authorityInput,
+  agent: { did: "did:intyga:agent:worker" },
+  actionPatterns: ["payments.refund"],
+  nonce: "tenant-authority-outliving-child-nonce",
+  parentReceiptHash: agentReceiptDigest(authorityShortRoot),
+  expiresAt: "2027-10-10T12:00:00.900Z",
 })
 
 const RP_ID = "platform.example"
@@ -712,6 +753,108 @@ const vectors = {
         actionType: "payments.refund.issue",
         agentDid: "did:intyga:agent:worker",
         delegatedBy: agentReceiptDigest(authorityChildV1),
+      },
+      options: { asOf: AS_OF },
+      ok: false,
+    },
+    {
+      name: "tenant-v2-authority-expires-before-sealed-subsecond",
+      verifier: "authority",
+      receipt: authorityInvertedSubsecond,
+      expected: {
+        approverDids: didExpected.approverDids,
+        target: TARGET,
+        agentDid: authorityInput.agent.did,
+      },
+      expectedTenantId: TENANT,
+      options: { asOf: AS_OF },
+      ok: false,
+    },
+    {
+      name: "tenant-v2-intent-malformed-witness-beside-valid",
+      verifier: "approval",
+      receipt: intentMalformedWitness,
+      expected: approvalExpected,
+      expectedTenantId: TENANT,
+      options: { asOf: AS_OF },
+      ok: false,
+    },
+    {
+      name: "tenant-v2-intent-empty-signature-beside-valid",
+      verifier: "approval",
+      receipt: withEmptySignatureWitness(intentV2),
+      expected: approvalExpected,
+      expectedTenantId: TENANT,
+      options: { asOf: AS_OF },
+      ok: false,
+    },
+    {
+      name: "tenant-v2-offline-empty-signature-beside-valid",
+      verifier: "approval",
+      receipt: withEmptySignatureWitness(offlineV2),
+      expected: approvalExpected,
+      expectedTenantId: TENANT,
+      options: { asOf: AS_OF, allowOffline: true },
+      ok: false,
+    },
+    {
+      name: "tenant-v2-delegation-empty-signature-beside-valid",
+      verifier: "delegation",
+      receipt: withEmptySignatureWitness(delegationV2),
+      expected: didExpected,
+      expectedTenantId: TENANT,
+      options: { asOf: AS_OF },
+      ok: false,
+    },
+    {
+      name: "tenant-v2-authority-empty-signature-beside-valid",
+      verifier: "authority",
+      receipt: withEmptySignatureWitness(authorityV2),
+      expected: {
+        approverDids: didExpected.approverDids,
+        target: TARGET,
+        agentDid: authorityInput.agent.did,
+      },
+      expectedTenantId: TENANT,
+      options: { asOf: AS_OF },
+      ok: false,
+    },
+    {
+      name: "tenant-v2-platform-empty-signature-beside-valid",
+      verifier: "platform",
+      receipt: withEmptySignatureWitness(platformReceipt()),
+      expected: {
+        approverKeyIds: ["alice"],
+        payloadHash: PAYLOAD_HASH,
+        rpId: RP_ID,
+        nonce: "tenant-platform-nonce",
+        subjectExternalId: "cust-42",
+      },
+      expectedTenantId: TENANT,
+      options: { asOf: AS_OF, expectedOrigin: ORIGIN },
+      ok: false,
+    },
+    {
+      name: "tenant-v2-authority-chain-child-outlives-parent-subsecond",
+      verifier: "authority-chain",
+      chain: [
+        {
+          receipt: authorityShortRoot,
+          expected: { ...didExpected, agentDid: authorityInput.agent.did },
+          expectedTenantId: TENANT,
+        },
+        {
+          receipt: authorityOutlivingChild,
+          expected: { ...didExpected, agentDid: "did:intyga:agent:worker" },
+          expectedTenantId: TENANT,
+        },
+      ],
+      action: {
+        tenantId: TENANT,
+        target: TARGET,
+        actionType: "payments.refund.issue",
+        agentDid: "did:intyga:agent:worker",
+        delegatedBy: agentReceiptDigest(authorityOutlivingChild),
       },
       options: { asOf: AS_OF },
       ok: false,

@@ -1706,6 +1706,30 @@ function webAuthnPublicKey(der: Buffer): crypto.KeyObject {
   return key
 }
 
+/**
+ * A `signatures` array is attacker-supplied JSON that the static types do not validate: an element
+ * that is `null`, not an object, or carries non-string signature material used to reach the witness
+ * loop and throw a TypeError out of the verifier. Returns the authored refusal, or null when every
+ * element has the witness shape. Absent fields stay allowed (a DID-mode witness may omit its key).
+ */
+function witnessProblem(receipt: ApprovalReceipt): string | null {
+  const sigs: unknown = receipt.signatures
+  if (sigs == null) return null
+  if (!Array.isArray(sigs)) return "receipt signatures is not an array"
+  for (const w of sigs as unknown[]) {
+    if (typeof w !== "object" || w === null || Array.isArray(w)) return "receipt carries a malformed witness"
+    const fields = w as Record<string, unknown>
+    if (typeof fields.signature !== "string" || fields.signature.length === 0)
+      return "receipt carries a malformed witness: signature is not a string"
+    for (const field of ["signerDid", "signerPublicKey", "sigAlg", "authenticatorData", "clientDataJSON"]) {
+      const v = fields[field]
+      if (v != null && typeof v !== "string")
+        return `receipt carries a malformed witness: ${field} is not a string`
+    }
+  }
+  return null
+}
+
 /** Normalize a receipt to a witness list: `signatures` if present, else the single-signature fields. */
 function witnessesOf(receipt: ApprovalReceipt): ApprovalWitness[] {
   if (receipt.signatures?.length) return receipt.signatures
@@ -2105,6 +2129,8 @@ export function verifyApprovalReceipt(
             "auto-approved by policy — no human signature to verify (pass { allowAutoApproved: true } to accept)",
         }
   }
+  const malformed = witnessProblem(receipt)
+  if (malformed) return { ok: false, reason: malformed }
   const witnesses = witnessesOf(receipt)
   if (witnesses.length === 0) return { ok: false, reason: "receipt missing signature material" }
   // The witness list is attacker-supplied and every entry costs an ECDSA verification per candidate
@@ -2411,6 +2437,8 @@ export function verifyPlatformReceipt(
       reason: "a platform receipt cannot be auto-approved — there is no signature to verify",
     }
 
+  const malformed = witnessProblem(receipt as ApprovalReceipt)
+  if (malformed) return { ok: false, reason: malformed }
   const witnesses = witnessesOf(receipt as ApprovalReceipt)
   if (witnesses.length === 0) return { ok: false, reason: "receipt missing signature material" }
   if (witnesses.length > MAX_WITNESSES)
@@ -2662,6 +2690,8 @@ export function verifyDelegation(
       reason:
         "a delegation cannot be auto-approved — delegating approval authority requires human signatures",
     }
+  const malformed = witnessProblem(receipt)
+  if (malformed) return { ok: false, reason: malformed.replace("receipt", "delegation") }
   const witnesses = witnessesOf(receipt)
   if (witnesses.length === 0) return { ok: false, reason: "delegation missing signature material" }
   // Same resource bound as the approval path: signature verification is the expensive step, and a
@@ -2965,6 +2995,8 @@ export function verifyAgentAuthority(
       ok: false,
       reason: "an agent authority cannot be auto-approved — granting agent scope requires human signatures",
     }
+  const malformed = witnessProblem(receipt)
+  if (malformed) return { ok: false, reason: malformed.replace("receipt", "authority") }
   const witnesses = witnessesOf(receipt)
   if (witnesses.length === 0) return { ok: false, reason: "authority missing signature material" }
   if (witnesses.length > MAX_WITNESSES) {
